@@ -13,7 +13,7 @@
 /// program-counter of the allocation call site (captured by the Observer in
 /// Phase 2); `size_class` is a compact index into the size-class table. The
 /// bandit weights one of these per call site.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Signature {
     pub caller_pc: u64,
     pub size_class: u8,
