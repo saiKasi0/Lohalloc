@@ -1,0 +1,14 @@
+[package]
+name = "lohalloc-example"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Binary that installs Lohalloc as the global allocator for cross-platform smoke testing."
+
+[[bin]]
+name = "lohalloc-example"
+path = "src/main.rs"
+
+[dependencies]
+lohalloc-alloc.workspace = true

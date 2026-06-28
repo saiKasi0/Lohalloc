@@ -1,0 +1,11 @@
+[package]
+name = "lohalloc-alloc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Lohalloc Execution Plane: GlobalAlloc shim with Slab, Buddy, and System Fallback backends."
+
+[dependencies]
+lohalloc-core.workspace = true
+libc = "0.2"

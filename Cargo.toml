@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lohalloc-core",
+    "crates/lohalloc-alloc",
+    "crates/lohalloc-server",
+    "crates/lohalloc-example",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.74"
+
+[workspace.dependencies]
+lohalloc-core = { path = "crates/lohalloc-core" }
+lohalloc-alloc = { path = "crates/lohalloc-alloc" }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = false
+
+# Tests run under the custom global allocator; keep them panic-friendly.
+[profile.test]
+opt-level = 1

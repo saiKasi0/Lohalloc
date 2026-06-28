@@ -1,0 +1,7 @@
+[package]
+name = "lohalloc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared types for Lohalloc: size classes, alignment, signatures, trace records."
