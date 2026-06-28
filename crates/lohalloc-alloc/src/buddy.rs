@@ -12,8 +12,8 @@
 //! and alignment-clean. Phase 2 adds telemetry hooks without changing the
 //! split/coalesce structure.
 
-use lohalloc_core::{round_up_pow2, MIN_ALIGN};
 use crate::system;
+use lohalloc_core::{round_up_pow2, MIN_ALIGN};
 
 /// Minimum buddy block size (bytes). Must be a power of two and >= `MIN_ALIGN`
 /// so every block satisfies the global alignment contract. 16 keeps us SIMD-
@@ -228,7 +228,9 @@ impl Buddy {
             let next = unsafe { (*node).next };
             if node == target {
                 result = Some(node as *mut u8);
-                unsafe { (*node).next = None; }
+                unsafe {
+                    (*node).next = None;
+                }
                 cur = next;
                 removed = true;
                 break;

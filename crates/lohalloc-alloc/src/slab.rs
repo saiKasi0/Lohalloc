@@ -11,8 +11,8 @@
 //! a Phase 1 implementation: simple, correct, alignment-clean. Phase 2 adds
 //! the telemetry hooks on top without changing the free-list structure.
 
-use lohalloc_core::{align_up, slab_class_for, SLAB_SIZE_CLASSES};
 use crate::system;
+use lohalloc_core::{align_up, slab_class_for, SLAB_SIZE_CLASSES};
 
 /// Node of the intrusive free list. Lives at the head of each free block.
 /// Blocks are always at least `SLAB_SIZE_CLASSES[0]` bytes (8), so the pointer

@@ -36,14 +36,16 @@
 //! is queried at runtime; alignment is satisfied by over-allocation within a
 //! page (see [`system`]). Do not assume a 4 KiB page anywhere above this layer.
 
+pub mod arena;
 pub mod buddy;
 pub mod slab;
 pub mod system;
+pub mod topology;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::Cell;
+use lohalloc_core::{align_up, BUDDY_MAX, MIN_ALIGN, SLAB_MAX};
 use std::sync::Mutex;
-use lohalloc_core::{align_up, MIN_ALIGN, SLAB_MAX, BUDDY_MAX};
 
 /// Sentinel written into every [`Header`] so we can sanity-check dealloc.
 const MAGIC: u64 = 0x534d4152414c4844; // "LOHALALHD"
@@ -51,7 +53,7 @@ const MAGIC: u64 = 0x534d4152414c4844; // "LOHALALHD"
 /// Per-allocation header prepended to the user-visible pointer. Lets
 /// `dealloc` identify the owning backend without guessing by size.
 ///
-/// 40 bytes; always accessed with `read_unaligned`/`write_unaligned` so we do
+/// 48 bytes; always accessed with `read_unaligned`/`write_unaligned` so we do
 /// not impose any alignment requirement beyond what the user asked for.
 #[repr(C)]
 struct Header {
@@ -66,6 +68,10 @@ struct Header {
     base: usize,
     /// For `Backend::System` only: the full mapped length to unmap.
     map_len: usize,
+    /// Topological hash of the allocation call site (Phase 2). Used by the
+    /// Decision Engine (Phase 3) for MAB correlation. Zero if the topology
+    /// engine returned a sentinel.
+    hash: u64,
 }
 
 const HEADER_SIZE: usize = core::mem::size_of::<Header>(); // 40
@@ -85,6 +91,7 @@ enum Backend {
     Slab = 0,
     Buddy = 1,
     System = 2,
+    Arena = 3,
 }
 
 impl Backend {
@@ -93,6 +100,7 @@ impl Backend {
             0 => Some(Backend::Slab),
             1 => Some(Backend::Buddy),
             2 => Some(Backend::System),
+            3 => Some(Backend::Arena),
             _ => None,
         }
     }
@@ -103,6 +111,7 @@ impl Backend {
 pub struct Lohalloc {
     slab: Mutex<slab::Slab>,
     buddy: Mutex<buddy::Buddy>,
+    arena: Mutex<Option<arena::BumpArena>>,
 }
 
 impl Default for Lohalloc {
@@ -116,6 +125,9 @@ impl Lohalloc {
         Self {
             slab: Mutex::new(slab::Slab::new()),
             buddy: Mutex::new(buddy::Buddy::new()),
+            // Arena is lazily initialized on first use (requires mmap, which
+            // is not const-evaluable).
+            arena: Mutex::new(None),
         }
     }
 }
@@ -151,7 +163,7 @@ unsafe impl GlobalAlloc for Lohalloc {
         // thread (e.g. a backend's `Vec` growing), serve directly from mmap.
         let depth = IN_ALLOC.get();
         if depth > 0 {
-            return self.system_alloc_with_header(total, align);
+            return self.system_alloc_with_header(total, align, 0);
         }
 
         IN_ALLOC.set(depth + 1);
@@ -193,11 +205,13 @@ unsafe impl GlobalAlloc for Lohalloc {
             Some(Backend::System) => {
                 // Release the exact mapping recorded at alloc time.
                 unsafe {
-                    libc::munmap(
-                        header.base as *mut core::ffi::c_void,
-                        header.map_len,
-                    );
+                    libc::munmap(header.base as *mut core::ffi::c_void, header.map_len);
                 }
+            }
+            Some(Backend::Arena) => {
+                // Arena allocations are reclaimed via `reset()`, not
+                // per-allocation free. Dealloc is a no-op — the memory stays
+                // mapped until the arena is reset or dropped.
             }
             None => {
                 debug_assert!(false, "dealloc: unknown backend tag");
@@ -210,11 +224,16 @@ impl Lohalloc {
     /// Route a (non-recursive) allocation to the appropriate backend and write
     /// the ownership header. Returns the user-visible pointer (post-header).
     fn route_alloc(&self, _size: usize, align: usize, pad: usize, total: usize) -> *mut u8 {
+        // Capture the topological hash of the current call stack. In Phase 2
+        // this is recorded in the Header for future MAB correlation (Phase 3).
+        // The routing is still size-based; MAB policy arrives in Phase 3.
+        let hash = topology::fast_stack_hash();
+
         // 1. Slab: small, naturally-aligned requests.
         if total <= SLAB_MAX {
             if let Ok(mut slab) = self.slab.lock() {
                 if let Some(block) = slab.alloc(total) {
-                    return self.write_header(block, pad, Backend::Slab, total, 0, 0);
+                    return self.write_header(block, pad, Backend::Slab, total, 0, 0, hash);
                 }
             }
         }
@@ -225,19 +244,19 @@ impl Lohalloc {
         if total <= BUDDY_MAX {
             if let Ok(mut buddy) = self.buddy.lock() {
                 if let Some(block) = buddy.alloc(total) {
-                    return self.write_header(block, pad, Backend::Buddy, total, 0, 0);
+                    return self.write_header(block, pad, Backend::Buddy, total, 0, 0, hash);
                 }
             }
         }
 
         // 3. System Fallback: any size/alignment (over-maps to satisfy align).
-        self.system_alloc_with_header(total, align)
+        self.system_alloc_with_header(total, align, hash)
     }
 
     /// Allocate `total` bytes at `align` via the System Fallback, write a
     /// `System`-tagged header, and leak the `Mapping` (dealloc will `munmap`
     /// using the base/length recorded in the header). Returns the user ptr.
-    fn system_alloc_with_header(&self, total: usize, align: usize) -> *mut u8 {
+    fn system_alloc_with_header(&self, total: usize, align: usize, hash: u64) -> *mut u8 {
         let pad = header_pad(align);
         let mapping = match system::alloc_pages(total, align) {
             Some(m) => m,
@@ -250,12 +269,13 @@ impl Lohalloc {
         let raw_base = unsafe { mapping.raw_base_for_unmap() };
         let raw_len = unsafe { mapping.raw_len_for_unmap() };
         core::mem::forget(mapping);
-        self.write_header(base, pad, Backend::System, total, raw_base, raw_len)
+        self.write_header(base, pad, Backend::System, total, raw_base, raw_len, hash)
     }
 
     /// Write the ownership header at `block + pad - HEADER_SIZE` and return
     /// `block + pad` (the user pointer). `block` must be aligned to at least
     /// `align` and hold `total` usable bytes.
+    #[allow(clippy::too_many_arguments)]
     fn write_header(
         &self,
         block: *mut u8,
@@ -264,6 +284,7 @@ impl Lohalloc {
         total: usize,
         base: usize,
         map_len: usize,
+        hash: u64,
     ) -> *mut u8 {
         let user = unsafe { block.add(pad) };
         let header = Header {
@@ -273,10 +294,50 @@ impl Lohalloc {
             size: total,
             base,
             map_len,
+            hash,
         };
         unsafe {
             core::ptr::write_unaligned(user.sub(HEADER_SIZE) as *mut Header, header);
         }
         user
+    }
+
+    /// Reset the Bump Arena, reclaiming all arena allocations.
+    ///
+    /// This is the "reset-based reclaim" mechanism: all Arena-tagged pointers
+    /// are invalidated. The Decision Engine (Phase 3) will call this when a
+    /// topological cluster's lifetime ends.
+    pub fn reset_arena(&self) {
+        if let Ok(mut arena_guard) = self.arena.lock() {
+            if let Some(ref mut arena) = *arena_guard {
+                arena.reset();
+            }
+        }
+    }
+
+    /// Allocate from the Bump Arena, writing an Arena-tagged header.
+    ///
+    /// This is not called by `route_alloc` in Phase 2 (routing is still
+    /// size-based). The Decision Engine (Phase 3) will call this directly
+    /// when the MAB policy routes a signature to the Arena backend.
+    pub fn arena_alloc(&self, size: usize, align: usize) -> *mut u8 {
+        let align = align.max(MIN_ALIGN);
+        let pad = header_pad(align);
+        let total = size + pad;
+
+        if let Ok(mut arena_guard) = self.arena.lock() {
+            // Lazily initialize the arena on first use.
+            if arena_guard.is_none() {
+                *arena_guard = arena::BumpArena::new();
+            }
+            if let Some(ref mut arena) = *arena_guard {
+                if let Some(block) = arena.alloc(total, align) {
+                    let hash = topology::fast_stack_hash();
+                    return self.write_header(block, pad, Backend::Arena, total, 0, 0, hash);
+                }
+            }
+        }
+        // Arena full or init failed → fall through to System.
+        self.system_alloc_with_header(total, align, 0)
     }
 }

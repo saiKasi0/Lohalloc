@@ -36,16 +36,23 @@ pub enum Backend {
     Slab = 0,
     Buddy = 1,
     System = 2,
+    Arena = 3,
 }
 
 impl Backend {
-    pub const ALL: [Backend; 3] = [Backend::Slab, Backend::Buddy, Backend::System];
+    pub const ALL: [Backend; 4] = [
+        Backend::Slab,
+        Backend::Buddy,
+        Backend::System,
+        Backend::Arena,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Backend::Slab => "slab",
             Backend::Buddy => "buddy",
             Backend::System => "system",
+            Backend::Arena => "arena",
         }
     }
 }
@@ -55,9 +62,8 @@ impl Backend {
 /// Each entry is a fixed block size (bytes). A request of `n` bytes is served
 /// by the smallest class `>= n`. Keep these powers of two for buddy-friendliness
 /// and simple alignment; the table is small and indexed by `u8`.
-pub const SLAB_SIZE_CLASSES: [usize; 12] = [
-    8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
-];
+pub const SLAB_SIZE_CLASSES: [usize; 12] =
+    [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384];
 
 /// Largest allocation served by the Slab allocator. Above this we fall back to
 /// the Buddy allocator; above `BUDDY_MAX` we go straight to the System backend.

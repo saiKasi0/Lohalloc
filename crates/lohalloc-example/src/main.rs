@@ -18,7 +18,11 @@ use lohalloc_alloc::Lohalloc;
 static ALLOC: Lohalloc = Lohalloc::new();
 
 fn main() {
-    println!("Lohalloc smoke test — host: {} {}", std::env::consts::OS, std::env::consts::ARCH);
+    println!(
+        "Lohalloc smoke test — host: {} {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
 
     // 1. Vec growth (many reallocs through the global allocator).
     let mut v: Vec<u64> = Vec::new();
@@ -51,6 +55,9 @@ fn main() {
     }
     assert_eq!(m.get(&50_000u64), Some(&100_000));
 
-    println!("OK: completed {} vec entries, large buffer, 100k hashmap entries", v.len());
+    println!(
+        "OK: completed {} vec entries, large buffer, 100k hashmap entries",
+        v.len()
+    );
     println!("Lohalloc smoke test PASSED");
 }

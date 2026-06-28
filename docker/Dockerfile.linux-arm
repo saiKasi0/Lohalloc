@@ -1,0 +1,32 @@
+# Docker image for cross-testing Lohalloc on aarch64-unknown-linux-gnu.
+#
+# Usage (from repo root):
+#   docker build -f docker/Dockerfile.linux-arm -t lohalloc-linux-arm .
+#   docker run --rm lohalloc-linux-arm
+#
+# On an Apple Silicon host this runs natively; on x86_64 it uses QEMU.
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust (stable) and the aarch64-unknown-linux-gnu target.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    --default-toolchain stable \
+    --profile minimal \
+    --target aarch64-unknown-linux-gnu
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Copy the workspace.
+WORKDIR /lohalloc
+COPY . .
+
+# Build and test.
+RUN cargo test --target aarch64-unknown-linux-gnu --workspace

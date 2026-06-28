@@ -1,0 +1,14 @@
+# Build configuration for Lohalloc.
+#
+# Layer 1 of the two-layered frame-pointer defense (see COPILOT.md →
+# "Topology Engine Design"). Forces the compiler to always preserve frame
+# pointers so the Phase 2 inline-asm stack walker can follow the `rbp`
+# (x86_64) / `x29` (ARM64) chain without hitting garbage values.
+
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]
+
+[profile.bench]
+opt-level = 3
+debug = true   # Preserves debug symbols for accurate PC hashing
+strip = "none"
