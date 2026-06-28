@@ -6,8 +6,9 @@
 //! ```
 //!
 //! Listens on `127.0.0.1:3000` by default. Set `LOHALLOC_ADDR` to override.
+//! Serves the built frontend from `gui/dist/` if it exists.
 
-use lohalloc_server::{build_app, AppState};
+use lohalloc_server::{build_app_with_options, AppState};
 
 #[tokio::main]
 async fn main() {
@@ -19,7 +20,8 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     eprintln!("Lohalloc server listening on {addr}");
 
-    axum::serve(listener, build_app(AppState::new()))
+    // Serve static frontend files from gui/dist/ in production.
+    axum::serve(listener, build_app_with_options(AppState::new(), true))
         .await
         .unwrap();
 }

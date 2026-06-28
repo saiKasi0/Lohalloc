@@ -577,6 +577,66 @@ impl Lohalloc {
 
         self.route_by_size(total, align, pad, hash)
     }
+
+    /// Allocate with a caller-provided hash **and** a strategy override
+    /// (Phase 5). The strategy biases backend selection: if the strategy's
+    /// preferred backend can serve the request, it is used instead of the
+    /// MAB recommendation.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as `alloc_with_hash`.
+    pub unsafe fn alloc_with_hash_and_strategy(
+        &self,
+        layout: Layout,
+        hash: u64,
+        strategy: lohalloc_core::Strategy,
+    ) -> *mut u8 {
+        let size = layout.size().max(1);
+        let align = layout.align().max(MIN_ALIGN);
+        let pad = header_pad(align);
+        let total = size + pad;
+
+        let depth = IN_ALLOC.get();
+        if depth > 0 {
+            return self.system_alloc_with_header(total, align, hash);
+        }
+
+        // If the strategy specifies a preferred backend, try it first.
+        if let Some(preferred) = strategy.preferred_backend(size) {
+            IN_ALLOC.set(depth + 1);
+            if let Some(ptr) = self.try_backend(preferred, total, align, pad, hash) {
+                IN_ALLOC.set(depth);
+                return ptr;
+            }
+            // Preferred backend failed — fall through to MAB / size routing.
+            IN_ALLOC.set(depth);
+        }
+
+        IN_ALLOC.set(depth + 1);
+        let ptr = self.route_alloc_with_hash(size, align, pad, total, hash);
+        IN_ALLOC.set(depth);
+        ptr
+    }
+
+    /// Returns which backend served an allocation by reading the Header.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a valid pointer previously returned by `alloc_with_hash`
+    /// or `alloc_with_hash_and_strategy`.
+    pub unsafe fn backend_for_ptr(&self, ptr: *mut u8) -> Option<lohalloc_core::Backend> {
+        if ptr.is_null() {
+            return None;
+        }
+        let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
+        Backend::from_u8(header.backend).map(|b| match b {
+            Backend::Slab => lohalloc_core::Backend::Slab,
+            Backend::Buddy => lohalloc_core::Backend::Buddy,
+            Backend::System => lohalloc_core::Backend::System,
+            Backend::Arena => lohalloc_core::Backend::Arena,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

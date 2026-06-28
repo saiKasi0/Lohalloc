@@ -58,6 +58,70 @@ impl Backend {
     }
 }
 
+/// Strategy override for the Decision Engine (Phase 5).
+///
+/// When set, the replay engine biases backend selection toward the strategy's
+/// preferred backend(s). This is a layer on top of the MAB — it doesn't
+/// replace the bandit but overrides its recommendation when the preferred
+/// backend can serve the request.
+///
+/// Real strategy-driven policy tuning (latency-based reward) arrives in
+/// Phase 6. For Phase 5, the override is a simple preference filter.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum Strategy {
+    /// MAB-driven routing — no override (default).
+    #[default]
+    Default,
+    /// Prefer fast backends (Slab for small, Arena for clusters).
+    LatencyPriority,
+    /// Prefer high-throughput backends (Buddy/Arena for bulk).
+    ThroughputPriority,
+}
+
+impl Strategy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Strategy::Default => "default",
+            Strategy::LatencyPriority => "latency_priority",
+            Strategy::ThroughputPriority => "throughput_priority",
+        }
+    }
+
+    /// Parse a `Strategy` from its snake_case string form.
+    pub fn parse_strategy(s: &str) -> Option<Self> {
+        match s.trim() {
+            "default" => Some(Strategy::Default),
+            "latency_priority" => Some(Strategy::LatencyPriority),
+            "throughput_priority" => Some(Strategy::ThroughputPriority),
+            _ => None,
+        }
+    }
+
+    /// Returns the preferred backend for a given size under this strategy,
+    /// or `None` if the strategy doesn't override (i.e., `Default`).
+    pub fn preferred_backend(self, size: usize) -> Option<Backend> {
+        match self {
+            Strategy::Default => None,
+            Strategy::LatencyPriority => {
+                if size <= 16384 {
+                    Some(Backend::Slab)
+                } else {
+                    Some(Backend::Buddy)
+                }
+            }
+            Strategy::ThroughputPriority => {
+                if size <= 16384 {
+                    Some(Backend::Arena)
+                } else {
+                    Some(Backend::Buddy)
+                }
+            }
+        }
+    }
+}
+
 /// Allocation operation kind. Used in trace records and the uploaded trace
 /// format (`{"op": "alloc|free", ...}`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -101,12 +165,18 @@ impl AllocOp {
 ///   "thread_id": "u32",
 ///   "result_ptr": "0xAddr",
 ///   "latency_ns": "u64",
-///   "fragmentation_pct": "f32"
+///   "fragmentation_pct": "f32",
+///   "backend": "slab | buddy | system | arena"
 /// }
 /// ```
 ///
 /// `result_ptr` is serialized as a hexadecimal string (`"0x..."`) for
 /// human-readability in the GUI; deserialize accepts the same format.
+///
+/// `backend` (added in Phase 5) indicates which Execution-Plane worker
+/// served the allocation. It is omitted from serialization when the backend
+/// is unknown (`None`), ensuring backward compatibility with Phase 4
+/// consumers.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TelemetryRecord {
@@ -123,6 +193,13 @@ pub struct TelemetryRecord {
     pub result_ptr: u64,
     pub latency_ns: u64,
     pub fragmentation_pct: f32,
+    /// Which backend served this allocation (Phase 5). `None` for free ops
+    /// or when backend info is unavailable. Serialized only when `Some`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
+    pub backend: Option<Backend>,
 }
 
 #[cfg(feature = "serde")]

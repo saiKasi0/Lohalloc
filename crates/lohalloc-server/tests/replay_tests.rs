@@ -363,6 +363,7 @@ fn telemetry_record_serde_roundtrip() {
         result_ptr: 0xdeadbeef,
         latency_ns: 500,
         fragmentation_pct: 12.5,
+        backend: None,
     };
     let json = serde_json::to_string(&record).unwrap();
     assert!(json.contains("0xdeadbeef"));

@@ -35,7 +35,7 @@
 
 use core::alloc::Layout;
 use lohalloc_alloc::Lohalloc;
-use lohalloc_core::{AllocOp, TelemetryRecord, TraceOp};
+use lohalloc_core::{AllocOp, Strategy, TelemetryRecord, TraceOp};
 use std::time::Instant;
 
 use crate::telemetry::TelemetrySender;
@@ -98,8 +98,17 @@ pub fn replay_trace_json(
     json: &str,
     sender: Option<&TelemetrySender>,
 ) -> Result<ReplayResult, ReplayError> {
+    replay_trace_json_with_strategy(json, sender, Strategy::Default)
+}
+
+/// Replay a JSON trace with a strategy override (Phase 5).
+pub fn replay_trace_json_with_strategy(
+    json: &str,
+    sender: Option<&TelemetrySender>,
+    strategy: Strategy,
+) -> Result<ReplayResult, ReplayError> {
     let ops = parse_json_trace(json)?;
-    Ok(replay_ops(&ops, sender))
+    Ok(replay_ops(&ops, sender, strategy))
 }
 
 /// Replay a CSV trace string through a fresh private `Lohalloc` instance.
@@ -117,8 +126,17 @@ pub fn replay_trace_csv(
     csv: &str,
     sender: Option<&TelemetrySender>,
 ) -> Result<ReplayResult, ReplayError> {
+    replay_trace_csv_with_strategy(csv, sender, Strategy::Default)
+}
+
+/// Replay a CSV trace with a strategy override (Phase 5).
+pub fn replay_trace_csv_with_strategy(
+    csv: &str,
+    sender: Option<&TelemetrySender>,
+    strategy: Strategy,
+) -> Result<ReplayResult, ReplayError> {
     let ops = parse_csv_trace(csv)?;
-    Ok(replay_ops(&ops, sender))
+    Ok(replay_ops(&ops, sender, strategy))
 }
 
 /// Replay a trace file (auto-detected JSON or CSV by extension) from disk.
@@ -126,11 +144,20 @@ pub fn replay_trace_file(
     path: &str,
     sender: Option<&TelemetrySender>,
 ) -> Result<ReplayResult, ReplayError> {
+    replay_trace_file_with_strategy(path, sender, Strategy::Default)
+}
+
+/// Replay a trace file with a strategy override (Phase 5).
+pub fn replay_trace_file_with_strategy(
+    path: &str,
+    sender: Option<&TelemetrySender>,
+    strategy: Strategy,
+) -> Result<ReplayResult, ReplayError> {
     let content = std::fs::read_to_string(path)?;
     if path.ends_with(".csv") {
-        replay_trace_csv(&content, sender)
+        replay_trace_csv_with_strategy(&content, sender, strategy)
     } else {
-        replay_trace_json(&content, sender)
+        replay_trace_json_with_strategy(&content, sender, strategy)
     }
 }
 
@@ -194,7 +221,11 @@ pub fn parse_csv_trace(csv: &str) -> Result<Vec<TraceOp>, ReplayError> {
 
 /// Drive a fresh `Lohalloc` instance through `ops`, emit telemetry to
 /// `sender`, freeze, and export the `.lohalloc` model.
-fn replay_ops(ops: &[TraceOp], sender: Option<&TelemetrySender>) -> ReplayResult {
+fn replay_ops(
+    ops: &[TraceOp],
+    sender: Option<&TelemetrySender>,
+    strategy: Strategy,
+) -> ReplayResult {
     let alloc = Lohalloc::new();
     let mut records_emitted = 0usize;
     let mut ops_executed = 0usize;
@@ -204,12 +235,22 @@ fn replay_ops(ops: &[TraceOp], sender: Option<&TelemetrySender>) -> ReplayResult
 
     for (i, op) in ops.iter().enumerate() {
         let start = Instant::now();
-        let (result_ptr, latency_ns, timestamp) = match op.op {
+        let (result_ptr, latency_ns, timestamp, backend) = match op.op {
             AllocOp::Alloc => {
                 let layout =
                     Layout::from_size_align(op.size.max(1), 16).expect("invalid layout in replay");
-                // Use the trace's stack_hash for deterministic routing.
-                let ptr = unsafe { alloc.alloc_with_hash(layout, op.stack_hash) };
+                // Use the trace's stack_hash for deterministic routing,
+                // plus the strategy override (Phase 5).
+                let ptr = if strategy == Strategy::Default {
+                    unsafe { alloc.alloc_with_hash(layout, op.stack_hash) }
+                } else {
+                    unsafe { alloc.alloc_with_hash_and_strategy(layout, op.stack_hash, strategy) }
+                };
+                let backend = if !ptr.is_null() {
+                    unsafe { alloc.backend_for_ptr(ptr) }
+                } else {
+                    None
+                };
                 if ptr.is_null() {
                     // We still emit a telemetry record for the failure.
                     let latency = start.elapsed().as_nanos() as u64;
@@ -223,27 +264,34 @@ fn replay_ops(ops: &[TraceOp], sender: Option<&TelemetrySender>) -> ReplayResult
                             result_ptr: 0,
                             latency_ns: latency,
                             fragmentation_pct: 0.0,
+                            backend: None,
                         });
                         records_emitted += 1;
                     }
                     continue;
                 }
                 live.push((ptr, op.size));
-                (ptr as u64, start.elapsed().as_nanos() as u64, i as u64)
+                (
+                    ptr as u64,
+                    start.elapsed().as_nanos() as u64,
+                    i as u64,
+                    backend,
+                )
             }
             AllocOp::Free => {
                 // Free the most recent live allocation of matching size (LIFO).
                 let idx = live.iter().rposition(|(_, s)| *s == op.size);
-                let ptr = if let Some(idx) = idx {
+                let (ptr, backend) = if let Some(idx) = idx {
                     let (ptr, size) = live.swap_remove(idx);
                     let layout = Layout::from_size_align(size.max(1), 16)
                         .expect("invalid layout in replay free");
+                    let backend = unsafe { alloc.backend_for_ptr(ptr) };
                     unsafe { alloc.dealloc_with_hash(ptr, layout) };
-                    ptr as u64
+                    (ptr as u64, backend)
                 } else {
-                    0 // No matching live allocation — no-op.
+                    (0, None) // No matching live allocation — no-op.
                 };
-                (ptr, start.elapsed().as_nanos() as u64, i as u64)
+                (ptr, start.elapsed().as_nanos() as u64, i as u64, backend)
             }
         };
 
@@ -261,6 +309,7 @@ fn replay_ops(ops: &[TraceOp], sender: Option<&TelemetrySender>) -> ReplayResult
                 // Fragmentation estimate is a placeholder for Phase 4 —
                 // real fragmentation tracking arrives with the Observer.
                 fragmentation_pct: 0.0,
+                backend,
             });
             records_emitted += 1;
         }

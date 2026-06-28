@@ -18,10 +18,11 @@ pub mod server;
 pub mod telemetry;
 
 pub use replay::{
-    parse_csv_trace, parse_json_trace, replay_trace_csv, replay_trace_file, replay_trace_json,
-    ReplayError, ReplayResult,
+    parse_csv_trace, parse_json_trace, replay_trace_csv, replay_trace_csv_with_strategy,
+    replay_trace_file, replay_trace_file_with_strategy, replay_trace_json,
+    replay_trace_json_with_strategy, ReplayError, ReplayResult,
 };
-pub use server::{build_app, AppState};
+pub use server::{build_app, build_app_with_options, AppState};
 pub use telemetry::{
     telemetry_channel, telemetry_channel_with_capacity, TelemetryReceiver, TelemetrySender,
     DEFAULT_CAPACITY,

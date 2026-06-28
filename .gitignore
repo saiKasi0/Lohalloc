@@ -3,3 +3,5 @@ COPILOT.md
 .claude
 target/
 .github
+dist/
+node_modules

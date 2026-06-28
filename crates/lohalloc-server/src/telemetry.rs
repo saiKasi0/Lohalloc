@@ -102,6 +102,7 @@ mod tests {
             result_ptr: 0x1000,
             latency_ns: 100,
             fragmentation_pct: 0.0,
+            backend: None,
         }
     }
 
