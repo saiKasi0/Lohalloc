@@ -5,3 +5,13 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Shared types for Lohalloc: size classes, alignment, signatures, trace records."
+
+[features]
+default = []
+# Enables `serde::Serialize`/`Deserialize` derives on shared types
+# (telemetry records, AllocOp). Required by `lohalloc-server` (Phase 4)
+# for JSON over WebSocket and the `/api/upload-trace` endpoint.
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }

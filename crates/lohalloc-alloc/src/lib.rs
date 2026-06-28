@@ -508,6 +508,75 @@ impl Lohalloc {
             false
         }
     }
+
+    // -----------------------------------------------------------------
+    // Phase 4: Replay Engine support
+    // -----------------------------------------------------------------
+
+    /// Allocate `size` bytes at `align` using a **caller-provided hash** instead
+    /// of capturing the stack via `fast_stack_hash()`.
+    ///
+    /// This is used by the replay engine (`lohalloc-server`) to drive a private
+    /// `Lohalloc` instance with a deterministic hash from trace files, so that
+    /// replaying the same trace produces an identical `.lohalloc` model.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as `GlobalAlloc::alloc`: returns a valid, aligned,
+    /// `size`-byte buffer or null on failure.
+    pub unsafe fn alloc_with_hash(&self, layout: Layout, hash: u64) -> *mut u8 {
+        let size = layout.size().max(1);
+        let align = layout.align().max(MIN_ALIGN);
+        let pad = header_pad(align);
+        let total = size + pad;
+
+        let depth = IN_ALLOC.get();
+        if depth > 0 {
+            return self.system_alloc_with_header(total, align, hash);
+        }
+
+        IN_ALLOC.set(depth + 1);
+        let ptr = self.route_alloc_with_hash(size, align, pad, total, hash);
+        IN_ALLOC.set(depth);
+        ptr
+    }
+
+    /// Deallocate a pointer previously returned by `alloc_with_hash`.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as `GlobalAlloc::dealloc`: `ptr` must have been returned by
+    /// a prior `alloc_with_hash` call with a matching `Layout`.
+    pub unsafe fn dealloc_with_hash(&self, ptr: *mut u8, layout: Layout) {
+        // Delegate to the GlobalAlloc impl — it reads the header for routing.
+        unsafe { self.dealloc(ptr, layout) };
+    }
+
+    /// Internal: route an allocation with a caller-provided hash.
+    fn route_alloc_with_hash(
+        &self,
+        size: usize,
+        align: usize,
+        pad: usize,
+        total: usize,
+        hash: u64,
+    ) -> *mut u8 {
+        let recommended: Option<lohalloc_core::Backend> = if let Ok(mut st) = self.state.lock() {
+            let backend = st.route(hash, size);
+            st.record(hash, backend, size);
+            Some(backend)
+        } else {
+            None
+        };
+
+        if let Some(backend) = recommended {
+            if let Some(ptr) = self.try_backend(backend, total, align, pad, hash) {
+                return ptr;
+            }
+        }
+
+        self.route_by_size(total, align, pad, hash)
+    }
 }
 
 // ---------------------------------------------------------------------------

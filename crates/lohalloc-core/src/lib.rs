@@ -31,6 +31,7 @@ impl Signature {
 /// Which Execution-Plane worker handled a request. Stored in trace records
 /// and surfaced in the GUI's Policy Matrix.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum Backend {
     Slab = 0,
@@ -55,6 +56,105 @@ impl Backend {
             Backend::Arena => "arena",
         }
     }
+}
+
+/// Allocation operation kind. Used in trace records and the uploaded trace
+/// format (`{"op": "alloc|free", ...}`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+pub enum AllocOp {
+    Alloc,
+    Free,
+}
+
+impl AllocOp {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            AllocOp::Alloc => "alloc",
+            AllocOp::Free => "free",
+        }
+    }
+
+    /// Parse an `AllocOp` from its lowercase string form. Used by the
+    /// CSV/JSON trace parsers in `lohalloc-server`.
+    pub fn parse_op(s: &str) -> Option<Self> {
+        match s.trim() {
+            "alloc" => Some(AllocOp::Alloc),
+            "free" => Some(AllocOp::Free),
+            _ => None,
+        }
+    }
+}
+
+/// A single telemetry record emitted by the allocator or the replay engine.
+///
+/// Matches the **Performance Trace Format** JSON schema documented in
+/// `COPILOT.md`:
+///
+/// ```json
+/// {
+///   "timestamp": "u64",
+///   "op": "alloc | free",
+///   "size": "usize",
+///   "stack_hash": "u64",
+///   "thread_id": "u32",
+///   "result_ptr": "0xAddr",
+///   "latency_ns": "u64",
+///   "fragmentation_pct": "f32"
+/// }
+/// ```
+///
+/// `result_ptr` is serialized as a hexadecimal string (`"0x..."`) for
+/// human-readability in the GUI; deserialize accepts the same format.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TelemetryRecord {
+    pub timestamp: u64,
+    pub op: AllocOp,
+    pub size: usize,
+    pub stack_hash: u64,
+    pub thread_id: u32,
+    /// Pointer result serialized as `"0x<hex>"` over JSON.
+    #[cfg_attr(
+        feature = "serde",
+        serde(serialize_with = "serialize_ptr", deserialize_with = "deserialize_ptr")
+    )]
+    pub result_ptr: u64,
+    pub latency_ns: u64,
+    pub fragmentation_pct: f32,
+}
+
+#[cfg(feature = "serde")]
+fn serialize_ptr<S: serde::Serializer>(ptr: &u64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&format!("0x{ptr:x}"))
+}
+
+#[cfg(feature = "serde")]
+fn deserialize_ptr<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    use serde::Deserialize;
+    let s = String::deserialize(d)?;
+    let s = s.trim();
+    let hex = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    u64::from_str_radix(hex, 16).map_err(serde::de::Error::custom)
+}
+
+/// A single entry in an uploaded trace file (JSON or CSV). This is the
+/// input format accepted by `POST /api/upload-trace` and
+/// `replay_trace_json`.
+///
+/// ```json
+/// {"op": "alloc", "size": 64, "stack_hash": 1234567890}
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TraceOp {
+    pub op: AllocOp,
+    pub size: usize,
+    pub stack_hash: u64,
 }
 
 /// The canonical size-class table used by the Slab allocator.
