@@ -19,6 +19,11 @@
 //!   of records (Phase 5++: live mode from LD_PRELOAD shim or external
 //!   producers). Forwards each record to the existing telemetry channel so
 //!   `/ws/telemetry` clients receive it in real time. Returns `202 Accepted`.
+//! - `GET /api/export-trace` — Returns a JSON array snapshot of the most
+//!   recent telemetry records (`TelemetryRecord[]`). Backed by an
+//!   independent ring buffer (`TRACE_RING_CAPACITY` records) that mirrors
+//!   what `POST /api/telemetry` / `POST /api/upload-trace` push, so it does
+//!   not interfere with the live WS stream.
 //! - `GET /health` — Liveness check.
 //!
 //! # Static File Serving
@@ -43,12 +48,17 @@ use axum::{
     Json, Router,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
-use lohalloc_core::{Strategy, TraceOp};
+use lohalloc_core::{Strategy, TelemetryRecord, TraceOp};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
 use crate::replay::{replay_trace_json_with_strategy, ReplayError};
 use crate::telemetry::{telemetry_channel, TelemetryReceiver, TelemetrySender};
+
+/// Maximum number of telemetry records retained for `GET /api/export-trace`.
+/// At ~200 bytes per record this caps the ring at ~13 MB.
+pub const TRACE_RING_CAPACITY: usize = 65_536;
 
 /// Shared application state.
 #[derive(Clone)]
@@ -73,6 +83,11 @@ pub struct AppState {
     /// via `GET /api/routing-table` so the GUI can render the Policy
     /// Matrix without re-parsing the binary model on each request.
     routing_table: Arc<std::sync::RwLock<Vec<(u64, String)>>>,
+    /// Ring buffer of recent telemetry records for `GET /api/export-trace`.
+    /// Independent of the live WS stream (which drains `telemetry_rx`); a
+    /// snapshot is served on demand. Capacity: [`TRACE_RING_CAPACITY`]
+    /// records.
+    trace_ring: Arc<std::sync::Mutex<VecDeque<TelemetryRecord>>>,
 }
 
 impl AppState {
@@ -90,7 +105,32 @@ impl AppState {
             last_model: Arc::new(std::sync::Mutex::new(Vec::new())),
             is_inference: Arc::new(std::sync::RwLock::new(false)),
             routing_table: Arc::new(std::sync::RwLock::new(Vec::new())),
+            trace_ring: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(
+                TRACE_RING_CAPACITY,
+            ))),
         }
+    }
+
+    /// Push a record into the export-trace ring buffer. When the buffer is
+    /// full, the oldest record is dropped. The lock is best-effort: if it
+    /// is poisoned we silently skip the push (the telemetry channel is the
+    /// authoritative live stream — losing a snapshot record is non-fatal).
+    pub fn push_trace_record(&self, record: TelemetryRecord) {
+        if let Ok(mut ring) = self.trace_ring.lock() {
+            if ring.len() >= TRACE_RING_CAPACITY {
+                ring.pop_front();
+            }
+            ring.push_back(record);
+        }
+    }
+
+    /// Snapshot the current contents of the ring buffer in insertion order.
+    /// Returns an empty `Vec` if the lock is poisoned.
+    pub fn snapshot_trace_ring(&self) -> Vec<TelemetryRecord> {
+        self.trace_ring
+            .lock()
+            .map(|r| r.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Get the current strategy.

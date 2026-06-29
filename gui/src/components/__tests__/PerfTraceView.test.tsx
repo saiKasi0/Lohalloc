@@ -16,12 +16,12 @@ describe('PerfTraceView', () => {
         <PerfTraceView records={cannedRecords} />
       </div>
     );
-    expect(screen.getByText('PERFORMANCE TRACE')).toBeDefined();
+    expect(screen.getByText('LATENCY P50/P90/P99')).toBeDefined();
   });
 
   it('shows waiting message when no data', () => {
     render(<PerfTraceView records={[]} />);
-    expect(screen.getByText('AWAITING TELEMETRY...')).toBeDefined();
+    expect(screen.getAllByText('AWAITING TELEMETRY...').length).toBeGreaterThan(0);
   });
 
   it('renders chart container with data', () => {
