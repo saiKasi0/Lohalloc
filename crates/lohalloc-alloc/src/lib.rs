@@ -39,6 +39,8 @@
 pub mod arena;
 pub mod bandit;
 pub mod buddy;
+#[cfg(feature = "telemetry-observer")]
+pub mod observer;
 pub mod perfect_hash;
 pub mod slab;
 pub mod state;
@@ -210,6 +212,16 @@ unsafe impl GlobalAlloc for Lohalloc {
             debug_assert!(false, "dealloc: bad header magic");
             return;
         }
+
+        // Telemetry hook (compiled away when the feature is off). Emit the
+        // free record before routing so the GUI sees every deallocation,
+        // even those that will be silently dropped (e.g. Arena frees, which
+        // are no-ops here).
+        #[cfg(feature = "telemetry-observer")]
+        {
+            observer::emit_free(header.size, header.hash, ptr as u64);
+        }
+
         match Backend::from_u8(header.backend) {
             Some(Backend::Slab) => {
                 let pad = header_pad(layout.align().max(MIN_ALIGN));
@@ -399,9 +411,10 @@ impl Lohalloc {
         hash: u64,
     ) -> *mut u8 {
         let user = unsafe { block.add(pad) };
+        let backend_tag = backend as u8;
         let header = Header {
             magic: MAGIC,
-            backend: backend as u8,
+            backend: backend_tag,
             _pad: [0; 7],
             size: total,
             base,
@@ -411,6 +424,16 @@ impl Lohalloc {
         unsafe {
             core::ptr::write_unaligned(user.sub(HEADER_SIZE) as *mut Header, header);
         }
+
+        // Telemetry hook (compiled away when the feature is off). This is
+        // the single chokepoint every successful allocation flows through,
+        // so we emit here rather than at each call site in `try_backend` /
+        // `route_by_size` / `system_alloc_with_header`.
+        #[cfg(feature = "telemetry-observer")]
+        {
+            observer::emit_alloc(total, hash, user as u64, backend_tag);
+        }
+
         user
     }
 

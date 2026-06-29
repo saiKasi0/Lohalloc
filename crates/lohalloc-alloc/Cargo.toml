@@ -9,3 +9,9 @@ description = "Lohalloc Execution Plane: GlobalAlloc shim with Slab, Buddy, and 
 [dependencies]
 lohalloc-core.workspace = true
 libc = "0.2"
+
+[features]
+# When enabled, every alloc/free emits a `TelemetryCRecord` to a C-ABI sink
+# installed by the demo binary (via LD_PRELOAD). Compiled away completely
+# when disabled — no symbols, no branches, no atomic loads on the hot path.
+telemetry-observer = []

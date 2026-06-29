@@ -15,6 +15,10 @@
 //!   `{"mode": "inference"}` depending on Decision Engine state.
 //! - `GET /api/routing-table` — Returns the frozen routing table as a JSON
 //!   array of `{hash, backend}` objects, or `[]` if not in Inference mode.
+//! - `POST /api/telemetry` — Accepts a single `TelemetryRecord` or an array
+//!   of records (Phase 5++: live mode from LD_PRELOAD shim or external
+//!   producers). Forwards each record to the existing telemetry channel so
+//!   `/ws/telemetry` clients receive it in real time. Returns `202 Accepted`.
 //! - `GET /health` — Liveness check.
 //!
 //! # Static File Serving
@@ -175,6 +179,7 @@ pub fn build_app_with_options(state: AppState, serve_static: bool) -> Router {
         )
         .route("/api/mode", get(get_mode_handler))
         .route("/api/routing-table", get(get_routing_table_handler))
+        .route("/api/telemetry", post(post_telemetry_handler))
         .route("/health", get(health_handler))
         .layer(CorsLayer::permissive());
 
@@ -375,6 +380,61 @@ async fn get_routing_table_handler(State(state): State<AppState>) -> Response {
         .map(|(hash, backend)| serde_json::json!({ "hash": hash, "backend": backend }))
         .collect();
     Json(payload).into_response()
+}
+
+/// `POST /api/telemetry` — Live-mode ingest endpoint (Phase 5++).
+///
+/// Accepts either:
+/// - A single JSON `TelemetryRecord`: `{ "timestamp": ..., "op": "alloc|free", ... }`
+/// - A JSON array of records: `[ {...}, {...} ]`
+///
+/// Each record is forwarded to the shared telemetry channel (`telemetry_tx`),
+/// which the existing `/ws/telemetry` WebSocket handler drains. This means
+/// the GUI's `useTelemetry()` hook, `FloatingWeb`, `TelemetrySidebar`,
+/// `PolicyMatrix`, and `PerfTraceView` all receive these live records
+/// without any change to their consumption logic.
+///
+/// Records that don't fit the bounded buffer (capacity = `DEFAULT_CAPACITY`)
+/// are silently dropped, matching the replay engine's behavior — we never
+/// block the producer.
+///
+/// Returns:
+/// - `202 Accepted` with `{ "accepted": <count> }` on success.
+/// - `400 Bad Request` if the body is not valid JSON or doesn't match the
+///   `TelemetryRecord` schema.
+/// - `415 Unsupported Media Type` if the `Content-Type` header is not
+///   `application/json` (Axum's `Json` extractor enforces this).
+async fn post_telemetry_handler(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Response {
+    // Peek at the first non-whitespace byte to decide single vs array.
+    // This avoids the cost of deserializing to a `serde_json::Value`
+    // first and re-parsing.
+    let first = body.iter().find(|b| !b.is_ascii_whitespace()).copied();
+    let records: Vec<lohalloc_core::TelemetryRecord> = match first {
+        Some(b'[') => match serde_json::from_slice::<Vec<lohalloc_core::TelemetryRecord>>(&body) {
+            Ok(rs) => rs,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("invalid array: {e}")).into_response();
+            }
+        },
+        Some(_) => match serde_json::from_slice::<lohalloc_core::TelemetryRecord>(&body) {
+            Ok(r) => vec![r],
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("invalid record: {e}")).into_response();
+            }
+        },
+        None => {
+            return (StatusCode::BAD_REQUEST, "empty body").into_response();
+        }
+    };
+
+    let count = records.len();
+    for record in records {
+        state.telemetry_tx.send(record);
+    }
+    Json(serde_json::json!({ "accepted": count })).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -921,5 +981,207 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["mode"], "training");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5++: POST /api/telemetry (live mode ingest)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn post_telemetry_single_record_returns_202() {
+        let app = build_app(AppState::new());
+        // Note: Backend serializes as variant name "Slab" (no rename_all).
+        // stack_hash / result_ptr / timestamp are u64 — must be JSON numbers.
+        let body = r#"{
+            "timestamp": 12345,
+            "op": "alloc",
+            "size": 64,
+            "stack_hash": 9876543210,
+            "thread_id": 0,
+            "result_ptr": "0x1000",
+            "latency_ns": 100,
+            "fragmentation_pct": 0.0,
+            "backend": "Slab"
+        }"#;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/telemetry")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let resp_body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(v["accepted"], 1);
+    }
+
+    #[tokio::test]
+    async fn post_telemetry_batch_returns_202() {
+        let app = build_app(AppState::new());
+        let body = r#"[
+            {"timestamp":1,"op":"alloc","size":64,"stack_hash":100,"thread_id":0,"result_ptr":"0x1000","latency_ns":50,"fragmentation_pct":0.0,"backend":"Slab"},
+            {"timestamp":2,"op":"alloc","size":128,"stack_hash":101,"thread_id":0,"result_ptr":"0x2000","latency_ns":75,"fragmentation_pct":0.0,"backend":"Buddy"},
+            {"timestamp":3,"op":"free","size":64,"stack_hash":100,"thread_id":0,"result_ptr":"0x1000","latency_ns":20,"fragmentation_pct":0.0}
+        ]"#;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/telemetry")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let resp_body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(v["accepted"], 3);
+    }
+
+    #[tokio::test]
+    async fn post_telemetry_malformed_returns_400() {
+        let app = build_app(AppState::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/telemetry")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"not_a_record": true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_telemetry_empty_returns_400() {
+        let app = build_app(AppState::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/telemetry")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(""))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_telemetry_arrives_on_ws_stream() {
+        // End-to-end: POST a record → verify it shows up on /ws/telemetry.
+        let state = AppState::new();
+        let app = build_app(state.clone());
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, app).into_future());
+
+        // Connect to the WebSocket.
+        let (mut socket, _response) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/ws/telemetry"))
+                .await
+                .unwrap();
+
+        // POST a single record.
+        let client = reqwest::Client::new();
+        let body = r#"{
+            "timestamp": 99999,
+            "op": "alloc",
+            "size": 256,
+            "stack_hash": 3203385166,
+            "thread_id": 7,
+            "result_ptr": "0xDEADBEEF",
+            "latency_ns": 333,
+            "fragmentation_pct": 0.5,
+            "backend": "Slab"
+        }"#;
+        let response = client
+            .post(format!("http://{addr}/api/telemetry"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        // Verify it appears on the WebSocket.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("timed out waiting for WS message")
+            .expect("stream ended")
+            .expect("WS error");
+        let text = msg.into_text().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["size"], 256);
+        // result_ptr is serialized as "0x..." hex string by the
+        // `serialize_ptr` adapter on TelemetryRecord.
+        assert_eq!(v["result_ptr"], "0xdeadbeef");
+        assert_eq!(v["op"], "alloc");
+        assert_eq!(v["backend"], "Slab");
+    }
+
+    #[tokio::test]
+    async fn post_telemetry_batch_arrives_on_ws_stream() {
+        let state = AppState::new();
+        let app = build_app(state.clone());
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, app).into_future());
+
+        let (mut socket, _response) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/ws/telemetry"))
+                .await
+                .unwrap();
+
+        let client = reqwest::Client::new();
+        let body = r#"[
+            {"timestamp":1,"op":"alloc","size":16,"stack_hash":1,"thread_id":0,"result_ptr":"0x10","latency_ns":10,"fragmentation_pct":0.0,"backend":"Slab"},
+            {"timestamp":2,"op":"alloc","size":32,"stack_hash":2,"thread_id":0,"result_ptr":"0x20","latency_ns":20,"fragmentation_pct":0.0,"backend":"Slab"}
+        ]"#;
+        let response = client
+            .post(format!("http://{addr}/api/telemetry"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        // Drain two messages from the WS.
+        let mut received = 0;
+        while received < 2 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+                .await
+                .expect("timeout")
+                .expect("stream ended")
+                .expect("WS error");
+            let text = msg.into_text().unwrap();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(v.get("op").is_some());
+            received += 1;
+        }
+        assert_eq!(received, 2);
     }
 }

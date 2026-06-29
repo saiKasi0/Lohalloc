@@ -32,8 +32,12 @@ into allocator latency.
 
 The implementation is built in six phases. Phases 1-5 (Foundation,
 Topology Engine, MAB + Freeze, Server & Telemetry, GUI & Trace
-Replay) are complete. Phase 6 -- cross-platform benchmarking via
-criterion and Terraform-provisioned AWS instances -- is in progress.
+Replay) are complete, plus a **Phase 5++ live telemetry streaming**
+extension (feature-gated observer hook, LD_PRELOAD shim, `POST
+/api/telemetry`, GUI live indicator) that shifts the GUI from
+replay-only to live allocation visualization. Phase 6 -- cross-platform
+benchmarking via criterion and Terraform-provisioned AWS instances --
+is in progress.
 
 ---
 
@@ -52,7 +56,7 @@ criterion and Terraform-provisioned AWS instances -- is in progress.
 
 ```bash
 cargo build                            # build all crates
-cargo test --workspace                 # run 159 Rust tests
+cargo test --workspace                 # run 164 Rust tests
 cargo clippy --all-targets --workspace # must be warning-free
 cargo run -p lohalloc-example          # smoke binary
 ```
@@ -72,6 +76,43 @@ cargo run -p lohalloc-server
 cd gui && npm install && npm run dev
 # ->  http://127.0.0.1:5173   (open this)
 ```
+
+### Live mode (real allocations, zero-overhead hook)
+
+The GUI ships two modes:
+
+- **Replay mode** (default): drag-and-drop a CSV/JSON trace to replay
+  historical allocations offline.
+- **Live mode**: run the `lohalloc-demo` binary with the `LD_PRELOAD`
+  shim; the feature-gated observer hook in `lohalloc-alloc` emits
+  per-allocation records that flow through the shim → `POST
+  /api/telemetry` → existing `/ws/telemetry` channel → GUI in real
+  time.
+
+The observer hook is **zero-overhead in deployment**: it only compiles
+in with `--features telemetry-observer`. Production builds (default
+features) emit zero observer symbols — verified via `nm`.
+
+```bash
+# Terminal 1 -- backend
+cargo run -p lohalloc-server --release
+
+# Terminal 2 -- GUI
+cd gui && npm run dev
+
+# Terminal 3 -- build the C shim + run the live demo
+make -C shim
+DYLD_INSERT_LIBRARIES=$PWD/shim/build/liblohalloc_obs.dylib \
+  LOHALLOC_OBS_PORT=3000 \
+  cargo run -p lohalloc-demo --features install-shim-sink --release
+# (Linux: use LD_PRELOAD=$PWD/shim/build/liblohalloc_obs.so instead)
+```
+
+The GUI's `TelemetrySidebar` and `FloatingWeb` light up as real
+allocations arrive. A `LIVE` indicator in the top bar distinguishes a
+live stream from a burst-replay. See
+[`shim/README.md`](./shim/README.md) and
+[`gui/README.md`](./gui/README.md) for details.
 
 ### Cross-OS Docker builds
 
@@ -162,7 +203,9 @@ via Terraform.
 |   |-- lohalloc-core/        # Signature, size classes, alignment math (#![forbid(unsafe)])
 |   |-- lohalloc-alloc/       # GlobalAlloc shim + Slab/Buddy/Arena/System + Topology + MAB + MPHT
 |   |-- lohalloc-example/     # Binary: installs Lohalloc as the process global allocator
+|   |-- lohalloc-demo/       # Binary: live-training demo (Lohalloc + shim sink + churn workload)
 |   `-- lohalloc-server/      # Axum backend: WebSocket telemetry + trace replay + freeze/export
+|-- shim/                     # LD_PRELOAD C shim: ring buffer + HTTP POST bridge for live mode
 |-- gui/                      # React + Vite + Three.js + Tailwind + Recharts
 |   `-- src/
 |       |-- components/       # HeapMap, PolicyMatrix, PerfTraceView, StrategyToggle, TraceUpload
@@ -185,16 +228,20 @@ via Terraform.
 | 3 | State Machine (MAB + Freeze)| Complete       | UCB1 bandit, PerfectHashTable, `.lohalloc` export/load            |
 | 4 | Server & Telemetry          | Complete       | Axum + WebSocket, crossbeam ring buffer, private replay allocator |
 | 5 | GUI & Local Trace Replay    | Complete       | Three.js HeapMap, drag-and-drop trace upload, Freeze & Export     |
+| 5++ | Live Telemetry Streaming  | Complete       | Feature-gated observer hook, LD_PRELOAD shim, POST /api/telemetry |
 | 6 | Benchmarking & Cross-Platform | In progress  | criterion vs jemalloc/mimalloc, hybrid Terraform/AWS CI           |
 
 ---
 
 ## TESTING
 
-- **159 Rust tests** across `lohalloc-core` (3), `lohalloc-alloc`
-  (73), `lohalloc-server` (73 -- 32 unit + 31 replay integration +
-  10 server integration), and `lohalloc-example` (0; smoke binary).
-- **15 GUI tests** under `gui/src/components/__tests__/` via Vitest
+- **164 Rust tests** across `lohalloc-core` (3), `lohalloc-alloc`
+  (77 -- 4 observer hook tests), `lohalloc-server` (42 -- 6 live
+  telemetry POST tests), `lohalloc-demo` (31), and `lohalloc-example`
+  (0; smoke binary).
+- **9 shim C tests** via `make -C shim test` (ring buffer, JSON
+  encoding, record size pin, emit-no-crash).
+- **30 GUI tests** under `gui/src/components/__tests__/` via Vitest
   and React Testing Library.
 - `cargo clippy --all-targets --workspace` must remain **warning-free**.
 - `cargo fmt --all` must remain clean.

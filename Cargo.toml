@@ -5,6 +5,7 @@ members = [
     "crates/lohalloc-alloc",
     "crates/lohalloc-server",
     "crates/lohalloc-example",
+    "crates/lohalloc-demo",
 ]
 
 [workspace.package]

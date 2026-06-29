@@ -1,0 +1,22 @@
+[package]
+name = "lohalloc-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Lohalloc live-training demo: installs Lohalloc as the global allocator, dlsym-installs the LD_PRELOAD shim's telemetry sink, and runs an allocation-heavy churn workload to drive the GUI's live mode."
+
+[[bin]]
+name = "lohalloc-demo"
+path = "src/main.rs"
+
+[dependencies]
+lohalloc-alloc = { workspace = true, features = ["telemetry-observer"] }
+libc = "0.2"
+
+[features]
+default = []
+# When enabled, the binary dlsym's the shim's sink symbol and installs it.
+# Disable for development where the shim is not built (the binary runs
+# normally with no telemetry emission — silent sink).
+install-shim-sink = []
