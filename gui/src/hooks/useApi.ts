@@ -1,9 +1,42 @@
 import type { Strategy, TraceOp } from '../types/telemetry';
 import {
   FREEZE_EXPORT_URL,
+  MODE_URL,
+  ROUTING_TABLE_URL,
   STRATEGY_URL,
   UPLOAD_TRACE_URL,
 } from '../utils/constants';
+
+export type Mode = 'training' | 'inference';
+
+export interface RoutingTableEntry {
+  hash: string; // u64 as string for JS precision
+  backend: string;
+}
+
+/**
+ * Get the current allocator mode (training or inference).
+ */
+export async function getMode(): Promise<Mode> {
+  const res = await fetch(MODE_URL);
+  if (!res.ok) {
+    throw new Error(`getMode failed: ${res.status} ${res.statusText}`);
+  }
+  const data = await res.json();
+  return data.mode as Mode;
+}
+
+/**
+ * Fetch the frozen routing table (only populated in inference mode).
+ * Returns an empty array if no model has been frozen yet.
+ */
+export async function getRoutingTable(): Promise<RoutingTableEntry[]> {
+  const res = await fetch(ROUTING_TABLE_URL);
+  if (!res.ok) {
+    throw new Error(`getRoutingTable failed: ${res.status} ${res.statusText}`);
+  }
+  return (await res.json()) as RoutingTableEntry[];
+}
 
 /**
  * Upload a trace as a JSON array of TraceOps and receive

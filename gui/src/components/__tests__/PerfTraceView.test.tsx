@@ -16,12 +16,12 @@ describe('PerfTraceView', () => {
         <PerfTraceView records={cannedRecords} />
       </div>
     );
-    expect(screen.getByText('Performance Trace')).toBeDefined();
+    expect(screen.getByText('PERFORMANCE TRACE')).toBeDefined();
   });
 
   it('shows waiting message when no data', () => {
     render(<PerfTraceView records={[]} />);
-    expect(screen.getByText('Waiting for telemetry data…')).toBeDefined();
+    expect(screen.getByText('AWAITING TELEMETRY...')).toBeDefined();
   });
 
   it('renders chart container with data', () => {

@@ -29,7 +29,8 @@ describe('StrategyToggle', () => {
     render(<StrategyToggle />);
     await waitFor(() => {
       expect(screen.getByTestId('freeze-export-btn')).toBeDefined();
-      expect(screen.getByText('Freeze & Export')).toBeDefined();
+      // The button is now uppercase "FREEZE & EXPORT"
+      expect(screen.getByText('FREEZE & EXPORT')).toBeDefined();
     });
   });
 

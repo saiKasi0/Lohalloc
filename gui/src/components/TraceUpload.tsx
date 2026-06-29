@@ -23,7 +23,11 @@ export function TraceUpload(): JSX.Element {
         const lines = text.trim().split('\n');
         trace = lines.slice(1).map((line) => {
           const [op, size, stackHash] = line.split(',').map((s) => s.trim());
-          return { op: op as TraceOp['op'], size: Number(size), stack_hash: Number(stackHash) };
+          return {
+            op: op as TraceOp['op'],
+            size: Number(size),
+            stack_hash: Number(stackHash),
+          };
         });
       }
 
@@ -44,20 +48,32 @@ export function TraceUpload(): JSX.Element {
       const file = e.dataTransfer.files[0];
       if (file) handleFile(file);
     },
-    [handleFile]
+    [handleFile],
   );
 
   return (
-    <div className="flex h-full flex-col p-4" data-testid="trace-upload">
-      <h3 className="mb-3 text-sm font-semibold text-slate-200">Trace Upload</h3>
+    <div
+      className="flex h-full flex-col bg-canvas text-ink font-mono"
+      data-testid="trace-upload"
+    >
+      <div className="px-3 py-2 border-b border-ink-faint text-[10px] tracking-widest text-ink-muted">
+        TRACE UPLOAD
+     </div>
       <div
         onDrop={handleDrop}
-        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setDragOver(true);
+        }}
         onDragLeave={() => setDragOver(false)}
         onClick={() => fileInputRef.current?.click()}
-        className={`flex flex-1 cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed transition ${
-          dragOver ? 'border-cyan-400 bg-cyan-400/10' : 'border-slate-600 hover:border-slate-500'
-        }`}
+        className={[
+          'flex flex-1 cursor-pointer flex-col items-center justify-center',
+          'border-2 border-dashed m-3 transition-colors duration-75',
+          dragOver
+            ? 'border-heat bg-heat/5'
+            : 'border-ink-faint hover:border-ink-muted',
+        ].join(' ')}
         data-testid="trace-dropzone"
       >
         <input
@@ -65,26 +81,43 @@ export function TraceUpload(): JSX.Element {
           type="file"
           accept=".json,.csv"
           className="hidden"
-          onChange={(e) => { const file = e.target.files?.[0]; if (file) handleFile(file); }}
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) handleFile(file);
+          }}
         />
         {uploading ? (
-          <p className="text-sm text-slate-400">Replaying trace…</p>
+          <p className="text-[10px] text-ink-muted tracking-widest">
+            REPLAYING TRACE...
+        </p>
         ) : (
           <>
-            <p className="text-sm text-slate-400">
-              Drag & drop a <code className="text-cyan-400">.json</code> or{' '}
-              <code className="text-cyan-400">.csv</code> trace file
-            </p>
-            <p className="mt-1 text-xs text-slate-500">or click to browse</p>
-          </>
+            <p className="text-[10px] text-ink-muted tracking-widest">
+              DRAG & DROP <span className="text-ink">.JSON</span> OR{' '}
+              <span className="text-ink">.CSV</span> TRACE
+           </p>
+            <p className="mt-1 text-[10px] text-ink-faint tracking-widest">
+              OR CLICK TO BROWSE
+         </p>
+       </>
         )}
-      </div>
+     </div>
       {result && (
-        <p className="mt-2 text-xs text-emerald-400" data-testid="upload-result">
-          Replayed {result.ops} ops → {result.bytes} bytes downloaded
-        </p>
+        <p
+          className="px-3 pb-2 text-[10px] text-heat tracking-widest"
+          data-testid="upload-result"
+        >
+          REPLAYED {result.ops.toString().padStart(5, '0')} OPS {'->'} {result.bytes.toString().padStart(6, '0')} BYTES
+       </p>
       )}
-      {error && <p className="mt-2 text-xs text-red-400" data-testid="upload-error">{error}</p>}
-    </div>
+      {error && (
+        <p
+          className="px-3 pb-2 text-[10px] text-heat truncate"
+          data-testid="upload-error"
+        >
+          ERR: {error}
+       </p>
+      )}
+   </div>
   );
 }

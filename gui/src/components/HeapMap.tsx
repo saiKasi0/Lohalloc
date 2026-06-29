@@ -13,12 +13,12 @@ interface Cell {
   backend: string;
 }
 
-const BACKEND_COLORS: Record<string, string> = {
-  slab: '#22d3ee',
-  buddy: '#a78bfa',
-  system: '#f87171',
-  arena: '#34d399',
-  free: '#1e293b',
+const BACKEND_COLORS: Record<string, number> = {
+  slab: 0xe5e0d8,    // ink (tan)
+  buddy: 0x8a857d,   // ink-muted
+  system: 0xff2e2e,  // heat (crimson)
+  arena: 0xff7e7e,   // heat-dim
+  free: 0x3a3733,    // ink-faint
 };
 
 export function HeapMap({ records }: { records: TelemetryRecord[] }): JSX.Element {
@@ -39,7 +39,7 @@ export function HeapMap({ records }: { records: TelemetryRecord[] }): JSX.Elemen
       const THREE = await import('three');
 
       const scene = new THREE.Scene();
-      scene.background = new THREE.Color(0x0f172a);
+      scene.background = new THREE.Color(0x0a0a0a);
       sceneRef.current = scene;
 
       camera = new THREE.PerspectiveCamera(45, mount.clientWidth / mount.clientHeight, 0.1, 1000);
@@ -59,7 +59,7 @@ export function HeapMap({ records }: { records: TelemetryRecord[] }): JSX.Elemen
       for (let x = 0; x < GRID_SIZE; x++) {
         for (let z = 0; z < GRID_SIZE; z++) {
           const geom = new THREE.BoxGeometry(CELL_SIZE, 1, CELL_SIZE);
-          const mat = new THREE.MeshStandardMaterial({ color: 0x1e293b, transparent: true, opacity: 0.15 });
+          const mat = new THREE.MeshStandardMaterial({ color: 0x3a3733, transparent: true, opacity: 0.15 });
           const mesh = new THREE.Mesh(geom, mat);
           mesh.position.set(
             (x - GRID_SIZE / 2) * (CELL_SIZE + CELL_GAP),

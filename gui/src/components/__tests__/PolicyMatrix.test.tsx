@@ -12,24 +12,25 @@ const cannedRecords: TelemetryRecord[] = [
 describe('PolicyMatrix', () => {
   it('renders with title', () => {
     render(<PolicyMatrix records={cannedRecords} />);
-    expect(screen.getByText('Policy Matrix')).toBeDefined();
+    expect(screen.getByText('POLICY MATRIX')).toBeDefined();
   });
 
   it('shows backend legend', () => {
     const { container } = render(<PolicyMatrix records={cannedRecords} />);
+    // Legend uses inline-flex items-center gap-1; should be 4 entries
     const legends = container.querySelectorAll('.flex.items-center.gap-1');
     expect(legends.length).toBe(4);
   });
 
   it('shows empty state when no allocs', () => {
     render(<PolicyMatrix records={[]} />);
-    expect(screen.getByText('No allocation data yet')).toBeDefined();
+    expect(screen.getByText('AWAITING DATA...')).toBeDefined();
   });
 
   it('shows hash hex values', () => {
     render(<PolicyMatrix records={cannedRecords} />);
-    // 100 in hex = 0x64, 200 in hex = 0xc8
-    expect(screen.getByText('64')).toBeDefined();
-    expect(screen.getByText('c8')).toBeDefined();
+    // 100 in hex = 0x000064, 200 in hex = 0x0000C8 (zero-padded uppercase with 0x prefix)
+    expect(screen.getByText((_, el) => el?.textContent === '0x000064')).toBeDefined();
+    expect(screen.getByText((_, el) => el?.textContent === '0x0000C8')).toBeDefined();
   });
 });

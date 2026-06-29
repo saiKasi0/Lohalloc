@@ -16,7 +16,7 @@ describe('TraceUpload', () => {
     const { TraceUpload } = await import('../TraceUpload');
     render(<TraceUpload />);
     expect(screen.getByTestId('trace-dropzone')).toBeDefined();
-    expect(screen.getByText(/Drag & drop/)).toBeDefined();
+    expect(screen.getByText(/Drag.*drop/i)).toBeDefined();
   });
 
   it('renders file input for .json and .csv', async () => {

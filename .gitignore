@@ -2,6 +2,6 @@ COPILOT.md
 .vscode
 .claude
 target/
-.github
+.github/*.md
 dist/
 node_modules

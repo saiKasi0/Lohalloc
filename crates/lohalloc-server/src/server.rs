@@ -11,6 +11,10 @@
 //!   last replay allocator and returns `.lohalloc` bytes (Phase 5).
 //! - `GET /api/strategy` — Returns the current strategy override (Phase 5).
 //! - `POST /api/strategy` — Sets the strategy override (Phase 5).
+//! - `GET /api/mode` — Returns `{"mode": "training"}` or
+//!   `{"mode": "inference"}` depending on Decision Engine state.
+//! - `GET /api/routing-table` — Returns the frozen routing table as a JSON
+//!   array of `{hash, backend}` objects, or `[]` if not in Inference mode.
 //! - `GET /health` — Liveness check.
 //!
 //! # Static File Serving
@@ -56,6 +60,15 @@ pub struct AppState {
     /// The last replay result's `.lohalloc` bytes (for freeze-export).
     /// Updated on each `/api/upload-trace` call.
     last_model: Arc<std::sync::Mutex<Vec<u8>>>,
+    /// Whether the Decision Engine is in Inference (frozen) mode. Toggled
+    /// by `/api/upload-trace` and `/api/freeze-export` (set to `true`) and
+    /// by `/api/strategy` (reset to `false`, since a strategy change
+    /// returns the allocator to Training mode).
+    is_inference: Arc<std::sync::RwLock<bool>>,
+    /// Cached routing table extracted from the last frozen model. Exposed
+    /// via `GET /api/routing-table` so the GUI can render the Policy
+    /// Matrix without re-parsing the binary model on each request.
+    routing_table: Arc<std::sync::RwLock<Vec<(u64, String)>>>,
 }
 
 impl AppState {
@@ -71,6 +84,8 @@ impl AppState {
             telemetry_rx: Arc::new(rx),
             strategy: Arc::new(std::sync::RwLock::new("default".to_string())),
             last_model: Arc::new(std::sync::Mutex::new(Vec::new())),
+            is_inference: Arc::new(std::sync::RwLock::new(false)),
+            routing_table: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
     }
 
@@ -82,24 +97,56 @@ impl AppState {
             .unwrap_or(Strategy::Default)
     }
 
-    /// Set the strategy override.
+    /// Set the strategy override. Resets the allocator to Training mode
+    /// since a strategy change invalidates the frozen routing table.
     pub fn set_strategy(&self, strategy: Strategy) {
         if let Ok(mut guard) = self.strategy.write() {
             *guard = strategy.as_str().to_string();
         }
+        self.set_inference(false);
+        if let Ok(mut guard) = self.routing_table.write() {
+            guard.clear();
+        }
     }
 
-    /// Store the last replay result's model bytes.
+    /// Store the last replay result's model bytes and transition to
+    /// Inference mode. The routing table is extracted from the frozen
+    /// model's binary format and cached for `/api/routing-table`.
     fn store_model(&self, bytes: Vec<u8>) {
+        let entries = decode_routing_entries(&bytes);
         if let Ok(mut guard) = self.last_model.lock() {
             *guard = bytes;
         }
+        if let Ok(mut guard) = self.routing_table.write() {
+            *guard = entries;
+        }
+        self.set_inference(true);
     }
 
     /// Get the last replay result's model bytes.
     fn get_model(&self) -> Vec<u8> {
         self.last_model
             .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Toggle the Inference mode flag.
+    fn set_inference(&self, value: bool) {
+        if let Ok(mut guard) = self.is_inference.write() {
+            *guard = value;
+        }
+    }
+
+    /// Read the current Inference mode.
+    pub fn is_inference(&self) -> bool {
+        self.is_inference.read().map(|g| *g).unwrap_or(false)
+    }
+
+    /// Get a snapshot of the cached routing table.
+    fn get_routing_table(&self) -> Vec<(u64, String)> {
+        self.routing_table
+            .read()
             .map(|g| g.clone())
             .unwrap_or_default()
     }
@@ -126,6 +173,8 @@ pub fn build_app_with_options(state: AppState, serve_static: bool) -> Router {
             "/api/strategy",
             get(get_strategy_handler).post(set_strategy_handler),
         )
+        .route("/api/mode", get(get_mode_handler))
+        .route("/api/routing-table", get(get_routing_table_handler))
         .route("/health", get(health_handler))
         .layer(CorsLayer::permissive());
 
@@ -298,6 +347,123 @@ async fn set_strategy_handler(
         )
             .into_response(),
     }
+}
+
+/// `GET /api/mode` — Returns the current Decision Engine mode as JSON
+/// `{"mode": "training"}` or `{"mode": "inference"}`.
+async fn get_mode_handler(State(state): State<AppState>) -> Response {
+    let mode = if state.is_inference() {
+        "inference"
+    } else {
+        "training"
+    };
+    Json(serde_json::json!({ "mode": mode })).into_response()
+}
+
+/// `GET /api/routing-table` — Returns the frozen routing table as a JSON
+/// array of `{"hash": <u64>, "backend": <string>}` objects. When the
+/// allocator is still in Training mode (or no model has been produced),
+/// returns an empty array.
+async fn get_routing_table_handler(State(state): State<AppState>) -> Response {
+    let entries = if state.is_inference() {
+        state.get_routing_table()
+    } else {
+        Vec::new()
+    };
+    let payload: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|(hash, backend)| serde_json::json!({ "hash": hash, "backend": backend }))
+        .collect();
+    Json(payload).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Routing-table extraction
+// ---------------------------------------------------------------------------
+
+/// Decode `(hash, backend)` entries from a frozen `.lohalloc` model's binary
+/// representation.
+///
+/// The format is owned by `lohalloc_alloc::perfect_hash::PerfectHashTable`:
+///
+/// ```text
+/// [8]    magic    "loha11oc" (LE u64)
+/// [4]    version  (LE u32)
+/// [4]    count    (LE u32)
+/// [N×12] entries: (hash: u64 LE, backend: u8, _pad: [u8; 3])
+/// [8]    checksum (XOR of all hashes, LE u64)
+/// ```
+///
+/// Returns an empty `Vec` if `bytes` is too short, has bad magic/version,
+/// or fails checksum validation. This is best-effort decoding — the
+/// authoritative parser lives in `lohalloc-alloc`; this duplicate exists
+/// so the server crate doesn't need to keep a private `Lohalloc` instance
+/// alive purely to enumerate entries.
+fn decode_routing_entries(bytes: &[u8]) -> Vec<(u64, String)> {
+    // magic(8) + version(4) + count(4) + checksum(8) = 24
+    if bytes.len() < 24 {
+        return Vec::new();
+    }
+    let mut pos = 0;
+
+    let magic = read_u64_le(bytes, &mut pos);
+    // Magic: "COLLAHOL" = 0x434f4c4c41484f4c (matches `lohalloc_alloc::perfect_hash::MAGIC`).
+    if magic != 0x434f_4c4c_4148_4f4c {
+        return Vec::new();
+    }
+
+    let version = read_u32_le(bytes, &mut pos);
+    if version != 1 {
+        return Vec::new();
+    }
+
+    let count = read_u32_le(bytes, &mut pos) as usize;
+    let expected_len = 16 + count * 12 + 8;
+    if bytes.len() < expected_len {
+        return Vec::new();
+    }
+
+    let mut entries = Vec::with_capacity(count);
+    let mut checksum: u64 = 0;
+    for _ in 0..count {
+        let hash = read_u64_le(bytes, &mut pos);
+        let backend_byte = *bytes.get(pos).unwrap_or(&0);
+        pos += 4; // backend(1) + padding(3)
+        let backend = match backend_byte {
+            0 => "slab",
+            1 => "buddy",
+            2 => "system",
+            3 => "arena",
+            _ => return Vec::new(),
+        };
+        entries.push((hash, backend.to_string()));
+        checksum ^= hash;
+    }
+
+    let stored_checksum = read_u64_le(bytes, &mut pos);
+    if stored_checksum != checksum {
+        return Vec::new();
+    }
+
+    entries
+}
+
+fn read_u64_le(bytes: &[u8], pos: &mut usize) -> u64 {
+    let end = *pos + 8;
+    let slice = bytes.get(*pos..end).unwrap_or(&[0u8; 8]);
+    *pos = end;
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(slice);
+    u64::from_le_bytes(buf)
+}
+
+fn read_u32_le(bytes: &[u8], pos: &mut usize) -> u32 {
+    let end = *pos + 4;
+    let slice = bytes.get(*pos..end).unwrap_or(&[0u8; 4]);
+    *pos = end;
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(slice);
+    u32::from_le_bytes(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -650,5 +816,110 @@ mod tests {
                 "alloc records should have backend field set"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5: mode + routing-table endpoints
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_mode_endpoint() {
+        let app = build_app(AppState::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/mode")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["mode"], "training");
+    }
+
+    #[tokio::test]
+    async fn test_routing_table_empty_initially() {
+        let app = build_app(AppState::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/routing-table")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v.is_array(), "routing-table should be a JSON array");
+        assert_eq!(v.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_strategy_change_resets_mode() {
+        let state = AppState::new();
+        let app = build_app(state.clone());
+
+        // Force the allocator into Inference mode (as if freeze-export had run).
+        state.set_inference(true);
+
+        // Sanity check: mode endpoint now reports "inference".
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/mode")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["mode"], "inference");
+
+        // POST /api/strategy — should revert the mode to training.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/strategy")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"strategy":"latency_priority"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Mode must now be back to "training".
+        assert!(!state.is_inference(), "mode should revert to training");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/mode")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["mode"], "training");
     }
 }

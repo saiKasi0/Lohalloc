@@ -7,20 +7,6 @@ interface PolicyEntry {
   count: number;
 }
 
-const BACKEND_COLORS: Record<Backend, string> = {
-  slab: 'bg-cyan-400',
-  buddy: 'bg-violet-400',
-  system: 'bg-red-400',
-  arena: 'bg-emerald-400',
-};
-
-const BACKEND_TEXT: Record<Backend, string> = {
-  slab: 'text-cyan-400',
-  buddy: 'text-violet-400',
-  system: 'text-red-400',
-  arena: 'text-emerald-400',
-};
-
 export function PolicyMatrix({ records }: { records: TelemetryRecord[] }): JSX.Element {
   const entries = useMemo(() => {
     const map = new Map<number, PolicyEntry>();
@@ -33,34 +19,71 @@ export function PolicyMatrix({ records }: { records: TelemetryRecord[] }): JSX.E
     return Array.from(map.values()).sort((a, b) => b.count - a.count).slice(0, 50);
   }, [records]);
 
-  const maxCount = useMemo(() => entries.reduce((m, e) => Math.max(m, e.count), 1), [entries]);
+  const maxCount = useMemo(
+    () => entries.reduce((m, e) => Math.max(m, e.count), 1),
+    [entries],
+  );
 
   return (
-    <div className="h-full overflow-auto p-4" data-testid="policy-matrix">
-      <h3 className="mb-3 text-sm font-semibold text-slate-200">Policy Matrix</h3>
-      <div className="grid grid-cols-5 gap-1">
-        {entries.map((entry) => (
-          <div
-            key={entry.hash}
-            className={`flex flex-col items-center rounded p-1 text-xs ${BACKEND_COLORS[entry.backend]} bg-opacity-20`}
-            style={{ opacity: 0.3 + 0.7 * (entry.count / maxCount) }}
-            title={`Hash: ${entry.hash}, Backend: ${entry.backend}, Count: ${entry.count}`}
-          >
-            <span className={`font-mono text-[10px] ${BACKEND_TEXT[entry.backend]}`}>
-              {entry.hash.toString(16).slice(0, 6)}
-            </span>
-            <span className={`text-[10px] ${BACKEND_TEXT[entry.backend]}`}>{entry.backend}</span>
-          </div>
-        ))}
+    <div
+      className="h-full overflow-auto term-scroll bg-canvas text-ink font-mono flex flex-col"
+      data-testid="policy-matrix"
+    >
+      <div className="px-3 py-2 border-b border-ink-faint text-[10px] tracking-widest text-ink-muted flex items-center justify-between">
+        <span>POLICY MATRIX</span>
+        <span className="text-ink">
+          {entries.length.toString().padStart(3, '0')} HASH
+        </span>
+      </div>
+      <div className="p-3 grid grid-cols-5 gap-1">
+        {entries.map((entry) => {
+          const intensity = entry.count / maxCount;
+          const isHot = intensity > 0.7;
+          return (
+            <div
+              key={entry.hash}
+              className={[
+                'flex flex-col items-center p-1 text-xs border',
+                isHot ? 'border-heat heat-glow-box' : 'border-ink-faint',
+              ].join(' ')}
+              style={{ opacity: 0.3 + 0.7 * intensity }}
+              title={`Hash: ${entry.hash.toString(16)}, Backend: ${entry.backend}, Count: ${entry.count}`}
+              data-testid="policy-matrix-cell"
+            >
+              <span className="font-mono text-[10px] text-ink">
+                {'0x' +
+                  entry.hash.toString(16).slice(0, 6).toUpperCase().padStart(6, '0')}
+              </span>
+              <span
+                className={[
+                  'text-[10px] tracking-widest',
+                  isHot ? 'text-heat' : 'text-ink-muted',
+                ].join(' ')}
+              >
+                {entry.backend.toUpperCase()}
+              </span>
+            </div>
+          );
+        })}
         {entries.length === 0 && (
-          <div className="col-span-5 py-8 text-center text-sm text-slate-500">No allocation data yet</div>
+          <div
+            className="col-span-5 py-8 text-center text-xs text-ink-muted tracking-widest"
+            data-testid="policy-matrix-empty"
+          >
+            AWAITING DATA...
+          </div>
         )}
       </div>
-      <div className="mt-3 flex gap-3 text-xs text-slate-400">
-        {(Object.keys(BACKEND_COLORS) as Backend[]).map((b) => (
+      <div className="px-3 py-2 border-t border-ink-faint flex gap-3 text-[10px] tracking-widest text-ink-muted">
+        {(['slab', 'buddy', 'system', 'arena'] as Backend[]).map((b) => (
           <span key={b} className="flex items-center gap-1">
-            <span className={`inline-block h-3 w-3 rounded ${BACKEND_COLORS[b]}`} />
-            {b}
+            <span
+              className={[
+                'inline-block h-2 w-2',
+                b === 'system' ? 'bg-heat' : 'bg-ink-muted',
+              ].join(' ')}
+            />
+            {b.toUpperCase()}
           </span>
         ))}
       </div>
