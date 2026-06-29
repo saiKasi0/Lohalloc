@@ -1,5 +1,6 @@
 import { useEffect, useState, type ComponentType } from 'react';
 import { useTelemetry } from './hooks/useTelemetry';
+import { useLiveStream } from './hooks/useLiveStream';
 import { PolicyMatrix } from './components/PolicyMatrix';
 import { PerfTraceView } from './components/PerfTraceView';
 import { StrategyToggle } from './components/StrategyToggle';
@@ -41,6 +42,7 @@ const FloatingWebLazy = () => {
 function App() {
   const { records, isConnected } = useTelemetry();
   const [mode, setMode] = useState<Mode>('training');
+  const isLive = useLiveStream(records.length);
 
   const allocCount = records.filter((r) => r.op === 'alloc').length;
   const freeCount = records.filter((r) => r.op === 'free').length;
@@ -75,7 +77,13 @@ function App() {
               {isConnected ? 'LINK UP' : 'LINK DN'}
           </span>
         </div>
-          <span className="text-ink-faint">|</span>
+        {isLive && (
+          <div className="flex items-center gap-1.5" data-testid="live-indicator">
+            <span className="inline-block h-1.5 w-1.5 bg-heat heat-glow-box" />
+            <span className="text-heat tracking-widest uppercase">LIVE</span>
+          </div>
+        )}
+        <span className="text-ink-faint">|</span>
           <span className="text-ink">
             {records.length.toString().padStart(6, '0')} REC
         </span>

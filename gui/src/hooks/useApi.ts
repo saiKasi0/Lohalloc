@@ -1,9 +1,10 @@
-import type { Strategy, TraceOp } from '../types/telemetry';
+import type { Strategy, TelemetryRecord, TraceOp } from '../types/telemetry';
 import {
   FREEZE_EXPORT_URL,
   MODE_URL,
   ROUTING_TABLE_URL,
   STRATEGY_URL,
+  TELEMETRY_URL,
   UPLOAD_TRACE_URL,
 } from '../utils/constants';
 
@@ -133,4 +134,34 @@ export function downloadLohalloc(bytes: ArrayBuffer, filename: string): void {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+/**
+ * Push one or more telemetry records to the server's live-ingest endpoint.
+ * The server forwards them to the `/ws/telemetry` channel so the GUI sees
+ * them in real time (same path the LD_PRELOAD shim uses).
+ *
+ * Accepts a single record or an array. Returns the number of records
+ * accepted by the server.
+ *
+ * Errors are swallowed — telemetry is best-effort; we never want to break
+ * the UI thread over a failed POST.
+ */
+export async function postTelemetryRecords(
+  records: TelemetryRecord | TelemetryRecord[],
+): Promise<number> {
+  try {
+    const res = await fetch(TELEMETRY_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(records),
+    });
+    if (!res.ok) {
+      return 0;
+    }
+    const data = await res.json();
+    return (data.accepted as number) ?? 0;
+  } catch {
+    return 0;
+  }
 }

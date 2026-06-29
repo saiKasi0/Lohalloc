@@ -93,6 +93,7 @@ The GUI consumes the following endpoints on the Axum server. All paths are relat
 | GET    | `/api/routing-table`  | Frozen Perfect Hash Table entries             |
 | POST   | `/api/upload-trace`   | Upload a `.json` or `.csv` trace file         |
 | POST   | `/api/freeze-export`  | Freeze the model and export a `.lohalloc`     |
+| POST   | `/api/telemetry`      | Live-mode ingest (single record or array)     |
 | WS     | `/ws/telemetry`       | Live allocation telemetry stream              |
 
 ## TELEMETRY FORMAT
@@ -129,6 +130,73 @@ npm test
 ```
 
 The suite currently contains 19 tests (15 existing + 4 new covering the aesthetic upgrade — typography, palette tokens, hard edges, no rounded corners).
+
+## LIVE MODE
+
+The GUI can visualize **live** allocator behavior — not just replayed traces.
+Two transports feed the same `/ws/telemetry` WebSocket stream:
+
+1. **Offline replay** — upload a trace (JSON/CSV) via `POST /api/upload-trace`;
+   the server replays through a private Lohalloc instance and forwards
+   records to the WS. (Existing path.)
+2. **Live LD_PRELOAD** — run any program under Lohalloc with the C shim
+   preloaded; allocation events flow through the shim → server's
+   `POST /api/telemetry` → `/ws/telemetry` → GUI in real time.
+
+### Live mode quickstart
+
+```bash
+# 1. Start the server
+cargo run -p lohalloc-server
+
+# 2. Build the C shim (separate Makefile — not part of Cargo workspace)
+make -C shim
+
+# 3. Build and run the demo binary with the shim preloaded
+DYLD_INSERT_LIBRARIES=$PWD/shim/build/liblohalloc_obs.dylib \
+  cargo run -p lohalloc-demo --features install-shim-sink --release
+```
+
+On Linux, replace `DYLD_INSERT_LIBRARIES` with `LD_PRELOAD` (path:
+`$PWD/shim/build/liblohalloc_obs.so`).
+
+### How it works
+
+```
+demo binary (Lohalloc as #[global_allocator])
+   │  --features telemetry-observer enables per-alloc C-ABI emit
+   ▼
+lohalloc_alloc::observer::emit_alloc(...) → sink function pointer
+   │
+   ▼
+liblohalloc_obs.dylib (LD_PRELOAD) → SPSC ring + background pthread
+   │  POST /api/telemetry (JSON array, batched 256 records / 50ms)
+   ▼
+lohalloc-server POST /api/telemetry → telemetry_tx.send(record)
+   │
+   ▼
+existing /ws/telemetry → useTelemetry() → FloatingWeb + TelemetrySidebar
+```
+
+### Zero-overhead guarantee
+
+The `telemetry-observer` feature is **OFF by default** in `lohalloc-alloc`.
+Production builds (`cargo build -p lohalloc-alloc`) compile out the entire
+observer module — no symbols, no branches, no atomic loads on the hot path.
+Only `cargo build -p lohalloc-demo --features install-shim-sink` (and the
+matching `install-shim-sink` feature) compiles in the hook.
+
+### Environment variables
+
+| Variable              | Default     | Purpose                            |
+|-----------------------|-------------|------------------------------------|
+| `LOHALLOC_OBS_PORT`   | `3000`      | Axum server port for live ingest   |
+
+### LIVE indicator
+
+When records arrive in quick succession (delta < 250ms), the top bar shows
+a crimson `LIVE` badge with a glowing dot — distinguishing a live stream
+from a finished burst-replay. The badge clears 1.5s after records stop.
 
 ## BACK TO PROJECT
 
