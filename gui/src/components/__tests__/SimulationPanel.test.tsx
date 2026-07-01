@@ -1,15 +1,15 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-import { SimulateDropdown, SimulationPanel, Toast } from '../SimulationPanel';
-import type { SimulationEvent } from '../../types/ws';
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { SimulateDropdown, SimulationPanel, Toast } from "../SimulationPanel";
+import type { SimulationEvent } from "../../types/ws";
 
 // Mock stopSimulation so SimulationPanel doesn't make real network calls
-vi.mock('../../hooks/useApi', () => ({
+vi.mock("../../hooks/useApi", () => ({
   stopSimulation: vi.fn().mockResolvedValue(undefined),
 }));
 
-describe('SimulateDropdown', () => {
-  it('renders the SIMULATE button', () => {
+describe("SimulateDropdown", () => {
+  it("renders the SIMULATE button", () => {
     const onSpawn = vi.fn();
     render(
       <SimulateDropdown
@@ -18,10 +18,10 @@ describe('SimulateDropdown', () => {
         onDurationChange={() => {}}
       />,
     );
-    expect(screen.getByText('SIMULATE v')).toBeDefined();
+    expect(screen.getByText("SIMULATE v")).toBeDefined();
   });
 
-  it('opens dropdown on click and shows workload options', async () => {
+  it("opens dropdown on click and shows workload options", async () => {
     const onSpawn = vi.fn();
     render(
       <SimulateDropdown
@@ -30,15 +30,15 @@ describe('SimulateDropdown', () => {
         onDurationChange={() => {}}
       />,
     );
-    fireEvent.click(screen.getByText('SIMULATE v'));
+    fireEvent.click(screen.getByText("SIMULATE v"));
     await waitFor(() => {
-      expect(screen.getByText('LOHALLOC EXAMPLE')).toBeDefined();
-      expect(screen.getByText('HTTP SERVER (PORT 4000')).toBeDefined();
-      expect(screen.getByText('LONG RUNNING')).toBeDefined();
+      expect(screen.getByText("LOHALLOC EXAMPLE")).toBeDefined();
+      expect(screen.getByText("HTTP SERVER (PORT 4000")).toBeDefined();
+      expect(screen.getByText("LONG RUNNING")).toBeDefined();
     });
   });
 
-  it('shows duration slider when open', async () => {
+  it("shows duration slider when open", async () => {
     const onSpawn = vi.fn();
     render(
       <SimulateDropdown
@@ -47,16 +47,18 @@ describe('SimulateDropdown', () => {
         onDurationChange={() => {}}
       />,
     );
-    fireEvent.click(screen.getByText('SIMULATE v'));
+    fireEvent.click(screen.getByText("SIMULATE v"));
     await waitFor(() => {
-      const slider = screen.getByTestId('duration-slider');
+      const slider = screen.getByTestId("duration-slider");
       expect(slider).toBeDefined();
-      expect((slider as HTMLInputElement).value).toBe('60');
+      expect((slider as HTMLInputElement).value).toBe("60");
     });
   });
 
-  it('calls onSpawn with lohalloc-example when clicked', async () => {
-    const onSpawn = vi.fn<(kind: string) => Promise<void>>().mockResolvedValue(undefined);
+  it("calls onSpawn with lohalloc-example when clicked", async () => {
+    const onSpawn = vi
+      .fn<(kind: string) => Promise<void>>()
+      .mockResolvedValue(undefined);
     render(
       <SimulateDropdown
         onSpawn={onSpawn}
@@ -64,16 +66,18 @@ describe('SimulateDropdown', () => {
         onDurationChange={() => {}}
       />,
     );
-    fireEvent.click(screen.getByText('SIMULATE v'));
-    await waitFor(() => screen.getByText('LOHALLOC EXAMPLE'));
-    fireEvent.click(screen.getByText('LOHALLOC EXAMPLE'));
+    fireEvent.click(screen.getByText("SIMULATE v"));
+    await waitFor(() => screen.getByText("LOHALLOC EXAMPLE"));
+    fireEvent.click(screen.getByText("LOHALLOC EXAMPLE"));
     await waitFor(() => {
-      expect(onSpawn).toHaveBeenCalledWith('lohalloc-example');
+      expect(onSpawn).toHaveBeenCalledWith("lohalloc-example");
     });
   });
 
-  it('calls onSpawn with http-server when clicked', async () => {
-    const onSpawn = vi.fn<(kind: string) => Promise<void>>().mockResolvedValue(undefined);
+  it("calls onSpawn with http-server when clicked", async () => {
+    const onSpawn = vi
+      .fn<(kind: string) => Promise<void>>()
+      .mockResolvedValue(undefined);
     render(
       <SimulateDropdown
         onSpawn={onSpawn}
@@ -81,16 +85,18 @@ describe('SimulateDropdown', () => {
         onDurationChange={() => {}}
       />,
     );
-    fireEvent.click(screen.getByText('SIMULATE v'));
-    await waitFor(() => screen.getByText('HTTP SERVER (PORT 4000'));
-    fireEvent.click(screen.getByText('HTTP SERVER (PORT 4000'));
+    fireEvent.click(screen.getByText("SIMULATE v"));
+    await waitFor(() => screen.getByText("HTTP SERVER (PORT 4000"));
+    fireEvent.click(screen.getByText("HTTP SERVER (PORT 4000"));
     await waitFor(() => {
-      expect(onSpawn).toHaveBeenCalledWith('http-server');
+      expect(onSpawn).toHaveBeenCalledWith("http-server");
     });
   });
 
-  it('calls onSpawn with long-running when clicked', async () => {
-    const onSpawn = vi.fn<(kind: string) => Promise<void>>().mockResolvedValue(undefined);
+  it("calls onSpawn with long-running when clicked", async () => {
+    const onSpawn = vi
+      .fn<(kind: string) => Promise<void>>()
+      .mockResolvedValue(undefined);
     render(
       <SimulateDropdown
         onSpawn={onSpawn}
@@ -98,15 +104,15 @@ describe('SimulateDropdown', () => {
         onDurationChange={() => {}}
       />,
     );
-    fireEvent.click(screen.getByText('SIMULATE v'));
-    await waitFor(() => screen.getByText('LONG RUNNING'));
-    fireEvent.click(screen.getByText('LONG RUNNING'));
+    fireEvent.click(screen.getByText("SIMULATE v"));
+    await waitFor(() => screen.getByText("LONG RUNNING"));
+    fireEvent.click(screen.getByText("LONG RUNNING"));
     await waitFor(() => {
-      expect(onSpawn).toHaveBeenCalledWith('long-running');
+      expect(onSpawn).toHaveBeenCalledWith("long-running");
     });
   });
 
-  it('calls onDurationChange when slider is moved', async () => {
+  it("calls onDurationChange when slider is moved", async () => {
     const onSpawn = vi.fn();
     const onDurationChange = vi.fn();
     render(
@@ -116,15 +122,17 @@ describe('SimulateDropdown', () => {
         onDurationChange={onDurationChange}
       />,
     );
-    fireEvent.click(screen.getByText('SIMULATE v'));
-    await waitFor(() => screen.getByTestId('duration-slider'));
-    const slider = screen.getByTestId('duration-slider') as HTMLInputElement;
-    fireEvent.change(slider, { target: { value: '120' } });
+    fireEvent.click(screen.getByText("SIMULATE v"));
+    await waitFor(() => screen.getByTestId("duration-slider"));
+    const slider = screen.getByTestId("duration-slider") as HTMLInputElement;
+    fireEvent.change(slider, { target: { value: "120" } });
     expect(onDurationChange).toHaveBeenCalledWith(120);
   });
 
-  it('shows STARTING label while pending', async () => {
-    const onSpawn = vi.fn<(kind: string) => Promise<void>>().mockImplementation(() => new Promise<void>(() => {}));
+  it("shows STARTING label while pending", async () => {
+    const onSpawn = vi
+      .fn<(kind: string) => Promise<void>>()
+      .mockImplementation(() => new Promise<void>(() => {}));
     render(
       <SimulateDropdown
         onSpawn={onSpawn}
@@ -132,129 +140,208 @@ describe('SimulateDropdown', () => {
         onDurationChange={() => {}}
       />,
     );
-    fireEvent.click(screen.getByText('SIMULATE v'));
-    await waitFor(() => screen.getByText('LOHALLOC EXAMPLE'));
-    fireEvent.click(screen.getByText('LOHALLOC EXAMPLE'));
+    fireEvent.click(screen.getByText("SIMULATE v"));
+    await waitFor(() => screen.getByText("LOHALLOC EXAMPLE"));
+    fireEvent.click(screen.getByText("LOHALLOC EXAMPLE"));
     await waitFor(() => {
       expect(screen.getByText(/STARTING LOHALLOC-EXAMPLE/i)).toBeDefined();
     });
   });
 });
 
-describe('SimulationPanel', () => {
+describe("SimulationPanel", () => {
   const mockEvent: SimulationEvent = {
     pid: 12345,
-    kind: 'lohalloc-example',
-    status: 'started',
+    kind: "lohalloc-example",
+    status: "started",
     duration_ms: 0,
   };
 
-  it('renders with title and close button', () => {
-    render(
-      <SimulationPanel events={[]} active={[]} onClose={() => {}} />,
-    );
-    expect(screen.getByText('[SIMULATIONS')).toBeDefined();
-    expect(screen.getByText('[X]')).toBeDefined();
+  it("renders with title and close button", () => {
+    render(<SimulationPanel events={[]} active={[]} onClose={() => {}} />);
+    expect(screen.getByText("[SIMULATIONS")).toBeDefined();
+    expect(screen.getByText("[X]")).toBeDefined();
   });
 
-  it('shows empty history message when no events', () => {
-    render(
-      <SimulationPanel events={[]} active={[]} onClose={() => {}} />,
-    );
+  it("shows empty history message when no events", () => {
+    render(<SimulationPanel events={[]} active={[]} onClose={() => {}} />);
     expect(screen.getByText(/No simulations yet/i)).toBeDefined();
   });
 
-  it('shows active simulations when present', () => {
+  it("shows active simulations when present", () => {
     render(
       <SimulationPanel events={[]} active={[mockEvent]} onClose={() => {}} />,
     );
-    expect(screen.getByText('1 RUNNING')).toBeDefined();
-    expect(screen.getByText('lohalloc-example')).toBeDefined();
+    expect(screen.getByText("1 RUNNING")).toBeDefined();
+    expect(screen.getByText("lohalloc-example")).toBeDefined();
   });
 
-  it('shows history events', () => {
+  it("shows history events", () => {
     const exitedEvent: SimulationEvent = {
       ...mockEvent,
-      status: 'exited',
+      status: "exited",
       duration_ms: 5000,
       exit_code: 0,
     };
     render(
       <SimulationPanel events={[exitedEvent]} active={[]} onClose={() => {}} />,
     );
-    expect(screen.getByText('[EXITED]')).toBeDefined();
+    expect(screen.getByText("[EXITED]")).toBeDefined();
   });
 
-  it('calls onClose when close button clicked', () => {
+  it("calls onClose when close button clicked", () => {
     const onClose = vi.fn();
-    render(
-      <SimulationPanel events={[]} active={[]} onClose={onClose} />,
-    );
-    fireEvent.click(screen.getByText('[X]'));
+    render(<SimulationPanel events={[]} active={[]} onClose={onClose} />);
+    fireEvent.click(screen.getByText("[X]"));
     expect(onClose).toHaveBeenCalled();
   });
 
-  it('shows KILL button for running simulations', () => {
+  it("shows KILL button for running simulations", () => {
     const runningEvent: SimulationEvent = {
       ...mockEvent,
-      status: 'running',
+      status: "running",
       duration_ms: 1000,
     };
     render(
-      <SimulationPanel events={[]} active={[runningEvent]} onClose={() => {}} />,
+      <SimulationPanel
+        events={[]}
+        active={[runningEvent]}
+        onClose={() => {}}
+      />,
     );
     expect(screen.getByTestId(`kill-sim-${mockEvent.pid}`)).toBeDefined();
-    expect(screen.getByText('KILL')).toBeDefined();
+    expect(screen.getByText("KILL")).toBeDefined();
   });
 
-  it('does not show KILL button for exited simulations', () => {
+  it("does not show KILL button for exited simulations", () => {
     const exitedEvent: SimulationEvent = {
       ...mockEvent,
-      status: 'exited',
+      status: "exited",
       duration_ms: 5000,
       exit_code: 0,
     };
     render(
       <SimulationPanel events={[exitedEvent]} active={[]} onClose={() => {}} />,
     );
-    expect(screen.queryByText('KILL')).toBeNull();
+    expect(screen.queryByText("KILL")).toBeNull();
   });
 
-  it('calls stopSimulation when KILL button is clicked', async () => {
-    const { stopSimulation } = await import('../../hooks/useApi');
+  it("calls stopSimulation when KILL button is clicked", async () => {
+    const { stopSimulation } = await import("../../hooks/useApi");
     vi.clearAllMocks();
     const runningEvent: SimulationEvent = {
       ...mockEvent,
-      status: 'running',
+      status: "running",
       duration_ms: 2000,
     };
     render(
-      <SimulationPanel events={[]} active={[runningEvent]} onClose={() => {}} />,
+      <SimulationPanel
+        events={[]}
+        active={[runningEvent]}
+        onClose={() => {}}
+      />,
     );
     fireEvent.click(screen.getByTestId(`kill-sim-${mockEvent.pid}`));
     await waitFor(() => {
       expect(stopSimulation).toHaveBeenCalledWith(mockEvent.pid);
     });
   });
+
+  it("shows VALIDATE button for exited simulations in inference mode", () => {
+    const exitedEvent: SimulationEvent = {
+      ...mockEvent,
+      status: "exited",
+      duration_ms: 5000,
+      exit_code: 0,
+    };
+    render(
+      <SimulationPanel
+        events={[exitedEvent]}
+        active={[]}
+        onClose={() => {}}
+        mode="inference"
+        onValidate={() => {}}
+      />,
+    );
+    expect(screen.getByTestId(`validate-sim-${mockEvent.pid}`)).toBeDefined();
+    expect(screen.getByText("VALIDATE")).toBeDefined();
+  });
+
+  it("does not show VALIDATE button when onValidate is not provided", () => {
+    const exitedEvent: SimulationEvent = {
+      ...mockEvent,
+      status: "exited",
+      duration_ms: 5000,
+      exit_code: 0,
+    };
+    render(
+      <SimulationPanel events={[exitedEvent]} active={[]} onClose={() => {}} />,
+    );
+    expect(screen.queryByText("VALIDATE")).toBeNull();
+  });
+
+  it("disables VALIDATE button in training mode", () => {
+    const exitedEvent: SimulationEvent = {
+      ...mockEvent,
+      status: "exited",
+      duration_ms: 5000,
+      exit_code: 0,
+    };
+    render(
+      <SimulationPanel
+        events={[exitedEvent]}
+        active={[]}
+        onClose={() => {}}
+        mode="training"
+        onValidate={() => {}}
+      />,
+    );
+    const btn = screen.getByTestId(
+      `validate-sim-${mockEvent.pid}`,
+    ) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  it("calls onValidate with kind and duration when VALIDATE clicked in inference mode", () => {
+    const exitedEvent: SimulationEvent = {
+      ...mockEvent,
+      kind: "long-running",
+      status: "exited",
+      duration_ms: 10000,
+      exit_code: 0,
+    };
+    const onValidate = vi.fn();
+    render(
+      <SimulationPanel
+        events={[exitedEvent]}
+        active={[]}
+        onClose={() => {}}
+        mode="inference"
+        onValidate={onValidate}
+      />,
+    );
+    fireEvent.click(screen.getByTestId(`validate-sim-${mockEvent.pid}`));
+    expect(onValidate).toHaveBeenCalledWith("long-running", 10);
+  });
 });
 
-describe('Toast', () => {
-  it('renders message with level', () => {
+describe("Toast", () => {
+  it("renders message with level", () => {
     render(
       <Toast message="Test message" level="success" onDismiss={() => {}} />,
     );
-    expect(screen.getByText('Test message')).toBeDefined();
-    expect(screen.getByText('[SUCCESS]')).toBeDefined();
+    expect(screen.getByText("Test message")).toBeDefined();
+    expect(screen.getByText("[SUCCESS]")).toBeDefined();
   });
 
-  it('renders error level', () => {
+  it("renders error level", () => {
     render(
       <Toast message="Error occurred" level="error" onDismiss={() => {}} />,
     );
-    expect(screen.getByText('[ERROR]')).toBeDefined();
+    expect(screen.getByText("[ERROR]")).toBeDefined();
   });
 
-  it('calls onDismiss after duration', async () => {
+  it("calls onDismiss after duration", async () => {
     vi.useFakeTimers();
     const onDismiss = vi.fn();
     render(
@@ -270,12 +357,12 @@ describe('Toast', () => {
     vi.useRealTimers();
   });
 
-  it('calls onDismiss when X clicked', () => {
+  it("calls onDismiss when X clicked", () => {
     const onDismiss = vi.fn();
     render(
       <Toast message="Click dismiss" level="info" onDismiss={onDismiss} />,
     );
-    fireEvent.click(screen.getByText('[X]'));
+    fireEvent.click(screen.getByText("[X]"));
     expect(onDismiss).toHaveBeenCalled();
   });
 });

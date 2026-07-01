@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react';
-import type { SimulationEvent } from '../types/ws';
-import { stopSimulation } from '../hooks/useApi';
+import { useState, useEffect } from "react";
+import type { SimulationEvent } from "../types/ws";
+import { stopSimulation } from "../hooks/useApi";
 
 /**
  * Floating panel showing currently-running simulations (top) and the
@@ -11,107 +11,150 @@ export function SimulationPanel(props: {
   events: SimulationEvent[];
   active: SimulationEvent[];
   onClose: () => void;
+  mode?: "training" | "inference";
+  onValidate?: (kind: string, durationSecs: number) => void;
 }) {
   return (
     <div className="fixed right-4 top-20 z-40 w-[420px] max-h-[70vh] flex flex-col bg-canvas border border-ink-faint font-mono text-[11px]">
-     <div className="flex items-center justify-between px-3 py-2 border-b border-ink-faint">
+      <div className="flex items-center justify-between px-3 py-2 border-b border-ink-faint">
         <div className="flex items-center gap-2">
-         <span className="text-ink-muted">[SIMULATIONS</span>
+          <span className="text-ink-muted">[SIMULATIONS</span>
           {props.active.length > 0 ? (
-           <span className="text-heat animate-pulse">
+            <span className="text-heat animate-pulse">
               {props.active.length} RUNNING
-           </span>
+            </span>
           ) : null}
-       </div>
+        </div>
         <button
           onClick={props.onClose}
-         className="text-ink-muted hover:text-heat px-2"
+          className="text-ink-muted hover:text-heat px-2"
           aria-label="Close simulation panel"
         >
           [X]
-       </button>
-     </div>
+        </button>
+      </div>
 
       {props.active.length > 0 ? (
-       <div className="border-b border-ink-faint">
-         <div className="px-3 py-1 text-ink-faint text-[10px] uppercase tracking-wider">
+        <div className="border-b border-ink-faint">
+          <div className="px-3 py-1 text-ink-faint text-[10px] uppercase tracking-wider">
             Active
-         </div>
+          </div>
           {props.active.map((ev) => (
-            <SimulationRow key={`active-${ev.pid}`} ev={ev} />
+            <SimulationRow
+              key={`active-${ev.pid}`}
+              ev={ev}
+              mode={props.mode}
+              onValidate={props.onValidate}
+            />
           ))}
-       </div>
+        </div>
       ) : null}
 
       <div className="flex-1 overflow-y-auto min-h-0">
-       <div className="px-3 py-1 text-ink-faint text-[10px] uppercase tracking-wider sticky top-0 bg-canvas">
+        <div className="px-3 py-1 text-ink-faint text-[10px] uppercase tracking-wider sticky top-0 bg-canvas">
           History
-       </div>
+        </div>
         {props.events.length === 0 ? (
-         <div className="px-3 py-4 text-ink-faint italic">
+          <div className="px-3 py-4 text-ink-faint italic">
             No simulations yet. Use [SIMULATE v] in the top bar to spawn one.
-         </div>
+          </div>
         ) : (
           props.events
-            .filter((e) => e.status !== 'running' && e.status !== 'started')
+            .filter((e) => e.status !== "running" && e.status !== "started")
             .map((ev) => (
-              <SimulationRow key={`hist-${ev.pid}-${ev.status}`} ev={ev} />
+              <SimulationRow
+                key={`hist-${ev.pid}-${ev.status}`}
+                ev={ev}
+                mode={props.mode}
+                onValidate={props.onValidate}
+              />
             ))
         )}
-     </div>
-   </div>
+      </div>
+    </div>
   );
 }
 
-function SimulationRow({ ev }: { ev: SimulationEvent }) {
+function SimulationRow({
+  ev,
+  mode = "training",
+  onValidate,
+}: {
+  ev: SimulationEvent;
+  mode?: "training" | "inference";
+  onValidate?: (kind: string, durationSecs: number) => void;
+}) {
   const statusColor =
-    ev.status === 'running' || ev.status === 'started'
-     ? 'text-heat'
-     : ev.status === 'failed'
-       ? 'text-heat'
-       : 'text-ink-muted';
+    ev.status === "running" || ev.status === "started"
+      ? "text-heat"
+      : ev.status === "failed"
+        ? "text-heat"
+        : "text-ink-muted";
 
-  const isRunning = ev.status === 'running' || ev.status === 'started';
+  const isRunning = ev.status === "running" || ev.status === "started";
+  const isExited = ev.status === "exited";
 
   const handleKill = async () => {
-   try {
-     await stopSimulation(ev.pid);
-   } catch {
-     // ignore — the WS event will update the status
-   }
+    try {
+      await stopSimulation(ev.pid);
+    } catch {
+      // ignore — the WS event will update the status
+    }
+  };
+
+  const handleValidate = () => {
+    if (mode !== "inference") return;
+    // Estimate duration from the sim's duration_ms, default to 30s.
+    const durationSecs =
+      ev.duration_ms > 0 ? Math.max(5, Math.round(ev.duration_ms / 1000)) : 30;
+    onValidate?.(ev.kind, durationSecs);
   };
 
   return (
-   <div className="flex items-center justify-between px-3 py-1 border-b border-ink-faint">
-     <div className="flex items-center gap-2 min-w-0">
-       <span className={statusColor}>[{ev.status.toUpperCase()}]</span>
-       <span className="text-ink truncate">{ev.kind}</span>
-       <span className="text-ink-faint text-[10px]">
-         pid={ev.pid}
-       </span>
-     </div>
-     <div className="flex items-center gap-3 text-[10px] text-ink-muted shrink-0">
-       <span>{formatDuration(ev.duration_ms)}</span>
-       {ev.exit_code !== undefined ? (
-         <span
-           className={
-             ev.exit_code === 0 ? 'text-ink-muted' : 'text-heat'
-           }
-         >
-           exit={ev.exit_code}
-         </span>
-       ) : null}
-       {isRunning && (
-         <button
-           onClick={handleKill}
-           className="text-heat hover:text-canvas hover:bg-heat px-1 border border-heat transition-colors"
-           data-testid={`kill-sim-${ev.pid}`}
-         >
-           KILL
-         </button>
-       )}
-     </div>
-   </div>
+    <div className="flex items-center justify-between px-3 py-1 border-b border-ink-faint">
+      <div className="flex items-center gap-2 min-w-0">
+        <span className={statusColor}>[{ev.status.toUpperCase()}]</span>
+        <span className="text-ink truncate">{ev.kind}</span>
+        <span className="text-ink-faint text-[10px]">pid={ev.pid}</span>
+      </div>
+      <div className="flex items-center gap-3 text-[10px] text-ink-muted shrink-0">
+        <span>{formatDuration(ev.duration_ms)}</span>
+        {ev.exit_code !== undefined ? (
+          <span className={ev.exit_code === 0 ? "text-ink-muted" : "text-heat"}>
+            exit={ev.exit_code}
+          </span>
+        ) : null}
+        {isRunning && (
+          <button
+            onClick={handleKill}
+            className="text-heat hover:text-canvas hover:bg-heat px-1 border border-heat transition-colors"
+            data-testid={`kill-sim-${ev.pid}`}
+          >
+            KILL
+          </button>
+        )}
+        {isExited && onValidate && (
+          <button
+            onClick={handleValidate}
+            disabled={mode !== "inference"}
+            title={
+              mode === "inference"
+                ? "Rerun this workload with the frozen routing table to validate the trained model."
+                : "Freeze the allocator first, then validate."
+            }
+            className={[
+              "px-1 border transition-colors",
+              mode === "inference"
+                ? "text-ink border-ink hover:bg-ink hover:text-canvas"
+                : "text-ink-faint border-ink-faint cursor-not-allowed opacity-50",
+            ].join(" ")}
+            data-testid={`validate-sim-${ev.pid}`}
+          >
+            VALIDATE
+          </button>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -130,11 +173,11 @@ function formatDuration(ms: number): string {
  */
 export function Toast(props: {
   message: string;
-  level?: 'info' | 'error' | 'success';
+  level?: "info" | "error" | "success";
   durationMs?: number;
   onDismiss: () => void;
 }) {
-  const { message, level = 'info', durationMs = 4000, onDismiss } = props;
+  const { message, level = "info", durationMs = 4000, onDismiss } = props;
 
   useEffect(() => {
     const t = setTimeout(onDismiss, durationMs);
@@ -142,9 +185,7 @@ export function Toast(props: {
   }, [durationMs, onDismiss]);
 
   const colorClass =
-    level === 'error'
-      ? 'border-heat text-heat'
-      : 'border-ink text-ink';
+    level === "error" ? "border-heat text-heat" : "border-ink text-ink";
 
   return (
     <div
@@ -156,9 +197,9 @@ export function Toast(props: {
         <span className="truncate">{message}</span>
         <button onClick={onDismiss} className="opacity-60 hover:opacity-100">
           [X]
-       </button>
-     </div>
-   </div>
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -179,11 +220,11 @@ export function SimulateDropdown(props: {
     if (!open) return;
     const onDocClick = () => setOpen(false);
     const handle = setTimeout(() => {
-      document.addEventListener('click', onDocClick, { once: true });
+      document.addEventListener("click", onDocClick, { once: true });
     }, 0);
     return () => {
       clearTimeout(handle);
-      document.removeEventListener('click', onDocClick);
+      document.removeEventListener("click", onDocClick);
     };
   }, [open]);
 
@@ -197,9 +238,7 @@ export function SimulateDropdown(props: {
     }
   };
 
-  const label = pending
-    ? `STARTING ${pending.toUpperCase()}...`
-    : 'SIMULATE v';
+  const label = pending ? `STARTING ${pending.toUpperCase()}...` : "SIMULATE v";
 
   return (
     <div className="relative">
@@ -214,56 +253,56 @@ export function SimulateDropdown(props: {
         aria-expanded={open}
       >
         {label}
-     </button>
+      </button>
       {open ? (
-       <div className="absolute right-0 top-full mt-1 z-30 bg-canvas border border-ink min-w-[280px] font-mono text-[11px]">
-         <div className="px-3 py-2 border-b border-ink-faint">
-           <div className="flex items-center justify-between mb-1">
-             <span className="text-ink-muted tracking-widest">DURATION</span>
-             <span className="text-heat">{props.durationSecs}s</span>
-           </div>
-           <input
-             type="range"
-             min={5}
-             max={300}
-             step={5}
-             value={props.durationSecs}
-             onChange={(e) => props.onDurationChange(Number(e.target.value))}
-             className="w-full accent-heat cursor-pointer"
-             data-testid="duration-slider"
-           />
-         </div>
+        <div className="absolute right-0 top-full mt-1 z-30 bg-canvas border border-ink min-w-[280px] font-mono text-[11px]">
+          <div className="px-3 py-2 border-b border-ink-faint">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-ink-muted tracking-widest">DURATION</span>
+              <span className="text-heat">{props.durationSecs}s</span>
+            </div>
+            <input
+              type="range"
+              min={5}
+              max={300}
+              step={5}
+              value={props.durationSecs}
+              onChange={(e) => props.onDurationChange(Number(e.target.value))}
+              className="w-full accent-heat cursor-pointer"
+              data-testid="duration-slider"
+            />
+          </div>
           <button
-            onClick={() => handleSelect('lohalloc-example')}
-           className="block w-full text-left px-3 py-2 text-ink hover:bg-heat/10 hover:text-heat"
+            onClick={() => handleSelect("lohalloc-example")}
+            className="block w-full text-left px-3 py-2 text-ink hover:bg-heat/10 hover:text-heat"
           >
             <div className="font-bold">LOHALLOC EXAMPLE</div>
-           <div className="text-[10px] text-ink-muted">
+            <div className="text-[10px] text-ink-muted">
               Vec growth + Boxes + 4MiB buffer + HashMap
-           </div>
-         </button>
-         <div className="border-t border-ink-faint" />
+            </div>
+          </button>
+          <div className="border-t border-ink-faint" />
           <button
-            onClick={() => handleSelect('http-server')}
-           className="block w-full text-left px-3 py-2 text-ink hover:bg-heat/10 hover:text-heat"
+            onClick={() => handleSelect("http-server")}
+            className="block w-full text-left px-3 py-2 text-ink hover:bg-heat/10 hover:text-heat"
           >
             <div className="font-bold">HTTP SERVER (PORT 4000</div>
-           <div className="text-[10px] text-ink-muted">
+            <div className="text-[10px] text-ink-muted">
               A second lohalloc-server under the shim
-           </div>
-         </button>
-         <div className="border-t border-ink-faint" />
+            </div>
+          </button>
+          <div className="border-t border-ink-faint" />
           <button
-            onClick={() => handleSelect('long-running')}
-           className="block w-full text-left px-3 py-2 text-ink hover:bg-heat/10 hover:text-heat"
+            onClick={() => handleSelect("long-running")}
+            className="block w-full text-left px-3 py-2 text-ink hover:bg-heat/10 hover:text-heat"
           >
-           <div className="font-bold">LONG RUNNING</div>
-           <div className="text-[10px] text-ink-muted">
-             lohalloc-example under the shim for {props.durationSecs}s
-           </div>
-         </button>
-       </div>
+            <div className="font-bold">LONG RUNNING</div>
+            <div className="text-[10px] text-ink-muted">
+              lohalloc-example under the shim for {props.durationSecs}s
+            </div>
+          </button>
+        </div>
       ) : null}
-   </div>
+    </div>
   );
 }

@@ -115,11 +115,17 @@ pub struct SimulationError {
 
 impl SimulationError {
     fn missing_binary(kind: SimulationKind) -> Self {
+        let name = kind.binary_name();
+        let env_key = kind.env_override_key();
         Self {
             code: "BINARY_NOT_FOUND",
             message: format!(
-                "could not find `{}`. Build it with: cargo build --release -p {}",
-                kind.binary_name(),
+                "could not find `{}`. Searched: ${} env var, target/debug/{name}, \
+                 target/release/{name}, ../target/*/{{debug,release}}/{name}, \
+                 ../../target/*/{{debug,release}}/{name}. \
+                 Build it with: cargo build --release -p {}",
+                name,
+                env_key,
                 kind.crate_name()
             ),
         }
@@ -414,6 +420,9 @@ mod tests {
         assert_eq!(e.code, "BINARY_NOT_FOUND");
         assert!(e.message.contains("lohalloc-example"));
         assert!(e.message.contains("cargo build"));
+        assert!(e.message.contains("target/debug"));
+        assert!(e.message.contains("target/release"));
+        assert!(e.message.contains("LOHALLOC_BIN_"));
     }
 
     #[test]

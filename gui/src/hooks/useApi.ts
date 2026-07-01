@@ -260,10 +260,12 @@ export async function runSimulation(
 
 /**
  * Stop a running simulation by pid. Sends a kill signal to the child process.
+ * If the server returns 404, the sim may have already exited (the WS
+ * "failed" event already updated the UI). We swallow that error.
  */
 export async function stopSimulation(pid: number): Promise<void> {
   const res = await fetch(`${STOP_SIMULATION_URL}/${pid}`, { method: 'POST' });
-  if (!res.ok) {
+  if (!res.ok && res.status !== 404) {
     throw new Error(`stopSimulation failed: ${res.status} ${res.statusText}`);
   }
 }

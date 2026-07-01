@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
-import type { TelemetryRecord } from '../types/telemetry';
-import type { SimulationEvent } from '../types/ws';
-import { WEBSOCKET_URL } from '../utils/constants';
+import { useEffect, useRef, useState, useCallback } from "react";
+import type { TelemetryRecord } from "../types/telemetry";
+import type { SimulationEvent } from "../types/ws";
+import { WEBSOCKET_URL } from "../utils/constants";
 
 // Cap at 5000 records (~1MB) so percentile charts, FloatingWeb, and HeapMap
 // have enough history for meaningful visualization during longer live sessions.
@@ -14,6 +14,7 @@ export function useTelemetry(): {
   paused: boolean;
   setPaused: (p: boolean) => void;
   subscribeSimEvents: (cb: (ev: SimulationEvent) => void) => () => void;
+  resetState: () => void;
 } {
   const [records, setRecords] = useState<TelemetryRecord[]>([]);
   const [isConnected, setIsConnected] = useState(false);
@@ -61,7 +62,7 @@ export function useTelemetry(): {
         if (cancelled) return;
         try {
           const parsed = JSON.parse(event.data as string);
-          if (parsed && parsed.type === 'simulation' && parsed.event) {
+          if (parsed && parsed.type === "simulation" && parsed.event) {
             const ev = parsed.event as SimulationEvent;
             simListenersRef.current.forEach((cb) => cb(ev));
             return;
@@ -71,7 +72,10 @@ export function useTelemetry(): {
             bufferRef.current.push(record);
             // Bound buffer to prevent unbounded growth during long pause.
             if (bufferRef.current.length > MAX_RECORDS) {
-              bufferRef.current.splice(0, bufferRef.current.length - MAX_RECORDS);
+              bufferRef.current.splice(
+                0,
+                bufferRef.current.length - MAX_RECORDS,
+              );
             }
             return;
           }
@@ -120,10 +124,31 @@ export function useTelemetry(): {
     };
   }, []);
 
-  const subscribeSimEvents = useCallback((cb: (ev: SimulationEvent) => void): (() => void) => {
-    simListenersRef.current.add(cb);
-    return () => { simListenersRef.current.delete(cb); };
+  const subscribeSimEvents = useCallback(
+    (cb: (ev: SimulationEvent) => void): (() => void) => {
+      simListenersRef.current.add(cb);
+      return () => {
+        simListenersRef.current.delete(cb);
+      };
+    },
+    [],
+  );
+
+  /** Clear all telemetry state — records, buffer, and timestamp tracking.
+   * Call before starting a new simulation to prevent telemetry bleed-over. */
+  const resetState = useCallback(() => {
+    setRecords([]);
+    bufferRef.current = [];
+    // opTimestampsRef is owned by App.tsx; we can't reset it here, but
+    // clearing records will cause App's useEffect to reset the buffer there.
   }, []);
 
-  return { records, isConnected, paused, setPaused, subscribeSimEvents };
+  return {
+    records,
+    isConnected,
+    paused,
+    setPaused,
+    subscribeSimEvents,
+    resetState,
+  };
 }

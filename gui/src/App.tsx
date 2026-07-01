@@ -1,19 +1,29 @@
-import { useEffect, useMemo, useRef, useState, type ComponentType } from 'react';
-import { useTelemetry } from './hooks/useTelemetry';
-import { useLiveStream } from './hooks/useLiveStream';
-import { useSimulationEvents } from './hooks/useSimulationEvents';
-import { useConvergence } from './hooks/useConvergence';
-import { runSimulation } from './hooks/useApi';
-import { PerfTraceView } from './components/PerfTraceView';
-import { StrategyButtons } from './components/StrategyToggle';
-import { HeapMap } from './components/HeapMap';
-import ModeToggle from './components/ModeToggle';
-import CollapsedTopology from './components/CollapsedTopology';
-import TelemetrySidebar from './components/TelemetrySidebar';
-import TraceUploadModal from './components/TraceUploadModal';
-import { SimulationPanel, SimulateDropdown, Toast } from './components/SimulationPanel';
-import type { Mode } from './hooks/useApi';
-import type { TelemetryRecord } from './types/telemetry';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentType,
+} from "react";
+import { useTelemetry } from "./hooks/useTelemetry";
+import { useLiveStream } from "./hooks/useLiveStream";
+import { useSimulationEvents } from "./hooks/useSimulationEvents";
+import { useConvergence } from "./hooks/useConvergence";
+import { runSimulation } from "./hooks/useApi";
+import { PerfTraceView } from "./components/PerfTraceView";
+import { StrategyButtons } from "./components/StrategyToggle";
+import { HeapMap } from "./components/HeapMap";
+import ModeToggle from "./components/ModeToggle";
+import CollapsedTopology from "./components/CollapsedTopology";
+import TelemetrySidebar from "./components/TelemetrySidebar";
+import TraceUploadModal from "./components/TraceUploadModal";
+import {
+  SimulationPanel,
+  SimulateDropdown,
+  Toast,
+} from "./components/SimulationPanel";
+import type { Mode } from "./hooks/useApi";
+import type { TelemetryRecord } from "./types/telemetry";
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n}B`;
@@ -22,12 +32,12 @@ function formatBytes(n: number): string {
 }
 
 const FloatingWebLazy = ({ records }: { records: TelemetryRecord[] }) => {
-  const [Cmp, setCmp] = useState<ComponentType<{ records: TelemetryRecord[] }> | null>(
-    null,
-  );
+  const [Cmp, setCmp] = useState<ComponentType<{
+    records: TelemetryRecord[];
+  }> | null>(null);
   useEffect(() => {
     let cancelled = false;
-    import('./components/FloatingWeb')
+    import("./components/FloatingWeb")
       .then((m) => {
         if (!cancelled) setCmp(() => m.default);
       })
@@ -49,40 +59,80 @@ const FloatingWebLazy = ({ records }: { records: TelemetryRecord[] }) => {
 };
 
 function App() {
-  const { records, isConnected, subscribeSimEvents } = useTelemetry();
-  const [mode, setMode] = useState<Mode>('training');
+  const { records, isConnected, subscribeSimEvents, resetState } =
+    useTelemetry();
+  const [mode, setMode] = useState<Mode>("training");
   const [traceModalOpen, setTraceModalOpen] = useState(false);
   const [simPanelOpen, setSimPanelOpen] = useState(false);
   const [durationSecs, setDurationSecs] = useState(30);
   const [toast, setToast] = useState<{
     message: string;
-    level?: 'info' | 'error' | 'success';
+    level?: "info" | "error" | "success";
     key: number;
   } | null>(null);
   const isLive = useLiveStream(records.length);
   const convergence = useConvergence(records);
 
   // Simulation events from the WS stream
-  const { active: activeSims, events: simEvents } = useSimulationEvents({
+  const {
+    active: activeSims,
+    events: simEvents,
+    clear: clearSimEvents,
+  } = useSimulationEvents({
     subscribeSimEvents,
   });
 
-  const allocCount = records.filter((r) => r.op === 'alloc').length;
-  const freeCount = records.filter((r) => r.op === 'free').length;
+  const allocCount = records.filter((r) => r.op === "alloc").length;
+  const freeCount = records.filter((r) => r.op === "free").length;
 
   const handleSpawn = async (kind: string) => {
+    // Purge old telemetry + sim history so the new run starts clean.
+    resetState();
+    clearSimEvents();
     try {
       const result = await runSimulation(kind, { duration_secs: durationSecs });
       setToast({
         message: `Spawned ${result.kind} (pid=${result.pid})`,
-        level: 'success',
+        level: "success",
         key: Date.now(),
       });
       setSimPanelOpen(true);
     } catch (err) {
       setToast({
-        message: err instanceof Error ? err.message : 'spawn failed',
-        level: 'error',
+        message: err instanceof Error ? err.message : "spawn failed",
+        level: "error",
+        key: Date.now(),
+      });
+    }
+  };
+
+  // Validate: rerun a completed simulation's workload using the frozen
+  // (inference-mode) routing table so the user can compare metrics.
+  const handleValidate = async (kind: string, validateDurationSecs: number) => {
+    if (mode !== "inference") {
+      setToast({
+        message: "Freeze the allocator first, then validate.",
+        level: "error",
+        key: Date.now(),
+      });
+      return;
+    }
+    resetState();
+    clearSimEvents();
+    try {
+      const result = await runSimulation(kind, {
+        duration_secs: validateDurationSecs,
+      });
+      setToast({
+        message: `Validating ${result.kind} with frozen model (pid=${result.pid})`,
+        level: "success",
+        key: Date.now(),
+      });
+      setSimPanelOpen(true);
+    } catch (err) {
+      setToast({
+        message: err instanceof Error ? err.message : "validation spawn failed",
+        level: "error",
         key: Date.now(),
       });
     }
@@ -122,7 +172,7 @@ function App() {
 
     const recent = records.slice(-5000);
     const bytesAlloc = recent.reduce(
-      (sum, r) => (r.op === 'alloc' ? sum + r.size : sum),
+      (sum, r) => (r.op === "alloc" ? sum + r.size : sum),
       0,
     );
 
@@ -171,23 +221,36 @@ function App() {
           >
             UPLOAD TRACE
           </button>
-          <SimulateDropdown onSpawn={handleSpawn} durationSecs={durationSecs} onDurationChange={setDurationSecs} />
+          <SimulateDropdown
+            onSpawn={handleSpawn}
+            durationSecs={durationSecs}
+            onDurationChange={setDurationSecs}
+          />
           <div
             className="flex items-center gap-3 text-[11px] tracking-widest tabular-nums"
             data-testid="metrics-strip"
           >
             <span className="text-heat uppercase">BYTES</span>
-            <span className="text-ink inline-block min-w-[72px] text-right" data-testid="metric-bytes">
+            <span
+              className="text-ink inline-block min-w-[72px] text-right"
+              data-testid="metric-bytes"
+            >
               {formatBytes(metrics.bytesAlloc)}
             </span>
             <span className="text-ink-faint">|</span>
             <span className="text-heat uppercase">OPS</span>
-            <span className="text-ink inline-block min-w-[48px] text-right" data-testid="metric-ops">
+            <span
+              className="text-ink inline-block min-w-[48px] text-right"
+              data-testid="metric-ops"
+            >
               {metrics.opsPerSec}/s
             </span>
             <span className="text-ink-faint">|</span>
             <span className="text-heat uppercase">FRAG</span>
-            <span className="text-ink inline-block min-w-[48px] text-right" data-testid="metric-frag">
+            <span
+              className="text-ink inline-block min-w-[48px] text-right"
+              data-testid="metric-frag"
+            >
               {metrics.fragAvg.toFixed(1)}%
             </span>
           </div>
@@ -195,29 +258,32 @@ function App() {
           <div className="flex items-center gap-1.5">
             <span
               className={[
-                'inline-block h-1.5 w-1.5',
-                isConnected ? 'bg-heat heat-glow-box' : 'bg-ink-muted',
-              ].join(' ')}
+                "inline-block h-1.5 w-1.5",
+                isConnected ? "bg-heat heat-glow-box" : "bg-ink-muted",
+              ].join(" ")}
               data-testid="connection-dot"
             />
             <span className="text-ink-muted uppercase">
-              {isConnected ? 'LINK UP' : 'LINK DN'}
+              {isConnected ? "LINK UP" : "LINK DN"}
             </span>
           </div>
           {isLive && (
-            <div className="flex items-center gap-1.5" data-testid="live-indicator">
+            <div
+              className="flex items-center gap-1.5"
+              data-testid="live-indicator"
+            >
               <span className="inline-block h-1.5 w-1.5 bg-heat heat-glow-box" />
               <span className="text-heat tracking-widest uppercase">LIVE</span>
             </div>
           )}
           <span className="text-ink-faint">|</span>
           <span className="text-ink">
-            {records.length.toString().padStart(6, '0')} REC
+            {records.length.toString().padStart(6, "0")} REC
           </span>
           <span className="text-ink-faint">|</span>
           <span className="text-ink-muted">
-            ALLOC {allocCount.toString().padStart(5, '0')} / FREE{' '}
-            {freeCount.toString().padStart(5, '0')}
+            ALLOC {allocCount.toString().padStart(5, "0")} / FREE{" "}
+            {freeCount.toString().padStart(5, "0")}
           </span>
         </div>
       </header>
@@ -226,8 +292,8 @@ function App() {
       <main
         className="grid grid-cols-12 gap-2 p-2 flex-1 overflow-hidden"
         style={{
-          gridTemplateRows: '3fr 2fr', // Top row slightly larger
-          height: 'calc(100vh - 64px)',
+          gridTemplateRows: "3fr 2fr", // Top row slightly larger
+          height: "calc(100vh - 64px)",
         }}
       >
         {/* TOP LEFT: Topology */}
@@ -237,19 +303,24 @@ function App() {
         >
           <div className="px-3 py-2 border-b border-ink-faint text-[10px] tracking-widest text-ink-muted flex items-center justify-between flex-wrap gap-y-1 shrink-0">
             <span>
-              {mode === 'inference'
-                ? 'COLLAPSED TOPOLOGY // INFERENCE'
-                : 'FLOATING WEB // TRAINING'}
+              {mode === "inference"
+                ? "COLLAPSED TOPOLOGY // INFERENCE"
+                : "FLOATING WEB // TRAINING"}
             </span>
             <div className="flex items-center gap-2 flex-wrap">
-              {mode === 'training' && convergence.uniqueHashes > 0 && (
-                <div className="flex items-center gap-2" data-testid="convergence-meters">
+              {mode === "training" && convergence.uniqueHashes > 0 && (
+                <div
+                  className="flex items-center gap-2"
+                  data-testid="convergence-meters"
+                >
                   <div className="flex items-center gap-1">
                     <span className="text-ink-faint">TOPO</span>
                     <div className="w-16 h-1 bg-ink-faint/30">
                       <div
                         className="h-full bg-heat transition-all"
-                        style={{ width: `${Math.round(convergence.topologyProgress * 100)}%` }}
+                        style={{
+                          width: `${Math.round(convergence.topologyProgress * 100)}%`,
+                        }}
                       />
                     </div>
                   </div>
@@ -258,7 +329,9 @@ function App() {
                     <div className="w-16 h-1 bg-ink-faint/30">
                       <div
                         className="h-full bg-heat transition-all"
-                        style={{ width: `${Math.round(convergence.stabilityProgress * 100)}%` }}
+                        style={{
+                          width: `${Math.round(convergence.stabilityProgress * 100)}%`,
+                        }}
                       />
                     </div>
                   </div>
@@ -279,7 +352,7 @@ function App() {
             </div>
           </div>
           <div className="flex-1 relative overflow-hidden min-h-0">
-            {mode === 'inference' ? (
+            {mode === "inference" ? (
               <CollapsedTopology refreshKey={records.length} />
             ) : (
               <FloatingWebLazy records={records} />
@@ -321,6 +394,8 @@ function App() {
           events={simEvents}
           active={activeSims}
           onClose={() => setSimPanelOpen(false)}
+          mode={mode}
+          onValidate={handleValidate}
         />
       )}
 

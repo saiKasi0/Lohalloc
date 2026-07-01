@@ -150,6 +150,9 @@ pub struct SimulationHandle {
     pub kind: crate::simulation::SimulationKind,
     pub started_at: std::time::Instant,
     pub child: Arc<tokio::sync::Mutex<std::process::Child>>,
+    /// Set to `true` when the operator kills the sim via `/api/stop-simulation`.
+    /// The watcher checks this to avoid emitting a duplicate exit event.
+    pub killed_by_operator: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -208,6 +211,7 @@ impl AppState {
             kind,
             started_at: std::time::Instant::now(),
             child: Arc::new(tokio::sync::Mutex::new(child)),
+            killed_by_operator: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         if let Ok(mut g) = self.simulations.lock() {
             g.insert(pid, handle);
@@ -216,11 +220,17 @@ impl AppState {
 
     /// Look up a registered simulation. Returns `None` if the pid is not
     /// currently tracked (either never registered, or already cleaned up).
-    pub fn get_simulation(&self, pid: u32) -> Option<Arc<tokio::sync::Mutex<std::process::Child>>> {
-        self.simulations
-            .lock()
-            .ok()
-            .and_then(|g| g.get(&pid).map(|h| h.child.clone()))
+    pub fn get_simulation(
+        &self,
+        pid: u32,
+    ) -> Option<(
+        Arc<tokio::sync::Mutex<std::process::Child>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    )> {
+        self.simulations.lock().ok().and_then(|g| {
+            g.get(&pid)
+                .map(|h| (h.child.clone(), h.killed_by_operator.clone()))
+        })
     }
 
     /// Get the kind of a registered simulation.
@@ -243,7 +253,9 @@ impl AppState {
     /// Kill a running simulation by pid. Sends `kill` (SIGKILL) to the child
     /// process. Returns the kind if the simulation was found and killed.
     pub async fn kill_simulation(&self, pid: u32) -> Option<crate::simulation::SimulationKind> {
-        let child_arc = self.get_simulation(pid)?;
+        let (child_arc, killed_flag) = self.get_simulation(pid)?;
+        // Set the operator-kill flag so the watcher doesn't emit a duplicate.
+        killed_flag.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut guard = child_arc.lock().await;
         let _ = guard.kill();
         let kind = self.get_simulation_kind(pid);
@@ -978,10 +990,15 @@ async fn run_simulation_handler(
         .into_response()
 }
 
+/// Hard ceiling for any simulation, regardless of kind. Prevents zombie
+/// processes from hanging indefinitely (e.g., a deadlocked `http-server`
+/// or a `lohalloc-example` stuck in an infinite loop).
+const MAX_SIM_DURATION_SECS: u64 = 300;
+
 /// Background task: poll a spawned simulation's exit status and emit
 /// lifecycle events. Runs on the tokio runtime; uses `try_wait` so it does
-/// not block other tasks. Auto-kills the process after `max_duration_secs`
-/// if set (applies to HttpServer which has no built-in duration limit).
+/// not block other tasks. Auto-kills the process after the effective
+/// deadline (the minimum of `max_duration_secs` and `MAX_SIM_DURATION_SECS`).
 fn spawn_simulation_watcher(
     state: AppState,
     pid: u32,
@@ -992,40 +1009,46 @@ fn spawn_simulation_watcher(
         // Tiny initial delay so the "started" event arrives first.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let started_at = std::time::Instant::now();
-        let max_duration = max_duration_secs.map(std::time::Duration::from_secs);
+
+        // Effective deadline: the requested duration (if any) capped by the
+        // hard ceiling. Always applies, even for kinds without a built-in
+        // duration limit.
+        let effective_deadline_secs = max_duration_secs
+            .unwrap_or(MAX_SIM_DURATION_SECS)
+            .min(MAX_SIM_DURATION_SECS);
+        let effective_deadline = std::time::Duration::from_secs(effective_deadline_secs);
 
         loop {
-            let Some(child_arc) = state.get_simulation(pid) else {
+            let Some((child_arc, killed_flag)) = state.get_simulation(pid) else {
                 // Already cleaned up.
                 return;
             };
 
-            // Check duration timeout (for HttpServer which runs forever).
-            if let Some(max) = max_duration {
-                if started_at.elapsed() >= max {
-                    // Kill the process.
-                    let mut guard = child_arc.lock().await;
-                    let _ = guard.kill();
-                    drop(guard);
+            // Check hard timeout ceiling (applies to ALL sim kinds).
+            if started_at.elapsed() >= effective_deadline {
+                // Set the operator-kill flag so we don't emit a duplicate.
+                killed_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                let mut guard = child_arc.lock().await;
+                let _ = guard.kill();
+                drop(guard);
 
-                    let duration_ms = started_at.elapsed().as_millis() as u64;
-                    let ev = SimulationEvent {
-                        pid,
-                        kind: kind.as_str().to_string(),
-                        status: "exited".to_string(),
-                        duration_ms,
-                        exit_code: Some(0),
-                        stdout_tail: None,
-                        error: Some("duration limit reached".to_string()),
-                    };
-                    let envelope = ev.clone().into_ws_message();
-                    if let Ok(s) = serde_json::to_string(&envelope) {
-                        state.telemetry_tx.send_raw(s);
-                    }
-                    state.push_simulation_history(ev);
-                    state.unregister_simulation(pid);
-                    return;
+                let duration_ms = started_at.elapsed().as_millis() as u64;
+                let ev = SimulationEvent {
+                    pid,
+                    kind: kind.as_str().to_string(),
+                    status: "exited".to_string(),
+                    duration_ms,
+                    exit_code: Some(0),
+                    stdout_tail: None,
+                    error: Some("duration limit reached".to_string()),
+                };
+                let envelope = ev.clone().into_ws_message();
+                if let Ok(s) = serde_json::to_string(&envelope) {
+                    state.telemetry_tx.send_raw(s);
                 }
+                state.push_simulation_history(ev);
+                state.unregister_simulation(pid);
+                return;
             }
 
             // Poll once.
@@ -1035,6 +1058,13 @@ fn spawn_simulation_watcher(
             };
 
             if let Some(status) = exit_status {
+                // If the operator already killed this sim (via
+                // `/api/stop-simulation`), the kill handler already emitted
+                // a "failed" event. Don't emit a duplicate.
+                if killed_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+
                 let duration_ms = started_at.elapsed().as_millis() as u64;
                 let exit_code = status.code();
                 let stdout_tail = read_child_stdout_tail(&child_arc).await;
