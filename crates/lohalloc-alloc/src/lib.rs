@@ -160,6 +160,14 @@ impl Lohalloc {
 // SAFETY: backend state is guarded by `Mutex`; `mmap`/`munmap` are thread-safe.
 // Re-entrancy is broken by the thread-local guard (see `alloc`). The backends
 // never call back into `Lohalloc::alloc` for user allocations.
+//
+// `Send` is also sound: all interior mutability is funnelled through the
+// `Mutex` fields (or the thread-local re-entrancy guard, which is itself
+// `Send`), so a `Lohalloc` can be safely moved to another thread — it
+// simply transfers ownership of the same locks. The raw `*mut FreeNode`
+// pointers inside `Slab`/`Buddy` only ever escape through the `Mutex`,
+// never across thread boundaries on their own.
+unsafe impl Send for Lohalloc {}
 unsafe impl Sync for Lohalloc {}
 
 thread_local! {
@@ -493,6 +501,38 @@ impl Lohalloc {
     pub fn freeze(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.freeze();
+        }
+    }
+
+    /// Snapshot the current "best backend per Signature" without
+    /// transitioning to Inference mode. Used during live training to show
+    /// the routing-table-as-it-is-being-built to the GUI (TensorBoard-style).
+    ///
+    /// Returns an empty Vec in Inference mode.
+    pub fn routing_snapshot(&self) -> Vec<(u64, lohalloc_core::Backend)> {
+        if let Ok(state) = self.state.lock() {
+            state.routing_snapshot()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Number of distinct Signatures observed so far (Training mode only).
+    /// Returns 0 in Inference mode.
+    pub fn signature_count(&self) -> usize {
+        if let Ok(state) = self.state.lock() {
+            state.signature_count()
+        } else {
+            0
+        }
+    }
+
+    /// Reset the Decision Engine back to a fresh Training state, discarding
+    /// any frozen routing table or learned bandit weights. Used by the GUI's
+    /// "back to training" button.
+    pub fn reset_to_training(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.reset_to_training();
         }
     }
 

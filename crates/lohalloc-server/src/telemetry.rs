@@ -12,17 +12,36 @@ use lohalloc_core::TelemetryRecord;
 /// growth if no WebSocket client is draining.
 pub const DEFAULT_CAPACITY: usize = 8192;
 
+/// Default bounded buffer capacity for raw WS text messages (e.g. simulation
+/// lifecycle events). Independent of the telemetry stream so a flood of
+/// allocation records can't starve control-plane messages.
+pub const RAW_MESSAGE_CAPACITY: usize = 1024;
+
+/// A pre-serialized JSON string ready to be forwarded verbatim to all
+/// connected WebSocket clients. Used for non-`TelemetryRecord` messages
+/// such as `{"type":"simulation","event":{...}}`.
+#[derive(Debug, Clone)]
+pub struct RawWsMessage(pub String);
+
 /// The sending half of the telemetry channel. The replay engine pushes
 /// `TelemetryRecord`s here; they are drained by the WebSocket handler.
 #[derive(Clone)]
 pub struct TelemetrySender {
     tx: Sender<TelemetryRecord>,
+    /// Channel for raw, pre-serialized WS messages (control plane).
+    raw_tx: Sender<RawWsMessage>,
+    /// Optional broadcast sender for WS fan-out. When set, `send()` and
+    /// `send_raw()` also broadcast to all WS subscribers so each client
+    /// gets its own copy (fixes the zombie-task record-stealing bug).
+    ws_broadcast: Option<tokio::sync::broadcast::Sender<TelemetryRecord>>,
+    ws_raw_broadcast: Option<tokio::sync::broadcast::Sender<RawWsMessage>>,
 }
 
 /// The receiving half of the telemetry channel. The WebSocket handler
 /// drains records and serializes them as JSON.
 pub struct TelemetryReceiver {
     rx: Receiver<TelemetryRecord>,
+    raw_rx: Receiver<RawWsMessage>,
 }
 
 /// Create a bounded telemetry channel pair with the default capacity.
@@ -33,13 +52,26 @@ pub fn telemetry_channel() -> (TelemetrySender, TelemetryReceiver) {
 /// Create a bounded telemetry channel pair with a custom capacity.
 pub fn telemetry_channel_with_capacity(cap: usize) -> (TelemetrySender, TelemetryReceiver) {
     let (tx, rx) = bounded(cap);
-    (TelemetrySender { tx }, TelemetryReceiver { rx })
+    let (raw_tx, raw_rx) = bounded(RAW_MESSAGE_CAPACITY);
+    (
+        TelemetrySender {
+            tx,
+            raw_tx,
+            ws_broadcast: None,
+            ws_raw_broadcast: None,
+        },
+        TelemetryReceiver { rx, raw_rx },
+    )
 }
 
 impl TelemetrySender {
     /// Push a record. If the buffer is full, the record is dropped (never
-    /// blocks the producer).
+    /// blocks the producer). Also broadcasts to WS subscribers if a
+    /// broadcast channel is attached.
     pub fn send(&self, record: TelemetryRecord) {
+        if let Some(bcast) = &self.ws_broadcast {
+            let _ = bcast.send(record);
+        }
         match self.tx.try_send(record) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
@@ -49,6 +81,35 @@ impl TelemetrySender {
                 // No receiver — drop silently.
             }
         }
+    }
+
+    /// Send a pre-serialized raw WS text message (e.g. a simulation event).
+    /// If the buffer is full or disconnected, the message is dropped.
+    /// Also broadcasts to WS subscribers if a raw broadcast channel is
+    /// attached.
+    pub fn send_raw(&self, msg: impl Into<String>) {
+        let s = msg.into();
+        let raw = RawWsMessage(s.clone());
+        if let Some(bcast) = &self.ws_raw_broadcast {
+            let _ = bcast.send(raw);
+        }
+        match self.raw_tx.try_send(RawWsMessage(s)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+}
+
+impl TelemetrySender {
+    /// Attach broadcast channels for WS fan-out. After this, `send()` and
+    /// `send_raw()` will also broadcast to all subscribers.
+    pub fn attach_broadcast(
+        &mut self,
+        ws: tokio::sync::broadcast::Sender<TelemetryRecord>,
+        ws_raw: tokio::sync::broadcast::Sender<RawWsMessage>,
+    ) {
+        self.ws_broadcast = Some(ws);
+        self.ws_raw_broadcast = Some(ws_raw);
     }
 }
 
@@ -75,6 +136,31 @@ impl TelemetryReceiver {
             }
             Err(_) => None,
         }
+    }
+
+    /// Block until at least one raw WS message is available, then drain all
+    /// buffered messages. Returns `None` if the channel is closed and empty.
+    pub fn recv_raw_batch(&self) -> Option<Vec<RawWsMessage>> {
+        match self.raw_rx.recv() {
+            Ok(first) => {
+                let mut out = vec![first];
+                while let Ok(m) = self.raw_rx.try_recv() {
+                    out.push(m);
+                }
+                Some(out)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Non-blocking drain of raw messages. Returns whatever is buffered
+    /// right now (may be empty).
+    pub fn drain_raw(&self) -> Vec<RawWsMessage> {
+        let mut out = Vec::new();
+        while let Ok(m) = self.raw_rx.try_recv() {
+            out.push(m);
+        }
+        out
     }
 
     /// Reference to the underlying receiver (for `select!`-based polling).

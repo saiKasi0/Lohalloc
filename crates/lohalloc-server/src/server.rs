@@ -9,12 +9,22 @@
 //!   returns the frozen `.lohalloc` model as `application/octet-stream`.
 //! - `POST /api/freeze-export` — Triggers `freeze()` + `export()` on the
 //!   last replay allocator and returns `.lohalloc` bytes (Phase 5).
+//! - `POST /api/freeze` — Freeze the live training allocator (TensorBoard
+//!   "commit"). Collapses the live MAB into a frozen routing table and
+//!   stores it for `/api/freeze-export`. Returns `{"frozen_entries": N}`.
+//! - `POST /api/reset-training` — Reset the live allocator back to fresh
+//!   Training mode (discards frozen routing table).
+//! - `GET /api/training-status` — Live-training diagnostics
+//!   (`{signatures, live_allocations, inference}`) for the GUI's
+//!   convergence indicator.
 //! - `GET /api/strategy` — Returns the current strategy override (Phase 5).
 //! - `POST /api/strategy` — Sets the strategy override (Phase 5).
 //! - `GET /api/mode` — Returns `{"mode": "training"}` or
 //!   `{"mode": "inference"}` depending on Decision Engine state.
-//! - `GET /api/routing-table` — Returns the frozen routing table as a JSON
-//!   array of `{hash, backend}` objects, or `[]` if not in Inference mode.
+//! - `GET /api/routing-table` — Returns the current routing table as a
+//!   JSON array of `{hash, backend}` objects. Inference mode returns
+//!   the frozen table; Training mode returns the live MAB snapshot
+//!   (TensorBoard-style, current best per signature).
 //! - `POST /api/telemetry` — Accepts a single `TelemetryRecord` or an array
 //!   of records (Phase 5++: live mode from LD_PRELOAD shim or external
 //!   producers). Forwards each record to the existing telemetry channel so
@@ -24,6 +34,13 @@
 //!   independent ring buffer (`TRACE_RING_CAPACITY` records) that mirrors
 //!   what `POST /api/telemetry` / `POST /api/upload-trace` push, so it does
 //!   not interfere with the live WS stream.
+//! - `POST /api/run-simulation` — Spawns a real Lohalloc workload with the
+//!   `liblohalloc_obs` shim preloaded. Body:
+//!   `{"kind": "lohalloc-example|http-server|long-running", "args": {...}}`.
+//!   Streams lifecycle events over `/ws/telemetry` as
+//!   `{"type":"simulation","event":{...}}` messages. Returns `202 Accepted`
+//!   with the spawned `pid`. Refuses requests from non-loopback IPs unless
+//!   `LOHALLOC_ALLOW_REMOTE_SPAWN=1` is set in the env.
 //! - `GET /health` — Liveness check.
 //!
 //! # Static File Serving
@@ -48,13 +65,16 @@ use axum::{
     Json, Router,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
-use lohalloc_core::{Strategy, TelemetryRecord, TraceOp};
+use lohalloc_alloc::Lohalloc;
+use lohalloc_core::{AllocOp, Strategy, TelemetryRecord, TraceOp};
+use serde::Deserialize;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
 use crate::replay::{replay_trace_json_with_strategy, ReplayError};
-use crate::telemetry::{telemetry_channel, TelemetryReceiver, TelemetrySender};
+use crate::simulation::{self, SimulationArgs, SimulationEvent, SimulationKind};
+use crate::telemetry::{telemetry_channel, RawWsMessage, TelemetryReceiver, TelemetrySender};
 
 /// Maximum number of telemetry records retained for `GET /api/export-trace`.
 /// At ~200 bytes per record this caps the ring at ~13 MB.
@@ -64,10 +84,18 @@ pub const TRACE_RING_CAPACITY: usize = 65_536;
 #[derive(Clone)]
 pub struct AppState {
     pub telemetry_tx: TelemetrySender,
-    // We keep the receiver alive so the channel doesn't close when no
-    // WebSocket client is connected. The WebSocket handler clones the
-    // `Arc<TelemetryReceiver>` to drain records.
+    // We keep the receiver alive so the crossbeam channel doesn't close
+    // when no WebSocket client is connected. WS clients now use the
+    // broadcast channel instead; this is kept for the trace ring buffer
+    // and tests.
+    #[allow(dead_code)]
     telemetry_rx: Arc<TelemetryReceiver>,
+    /// Broadcast sender for WS fan-out. Each WS client subscribes by calling
+    /// `subscribe()`, getting its own receiver so records aren't stolen by
+    /// other (possibly zombie) connections.
+    ws_broadcast: Arc<tokio::sync::broadcast::Sender<TelemetryRecord>>,
+    /// Broadcast sender for raw WS messages (simulation lifecycle events).
+    ws_raw_broadcast: Arc<tokio::sync::broadcast::Sender<RawWsMessage>>,
     /// Current strategy override (Phase 5). Stored behind a `RwLock` for
     /// thread-safe interior mutability.
     strategy: Arc<std::sync::RwLock<String>>,
@@ -88,6 +116,40 @@ pub struct AppState {
     /// snapshot is served on demand. Capacity: [`TRACE_RING_CAPACITY`]
     /// records.
     trace_ring: Arc<std::sync::Mutex<VecDeque<TelemetryRecord>>>,
+    /// The TCP port the server is bound to. Defaults to `0` (unknown) until
+    /// `set_server_port` is called by `main.rs`. Used by `/api/run-simulation`
+    /// to tell spawned subprocesses which port to POST telemetry to.
+    server_port: Arc<std::sync::RwLock<u16>>,
+    /// Active simulation subprocess handles, keyed by pid. Cleaned up on
+    /// `exited` / `failed`. Sized to bound memory; oldest are evicted if
+    /// the cap is reached.
+    simulations: Arc<std::sync::Mutex<std::collections::HashMap<u32, SimulationHandle>>>,
+    /// History of completed simulations (capped). Used by the GUI's
+    /// `SimulationPanel` to show past runs even after they've exited.
+    simulation_history: Arc<std::sync::Mutex<Vec<SimulationEvent>>>,
+    /// Live training allocator (TensorBoard-style). Receives every
+    /// incoming telemetry record from `POST /api/telemetry` so the MAB
+    /// learns in real time as the shim workload runs. When the user
+    /// triggers `/api/freeze`, this is what gets frozen — no replay
+    /// required.
+    live_alloc: Arc<Lohalloc>,
+    /// Tracks `(ptr, size)` pairs from live allocations so free
+    /// operations can be routed back through `dealloc_with_hash`.
+    /// Pointers are stored as `usize` so this field stays `Send` —
+    /// `(*mut u8, usize)` is not. Cleared on reset to training.
+    live_allocations: Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
+}
+
+/// Cap on the simulation history shown in the GUI.
+pub const SIMULATION_HISTORY_CAP: usize = 32;
+
+/// Lightweight bookkeeping for a running simulation. The actual `Child`
+/// handle lives behind a `tokio::sync::Mutex` so the async cleanup task
+/// can `try_wait()` on it.
+pub struct SimulationHandle {
+    pub kind: crate::simulation::SimulationKind,
+    pub started_at: std::time::Instant,
+    pub child: Arc<tokio::sync::Mutex<std::process::Child>>,
 }
 
 impl AppState {
@@ -97,10 +159,15 @@ impl AppState {
     }
 
     /// Create an `AppState` from an existing channel pair (for testing).
-    pub fn new_with_channel((tx, rx): (TelemetrySender, TelemetryReceiver)) -> Self {
+    pub fn new_with_channel((mut tx, rx): (TelemetrySender, TelemetryReceiver)) -> Self {
+        let (ws_tx, _) = tokio::sync::broadcast::channel(1024);
+        let (ws_raw_tx, _) = tokio::sync::broadcast::channel(256);
+        tx.attach_broadcast(ws_tx.clone(), ws_raw_tx.clone());
         Self {
             telemetry_tx: tx,
             telemetry_rx: Arc::new(rx),
+            ws_broadcast: Arc::new(ws_tx),
+            ws_raw_broadcast: Arc::new(ws_raw_tx),
             strategy: Arc::new(std::sync::RwLock::new("default".to_string())),
             last_model: Arc::new(std::sync::Mutex::new(Vec::new())),
             is_inference: Arc::new(std::sync::RwLock::new(false)),
@@ -108,7 +175,109 @@ impl AppState {
             trace_ring: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(
                 TRACE_RING_CAPACITY,
             ))),
+            server_port: Arc::new(std::sync::RwLock::new(0)),
+            simulations: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            simulation_history: Arc::new(std::sync::Mutex::new(Vec::new())),
+            live_alloc: Arc::new(Lohalloc::new()),
+            live_allocations: Arc::new(std::sync::Mutex::new(Vec::<(usize, usize)>::new())),
         }
+    }
+
+    /// Record the port the server is bound to. Called by `main.rs` after
+    /// `TcpListener::bind` so `/api/run-simulation` can pass the correct
+    /// `LOHALLOC_OBS_PORT` to its children.
+    pub fn set_server_port(&self, port: u16) {
+        if let Ok(mut g) = self.server_port.write() {
+            *g = port;
+        }
+    }
+
+    /// Get the bound port (or `0` if unknown).
+    pub fn get_server_port(&self) -> u16 {
+        self.server_port.read().map(|g| *g).unwrap_or(0)
+    }
+
+    /// Register a freshly-spawned simulation in the active set.
+    pub fn register_simulation(
+        &self,
+        pid: u32,
+        kind: crate::simulation::SimulationKind,
+        child: std::process::Child,
+    ) {
+        let handle = SimulationHandle {
+            kind,
+            started_at: std::time::Instant::now(),
+            child: Arc::new(tokio::sync::Mutex::new(child)),
+        };
+        if let Ok(mut g) = self.simulations.lock() {
+            g.insert(pid, handle);
+        }
+    }
+
+    /// Look up a registered simulation. Returns `None` if the pid is not
+    /// currently tracked (either never registered, or already cleaned up).
+    pub fn get_simulation(&self, pid: u32) -> Option<Arc<tokio::sync::Mutex<std::process::Child>>> {
+        self.simulations
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&pid).map(|h| h.child.clone()))
+    }
+
+    /// Get the kind of a registered simulation.
+    pub fn get_simulation_kind(&self, pid: u32) -> Option<crate::simulation::SimulationKind> {
+        self.simulations
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&pid).map(|h| h.kind))
+    }
+
+    /// Remove a simulation from the active set after it has exited or failed.
+    /// Returns the kind so the caller can record a final lifecycle event.
+    pub fn unregister_simulation(&self, pid: u32) -> Option<crate::simulation::SimulationKind> {
+        self.simulations
+            .lock()
+            .ok()
+            .and_then(|mut g| g.remove(&pid).map(|h| h.kind))
+    }
+
+    /// Append a finished lifecycle event to the bounded history.
+    pub fn push_simulation_history(&self, event: crate::simulation::SimulationEvent) {
+        if let Ok(mut g) = self.simulation_history.lock() {
+            if g.len() >= SIMULATION_HISTORY_CAP {
+                g.remove(0);
+            }
+            g.push(event);
+        }
+    }
+
+    /// Snapshot the simulation history for `GET /api/simulation-history`.
+    pub fn snapshot_simulation_history(&self) -> Vec<crate::simulation::SimulationEvent> {
+        self.simulation_history
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot the currently-running simulations for `GET /api/simulation-history`.
+    /// Each entry is the same `SimulationEvent` shape but with `status: "running"`.
+    pub fn snapshot_active_simulations(&self) -> Vec<crate::simulation::SimulationEvent> {
+        let now = std::time::Instant::now();
+        self.simulations
+            .lock()
+            .map(|g| {
+                g.iter()
+                    .map(|(pid, h)| crate::simulation::SimulationEvent {
+                        pid: *pid,
+                        kind: h.kind.as_str().to_string(),
+                        status: "running".to_string(),
+                        duration_ms: now.duration_since(h.started_at).as_millis() as u64,
+                        exit_code: None,
+                        stdout_tail: None,
+                        error: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Push a record into the export-trace ring buffer. When the buffer is
@@ -194,6 +363,116 @@ impl AppState {
             .map(|g| g.clone())
             .unwrap_or_default()
     }
+
+    // -----------------------------------------------------------------
+    // Live training allocator (TensorBoard-style)
+    //
+    // The server holds a single `Lohalloc` instance in Training mode and
+    // feeds every incoming telemetry record from `POST /api/telemetry`
+    // through its `alloc_with_hash`/`dealloc_with_hash` API. This means
+    // the MAB learns from the SAME workload the shim is running, in
+    // real time — no replay required. When the user triggers a freeze
+    // (via `/api/freeze`), the live allocator collapses its bandit
+    // weights into a frozen routing table and exports a `.lohalloc`.
+    // -----------------------------------------------------------------
+
+    /// Feed one telemetry record into the live training allocator.
+    /// Allocations are actually performed; frees find the matching
+    /// pointer in `live_allocations` and pass it to
+    /// `dealloc_with_hash`. Pointer-tracking is necessary because the
+    /// shim only sends `(op, size, stack_hash)` — no pointer — and
+    /// `GlobalAlloc::dealloc` requires a pointer.
+    fn feed_live_record(&self, record: &TelemetryRecord) {
+        let layout = match std::alloc::Layout::from_size_align(record.size.max(1), 16) {
+            Ok(l) => l,
+            Err(_) => return, // Invalid layout — silently skip.
+        };
+        match record.op {
+            AllocOp::Alloc => {
+                let ptr = unsafe {
+                    self.live_alloc
+                        .alloc_with_hash(layout, record.stack_hash)
+                };
+                if !ptr.is_null() {
+                    if let Ok(mut live) = self.live_allocations.lock() {
+                        live.push((ptr as usize, record.size));
+                    }
+                }
+            }
+            AllocOp::Free => {
+                let pair = if let Ok(mut live) = self.live_allocations.lock() {
+                    live.iter()
+                        .rposition(|(_, s)| *s == record.size)
+                        .map(|idx| live.swap_remove(idx))
+                } else {
+                    None
+                };
+                if let Some((ptr_usize, _size)) = pair {
+                    let ptr = ptr_usize as *mut u8;
+                    unsafe { self.live_alloc.dealloc_with_hash(ptr, layout) };
+                }
+            }
+        }
+    }
+
+    /// Number of live allocations the live allocator is currently
+    /// tracking. Useful for diagnostics / convergence display.
+    pub fn live_allocation_count(&self) -> usize {
+        self.live_allocations
+            .lock()
+            .map(|g| g.len())
+            .unwrap_or_default()
+    }
+
+    /// Number of distinct Signatures the live allocator's MAB has
+    /// observed so far. 0 if in Inference mode.
+    pub fn live_signature_count(&self) -> usize {
+        self.live_alloc.signature_count()
+    }
+
+    /// Snapshot the live MAB's current best-backend-per-signature.
+    /// Returns an empty Vec if the allocator is in Inference mode.
+    pub fn live_routing_snapshot(&self) -> Vec<(u64, String)> {
+        self.live_alloc
+            .routing_snapshot()
+            .into_iter()
+            .map(|(h, b)| (h, backend_to_string(b).to_string()))
+            .collect()
+    }
+
+    /// Freeze the live training allocator and store the resulting
+    /// `.lohalloc` model bytes for `/api/freeze-export` download.
+    /// Returns the routing table extracted from the frozen model.
+    pub fn freeze_live(&self) -> Vec<(u64, String)> {
+        self.live_alloc.freeze();
+        let bytes = self.live_alloc.export().unwrap_or_default();
+        let entries = decode_routing_entries(&bytes);
+        if let Ok(mut guard) = self.last_model.lock() {
+            *guard = bytes;
+        }
+        if let Ok(mut guard) = self.routing_table.write() {
+            *guard = entries.clone();
+        }
+        self.set_inference(true);
+        entries
+    }
+
+    /// Reset the live allocator back to fresh Training mode, discarding
+    /// the frozen routing table and any live pointers. Used by the GUI's
+    /// "back to training" button.
+    pub fn reset_live_to_training(&self) {
+        self.live_alloc.reset_to_training();
+        if let Ok(mut live) = self.live_allocations.lock() {
+            live.clear();
+        }
+        if let Ok(mut guard) = self.last_model.lock() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.routing_table.write() {
+            guard.clear();
+        }
+        self.set_inference(false);
+    }
 }
 
 impl Default for AppState {
@@ -213,6 +492,9 @@ pub fn build_app_with_options(state: AppState, serve_static: bool) -> Router {
         .route("/ws/telemetry", get(ws_telemetry_handler))
         .route("/api/upload-trace", post(upload_trace_handler))
         .route("/api/freeze-export", post(freeze_export_handler))
+        .route("/api/freeze", post(freeze_live_handler))
+        .route("/api/reset-training", post(reset_training_handler))
+        .route("/api/training-status", get(training_status_handler))
         .route(
             "/api/strategy",
             get(get_strategy_handler).post(set_strategy_handler),
@@ -220,6 +502,11 @@ pub fn build_app_with_options(state: AppState, serve_static: bool) -> Router {
         .route("/api/mode", get(get_mode_handler))
         .route("/api/routing-table", get(get_routing_table_handler))
         .route("/api/telemetry", post(post_telemetry_handler))
+        .route("/api/run-simulation", post(run_simulation_handler))
+        .route(
+            "/api/simulation-history",
+            get(get_simulation_history_handler),
+        )
         .route("/health", get(health_handler))
         .layer(CorsLayer::permissive());
 
@@ -257,48 +544,79 @@ async fn ws_telemetry_handler(ws: WebSocketUpgrade, State(state): State<AppState
 /// send each record as a JSON text message. The connection stays open until
 /// the client disconnects or the server is shut down.
 async fn handle_telemetry_socket(socket: WebSocket, state: AppState) {
-    let (mut sender, mut receiver) = socket.split();
-    let rx = state.telemetry_rx.clone();
+    let (sender, mut receiver) = socket.split();
 
-    // Spawn a task that drains the telemetry channel and sends JSON records.
-    // `crossbeam-channel::recv` is blocking, so we use `spawn_blocking` to
-    // avoid stalling the async runtime.
-    let mut send_task = tokio::spawn(async move {
+    // Each WS client gets its own broadcast receiver so records aren't
+    // stolen by other (possibly zombie) connections. This is the fix for
+    // the "records not reaching browser" bug where StrictMode remount
+    // created zombie send tasks that consumed records from a shared
+    // crossbeam Receiver.
+    let mut ws_rx = state.ws_broadcast.subscribe();
+    let mut raw_rx = state.ws_raw_broadcast.subscribe();
+
+    // Wrap the sink so the send futures can share it.
+    let sender = Arc::new(tokio::sync::Mutex::new(sender));
+    let sender2 = sender.clone();
+
+    // Future: receive telemetry records from the broadcast channel and
+    // forward as JSON WS text frames. Cancelled by `select!` when the
+    // client disconnects (recv_fut completes).
+    let send_fut = async move {
         loop {
-            let batch = tokio::task::spawn_blocking({
-                let rx = rx.clone();
-                move || rx.recv_batch()
-            })
-            .await;
-
-            match batch {
-                Ok(Some(records)) => {
-                    for record in records {
-                        let json = serde_json::to_string(&record).unwrap_or_default();
-                        if sender.send(Message::text(json)).await.is_err() {
-                            return;
-                        }
+            match ws_rx.recv().await {
+                Ok(record) => {
+                    let json = serde_json::to_string(&record).unwrap_or_default();
+                    let mut guard = sender.lock().await;
+                    if guard.send(Message::text(json)).await.is_err() {
+                        return;
                     }
                 }
-                Ok(None) => {
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Client is slow — skip missed records and continue.
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     return;
                 }
-                Err(_) => return,
             }
         }
-    });
+    };
 
-    // Spawn a task that reads incoming messages (to detect client disconnect).
-    let mut recv_task = tokio::spawn(async move {
+    // Future: receive raw (simulation event) messages from the broadcast
+    // channel and forward verbatim as WS text frames.
+    let raw_send_fut = async move {
+        loop {
+            match raw_rx.recv().await {
+                Ok(msg) => {
+                    let mut guard = sender2.lock().await;
+                    if guard.send(Message::text(msg.0)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return;
+                }
+            }
+        }
+    };
+
+    // Future: read incoming messages to detect client disconnect.
+    let recv_fut = async move {
         while receiver.next().await.is_some() {
             // Ignore incoming messages — this is a server-push stream.
         }
-    });
+    };
 
-    // If either task completes, abort the other.
+    // Select on inline futures. When any future completes, the others are
+    // dropped, cancelling them. Since these are inline futures (not spawned
+    // tasks), dropping them properly cancels the broadcast recv.
     tokio::select! {
-        _ = &mut send_task => recv_task.abort(),
-        _ = &mut recv_task => send_task.abort(),
+        _ = send_fut => {}
+        _ = raw_send_fut => {}
+        _ = recv_fut => {}
     }
 }
 
@@ -360,6 +678,60 @@ async fn freeze_export_handler(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+/// `POST /api/freeze` — Freeze the live training allocator.
+///
+/// Collapses the live MAB's bandit weights into a frozen `PerfectHashTable`
+/// and stores the resulting `.lohalloc` bytes for download via
+/// `/api/freeze-export`. This is the TensorBoard-style "commit" action
+/// that switches the system from live-training to inference.
+///
+/// Returns:
+/// - `200 OK` with `{"frozen_entries": <usize>, "signatures": <usize>}`
+///   on success.
+async fn freeze_live_handler(State(state): State<AppState>) -> Response {
+    if state.is_inference() {
+        // Idempotent — already frozen. Return current state instead of
+        // panicking.
+        let entries = state.get_routing_table();
+        return Json(serde_json::json!({
+            "frozen_entries": entries.len(),
+            "signatures": entries.len(),
+            "already_frozen": true,
+        }))
+        .into_response();
+    }
+    let entries = state.freeze_live();
+    Json(serde_json::json!({
+        "frozen_entries": entries.len(),
+        "signatures": entries.len(),
+        "already_frozen": false,
+    }))
+    .into_response()
+}
+
+/// `POST /api/reset-training` — Reset the live allocator back to fresh
+/// Training mode, discarding any frozen routing table and learned
+/// weights. Used by the GUI's "back to training" button.
+async fn reset_training_handler(State(state): State<AppState>) -> Response {
+    state.reset_live_to_training();
+    Json(serde_json::json!({ "mode": "training" })).into_response()
+}
+
+/// `GET /api/training-status` — Returns live-training diagnostics for the
+/// GUI's convergence indicator:
+///
+/// - `signatures` — distinct topology hashes the MAB has observed.
+/// - `live_allocations` — currently-tracked allocations awaiting free.
+/// - `inference` — whether the system is in frozen mode.
+async fn training_status_handler(State(state): State<AppState>) -> Response {
+    Json(serde_json::json!({
+        "signatures": state.live_signature_count(),
+        "live_allocations": state.live_allocation_count(),
+        "inference": state.is_inference(),
+    }))
+    .into_response()
+}
+
 /// `GET /api/strategy` — Returns the current strategy override as JSON
 /// `{"strategy": "default|latency_priority|throughput_priority"}`.
 async fn get_strategy_handler(State(state): State<AppState>) -> Response {
@@ -405,15 +777,18 @@ async fn get_mode_handler(State(state): State<AppState>) -> Response {
     Json(serde_json::json!({ "mode": mode })).into_response()
 }
 
-/// `GET /api/routing-table` — Returns the frozen routing table as a JSON
-/// array of `{"hash": <u64>, "backend": <string>}` objects. When the
-/// allocator is still in Training mode (or no model has been produced),
-/// returns an empty array.
+/// `GET /api/routing-table` — Returns the current routing table as a JSON
+/// array of `{"hash": <u64>, "backend": <string>}` objects.
+///
+/// - **Inference mode**: returns the cached frozen routing table.
+/// - **Training mode**: returns the live MAB snapshot (current
+///   best-backend-per-signature), so the GUI can render the table as
+///   it converges in real time (TensorBoard-style).
 async fn get_routing_table_handler(State(state): State<AppState>) -> Response {
     let entries = if state.is_inference() {
         state.get_routing_table()
     } else {
-        Vec::new()
+        state.live_routing_snapshot()
     };
     let payload: Vec<serde_json::Value> = entries
         .into_iter()
@@ -472,9 +847,239 @@ async fn post_telemetry_handler(
 
     let count = records.len();
     for record in records {
+        // TensorBoard-style: feed each record into the live training
+        // allocator in real time. The MAB learns from this stream, and
+        // `/api/freeze` collapses it directly without a replay.
+        state.feed_live_record(&record);
         state.telemetry_tx.send(record);
     }
     Json(serde_json::json!({ "accepted": count })).into_response()
+}
+
+/// Request body for `POST /api/run-simulation`.
+#[derive(Debug, Deserialize)]
+struct RunSimulationRequest {
+    /// One of `"lohalloc-example"`, `"http-server"`, `"long-running"`.
+    kind: String,
+    /// Optional per-kind args (port for http-server, duration_secs for long-running).
+    #[serde(default)]
+    args: Option<SimulationArgs>,
+}
+
+/// `POST /api/run-simulation` — Spawn a real Lohalloc workload with the
+/// `liblohalloc_obs` shim preloaded.
+///
+/// Body:
+/// ```json
+/// { "kind": "lohalloc-example", "args": {} }
+/// ```
+///
+/// Returns:
+/// - `202 Accepted` with `{"pid": <u32>}` on success.
+/// - `400 Bad Request` on malformed JSON or unknown kind.
+/// - `501 Not Implemented` on Windows (the shim is POSIX-only).
+/// - `503 Service Unavailable` if the binary or shim is missing, with a
+///   helpful message and build command.
+///
+/// Lifecycle events are streamed over `/ws/telemetry` as
+/// `{"type":"simulation","event":{...}}` messages.
+async fn run_simulation_handler(
+    State(state): State<AppState>,
+    Json(body): Json<RunSimulationRequest>,
+) -> Response {
+    if !(cfg!(target_os = "macos") || cfg!(target_os = "linux")) {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "simulation spawn is only supported on macOS and Linux",
+        )
+            .into_response();
+    }
+
+    let kind = match SimulationKind::parse(&body.kind) {
+        Some(k) => k,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown kind '{}', expected lohalloc-example|http-server|long-running",
+                    body.kind
+                ),
+            )
+                .into_response();
+        }
+    };
+
+    let shim = match simulation::find_shim_path() {
+        Some(p) => p,
+        None => {
+            let err = simulation::missing_shim_error();
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(err)).into_response();
+        }
+    };
+
+    if simulation::find_simulation_binary(kind).is_none() {
+        let err = simulation::missing_binary_error(kind);
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(err)).into_response();
+    }
+
+    let args = body.args.unwrap_or_default();
+    let server_port = state.get_server_port();
+    if server_port == 0 {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server port not yet known; cannot spawn simulations",
+        )
+            .into_response();
+    }
+
+    let child = match simulation::spawn_simulation(kind, &shim, server_port, &args) {
+        Ok(c) => c,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(e)).into_response();
+        }
+    };
+
+    let pid = child.id();
+    state.register_simulation(pid, kind, child);
+
+    // Emit the "started" event. WS clients receive it immediately.
+    let started = SimulationEvent {
+        pid,
+        kind: kind.as_str().to_string(),
+        status: "started".to_string(),
+        duration_ms: 0,
+        exit_code: None,
+        stdout_tail: None,
+        error: None,
+    };
+    let envelope = started.clone().into_ws_message();
+    if let Ok(s) = serde_json::to_string(&envelope) {
+        state.telemetry_tx.send_raw(s);
+    }
+    state.push_simulation_history(started);
+
+    // Spawn a background task that polls the child and emits "exited"/"failed"
+    // events when the process terminates.
+    spawn_simulation_watcher(state.clone(), pid, kind);
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "pid": pid, "kind": kind.as_str() })),
+    )
+        .into_response()
+}
+
+/// Background task: poll a spawned simulation's exit status and emit
+/// lifecycle events. Runs on the tokio runtime; uses `try_wait` so it does
+/// not block other tasks.
+fn spawn_simulation_watcher(state: AppState, pid: u32, kind: SimulationKind) {
+    tokio::spawn(async move {
+        // Tiny initial delay so the "started" event arrives first.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let started_at = std::time::Instant::now();
+
+        loop {
+            let Some(child_arc) = state.get_simulation(pid) else {
+                // Already cleaned up.
+                return;
+            };
+
+            // Poll once.
+            let exit_status = {
+                let mut guard = child_arc.lock().await;
+                guard.try_wait().ok().flatten()
+            };
+
+            if let Some(status) = exit_status {
+                let duration_ms = started_at.elapsed().as_millis() as u64;
+                let exit_code = status.code();
+                let stdout_tail = read_child_stdout_tail(&child_arc).await;
+                let status_str = if status.success() { "exited" } else { "failed" };
+                let ev = SimulationEvent {
+                    pid,
+                    kind: kind.as_str().to_string(),
+                    status: status_str.to_string(),
+                    duration_ms,
+                    exit_code,
+                    stdout_tail: stdout_tail.clone(),
+                    error: if status.success() {
+                        None
+                    } else {
+                        Some(format!(
+                            "process exited with code {}",
+                            exit_code.unwrap_or(-1)
+                        ))
+                    },
+                };
+                let envelope = ev.clone().into_ws_message();
+                if let Ok(s) = serde_json::to_string(&envelope) {
+                    state.telemetry_tx.send_raw(s);
+                }
+                state.push_simulation_history(ev);
+                state.unregister_simulation(pid);
+                return;
+            }
+
+            // Emit a "running" heartbeat every 500ms so the GUI can update
+            // elapsed time without polling the WS.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if state.get_simulation(pid).is_none() {
+                return;
+            }
+            let duration_ms = started_at.elapsed().as_millis() as u64;
+            let ev = SimulationEvent {
+                pid,
+                kind: kind.as_str().to_string(),
+                status: "running".to_string(),
+                duration_ms,
+                exit_code: None,
+                stdout_tail: None,
+                error: None,
+            };
+            let envelope = ev.into_ws_message();
+            if let Ok(s) = serde_json::to_string(&envelope) {
+                state.telemetry_tx.send_raw(s);
+            }
+        }
+    });
+}
+
+/// Read up to 4 KiB of the child's stdout tail. Best-effort: returns
+/// `None` on any error or if the child has no captured stdout. Uses
+/// blocking I/O because `std::process::ChildStdout` is not async-aware.
+async fn read_child_stdout_tail(
+    child_arc: &Arc<tokio::sync::Mutex<std::process::Child>>,
+) -> Option<String> {
+    let mut guard = child_arc.lock().await;
+    let stdout = guard.stdout.take()?;
+    // Move the blocking read off the async runtime.
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut stdout = stdout;
+        let mut buf = vec![0u8; 4096];
+        let n = match stdout.read(&mut buf) {
+            Ok(n) => n,
+            Err(_) => return None,
+        };
+        if n == 0 {
+            return None;
+        }
+        buf.truncate(n);
+        Some(String::from_utf8_lossy(&buf).into_owned())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// `GET /api/simulation-history` — Returns the last `SIMULATION_HISTORY_CAP`
+/// simulation lifecycle events plus the currently-active set. Used by the
+/// GUI's `SimulationPanel` to populate on initial page load.
+async fn get_simulation_history_handler(State(state): State<AppState>) -> Response {
+    let mut events = state.snapshot_active_simulations();
+    let mut history = state.snapshot_simulation_history();
+    events.append(&mut history);
+    Json(serde_json::json!({ "events": events })).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -564,6 +1169,20 @@ fn read_u32_le(bytes: &[u8], pos: &mut usize) -> u32 {
     let mut buf = [0u8; 4];
     buf.copy_from_slice(slice);
     u32::from_le_bytes(buf)
+}
+
+/// Convert a `lohalloc_core::Backend` enum to its lowercase wire name
+/// (matches the `rename_all = "snake_case"` setting used by the shim and
+/// GUI). Keeping this in one place avoids drift between server and
+/// client string formats.
+fn backend_to_string(backend: lohalloc_core::Backend) -> &'static str {
+    use lohalloc_core::Backend;
+    match backend {
+        Backend::Slab => "slab",
+        Backend::Buddy => "buddy",
+        Backend::System => "system",
+        Backend::Arena => "arena",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1030,7 +1649,7 @@ mod tests {
     #[tokio::test]
     async fn post_telemetry_single_record_returns_202() {
         let app = build_app(AppState::new());
-        // Note: Backend serializes as variant name "Slab" (no rename_all).
+        // Backend serializes as snake_case ("slab", "buddy", etc.).
         // stack_hash / result_ptr / timestamp are u64 — must be JSON numbers.
         let body = r#"{
             "timestamp": 12345,
@@ -1041,7 +1660,7 @@ mod tests {
             "result_ptr": "0x1000",
             "latency_ns": 100,
             "fragmentation_pct": 0.0,
-            "backend": "Slab"
+            "backend": "slab"
         }"#;
         let response = app
             .oneshot(
@@ -1066,8 +1685,8 @@ mod tests {
     async fn post_telemetry_batch_returns_202() {
         let app = build_app(AppState::new());
         let body = r#"[
-            {"timestamp":1,"op":"alloc","size":64,"stack_hash":100,"thread_id":0,"result_ptr":"0x1000","latency_ns":50,"fragmentation_pct":0.0,"backend":"Slab"},
-            {"timestamp":2,"op":"alloc","size":128,"stack_hash":101,"thread_id":0,"result_ptr":"0x2000","latency_ns":75,"fragmentation_pct":0.0,"backend":"Buddy"},
+            {"timestamp":1,"op":"alloc","size":64,"stack_hash":100,"thread_id":0,"result_ptr":"0x1000","latency_ns":50,"fragmentation_pct":0.0,"backend":"slab"},
+            {"timestamp":2,"op":"alloc","size":128,"stack_hash":101,"thread_id":0,"result_ptr":"0x2000","latency_ns":75,"fragmentation_pct":0.0,"backend":"buddy"},
             {"timestamp":3,"op":"free","size":64,"stack_hash":100,"thread_id":0,"result_ptr":"0x1000","latency_ns":20,"fragmentation_pct":0.0}
         ]"#;
         let response = app
@@ -1152,7 +1771,7 @@ mod tests {
             "result_ptr": "0xDEADBEEF",
             "latency_ns": 333,
             "fragmentation_pct": 0.5,
-            "backend": "Slab"
+            "backend": "slab"
         }"#;
         let response = client
             .post(format!("http://{addr}/api/telemetry"))
@@ -1176,7 +1795,7 @@ mod tests {
         // `serialize_ptr` adapter on TelemetryRecord.
         assert_eq!(v["result_ptr"], "0xdeadbeef");
         assert_eq!(v["op"], "alloc");
-        assert_eq!(v["backend"], "Slab");
+        assert_eq!(v["backend"], "slab");
     }
 
     #[tokio::test]
@@ -1197,8 +1816,8 @@ mod tests {
 
         let client = reqwest::Client::new();
         let body = r#"[
-            {"timestamp":1,"op":"alloc","size":16,"stack_hash":1,"thread_id":0,"result_ptr":"0x10","latency_ns":10,"fragmentation_pct":0.0,"backend":"Slab"},
-            {"timestamp":2,"op":"alloc","size":32,"stack_hash":2,"thread_id":0,"result_ptr":"0x20","latency_ns":20,"fragmentation_pct":0.0,"backend":"Slab"}
+            {"timestamp":1,"op":"alloc","size":16,"stack_hash":1,"thread_id":0,"result_ptr":"0x10","latency_ns":10,"fragmentation_pct":0.0,"backend":"slab"},
+            {"timestamp":2,"op":"alloc","size":32,"stack_hash":2,"thread_id":0,"result_ptr":"0x20","latency_ns":20,"fragmentation_pct":0.0,"backend":"slab"}
         ]"#;
         let response = client
             .post(format!("http://{addr}/api/telemetry"))
@@ -1223,5 +1842,308 @@ mod tests {
             received += 1;
         }
         assert_eq!(received, 2);
+    }
+
+    // -----------------------------------------------------------------
+    // Live training allocator tests (TensorBoard-style)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn training_status_starts_in_training_with_zero_sigs() {
+        let app = build_app(AppState::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/training-status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["signatures"], 0);
+        assert_eq!(v["live_allocations"], 0);
+        assert_eq!(v["inference"], false);
+    }
+
+    #[tokio::test]
+    async fn post_telemetry_updates_live_signature_count() {
+        let app = build_app(AppState::new());
+        // Send two allocations with different stack_hashes.
+        let body = r#"[
+            {"timestamp":1,"op":"alloc","size":64,"stack_hash":100,"thread_id":0,"result_ptr":"0x1000","latency_ns":1,"fragmentation_pct":0.0,"backend":"slab"},
+            {"timestamp":2,"op":"alloc","size":128,"stack_hash":200,"thread_id":0,"result_ptr":"0x2000","latency_ns":1,"fragmentation_pct":0.0,"backend":"slab"}
+        ]"#;
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/telemetry")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Status should reflect 2 distinct signatures.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/training-status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["signatures"], 2);
+        assert_eq!(v["live_allocations"], 2);
+        assert_eq!(v["inference"], false);
+    }
+
+    #[tokio::test]
+    async fn routing_table_returns_live_snapshot_in_training_mode() {
+        let app = build_app(AppState::new());
+        let body = r#"[
+            {"timestamp":1,"op":"alloc","size":64,"stack_hash":100,"thread_id":0,"result_ptr":"0x1000","latency_ns":1,"fragmentation_pct":0.0,"backend":"slab"},
+            {"timestamp":2,"op":"alloc","size":128,"stack_hash":200,"thread_id":0,"result_ptr":"0x2000","latency_ns":1,"fragmentation_pct":0.0,"backend":"slab"}
+        ]"#;
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/telemetry")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // /api/routing-table in training mode returns the live snapshot
+        // (not the empty Vec that the inference path returns).
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/routing-table")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        let mut hashes: Vec<u64> = arr
+            .iter()
+            .map(|e| e["hash"].as_u64().unwrap())
+            .collect();
+        hashes.sort();
+        assert_eq!(hashes, vec![100, 200]);
+        // Backend should be a valid string.
+        for entry in arr {
+            assert!(entry["backend"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn freeze_live_switches_to_inference_and_persists_model() {
+        let app = build_app(AppState::new());
+        let body = r#"[
+            {"timestamp":1,"op":"alloc","size":64,"stack_hash":100,"thread_id":0,"result_ptr":"0x1000","latency_ns":1,"fragmentation_pct":0.0,"backend":"slab"},
+            {"timestamp":2,"op":"alloc","size":128,"stack_hash":200,"thread_id":0,"result_ptr":"0x2000","latency_ns":1,"fragmentation_pct":0.0,"backend":"slab"}
+        ]"#;
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/telemetry")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Freeze the live allocator.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/freeze")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["already_frozen"], false);
+        assert!(v["frozen_entries"].as_u64().unwrap() >= 2);
+
+        // Mode should now be inference.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/mode")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["mode"], "inference");
+
+        // /api/freeze-export should now return non-empty .lohalloc bytes.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/freeze-export")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(!bytes.is_empty(), "model bytes should be present after freeze");
+    }
+
+    #[tokio::test]
+    async fn freeze_live_is_idempotent_when_already_frozen() {
+        let app = build_app(AppState::new());
+        let body = r#"[{"timestamp":1,"op":"alloc","size":64,"stack_hash":100,"thread_id":0,"result_ptr":"0x1000","latency_ns":1,"fragmentation_pct":0.0,"backend":"slab"}]"#;
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/telemetry")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Freeze twice — second call should NOT panic.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/freeze")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/freeze")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["already_frozen"], true);
+    }
+
+    #[tokio::test]
+    async fn reset_training_returns_to_training_mode_and_clears_model() {
+        let app = build_app(AppState::new());
+        let body = r#"[{"timestamp":1,"op":"alloc","size":64,"stack_hash":100,"thread_id":0,"result_ptr":"0x1000","latency_ns":1,"fragmentation_pct":0.0,"backend":"slab"}]"#;
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/telemetry")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Freeze first.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/freeze")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Reset.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/reset-training")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Mode should now be training again.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/mode")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["mode"], "training");
     }
 }

@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type ComponentType } from 'react';
 import { useTelemetry } from './hooks/useTelemetry';
 import { useLiveStream } from './hooks/useLiveStream';
+import { useSimulationEvents } from './hooks/useSimulationEvents';
+import { useConvergence } from './hooks/useConvergence';
+import { runSimulation } from './hooks/useApi';
 import { PerfTraceView } from './components/PerfTraceView';
 import { StrategyToggle } from './components/StrategyToggle';
 import { HeapMap } from './components/HeapMap';
@@ -8,6 +11,7 @@ import ModeToggle from './components/ModeToggle';
 import CollapsedTopology from './components/CollapsedTopology';
 import TelemetrySidebar from './components/TelemetrySidebar';
 import TraceUploadModal from './components/TraceUploadModal';
+import { SimulationPanel, SimulateDropdown, Toast } from './components/SimulationPanel';
 import type { Mode } from './hooks/useApi';
 import type { TelemetryRecord } from './types/telemetry';
 
@@ -17,11 +21,10 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)}MB`;
 }
 
-const FloatingWebLazy = () => {
+const FloatingWebLazy = ({ records }: { records: TelemetryRecord[] }) => {
   const [Cmp, setCmp] = useState<ComponentType<{ records: TelemetryRecord[] }> | null>(
     null,
   );
-  const { records } = useTelemetry();
   useEffect(() => {
     let cancelled = false;
     import('./components/FloatingWeb')
@@ -46,13 +49,44 @@ const FloatingWebLazy = () => {
 };
 
 function App() {
-  const { records, isConnected } = useTelemetry();
+  const { records, isConnected, subscribeSimEvents } = useTelemetry();
   const [mode, setMode] = useState<Mode>('training');
   const [traceModalOpen, setTraceModalOpen] = useState(false);
+  const [simPanelOpen, setSimPanelOpen] = useState(false);
+  const [durationSecs, setDurationSecs] = useState(30);
+  const [toast, setToast] = useState<{
+    message: string;
+    level?: 'info' | 'error' | 'success';
+    key: number;
+  } | null>(null);
   const isLive = useLiveStream(records.length);
+  const convergence = useConvergence(records);
+
+  // Simulation events from the WS stream
+  const { active: activeSims, events: simEvents } = useSimulationEvents({
+    subscribeSimEvents,
+  });
 
   const allocCount = records.filter((r) => r.op === 'alloc').length;
   const freeCount = records.filter((r) => r.op === 'free').length;
+
+  const handleSpawn = async (kind: string) => {
+    try {
+      const result = await runSimulation(kind, { duration_secs: durationSecs });
+      setToast({
+        message: `Spawned ${result.kind} (pid=${result.pid})`,
+        level: 'success',
+        key: Date.now(),
+      });
+      setSimPanelOpen(true);
+    } catch (err) {
+      setToast({
+        message: err instanceof Error ? err.message : 'spawn failed',
+        level: 'error',
+        key: Date.now(),
+      });
+    }
+  };
 
   // Track timestamps of records arriving for OPS/SEC computation.
   const opTimestampsRef = useRef<number[]>([]);
@@ -106,7 +140,10 @@ function App() {
             <span className="text-ink">ALLOC</span>
          </h1>
           <div className="w-64">
-            <ModeToggle onModeChange={setMode} />
+             <ModeToggle
+               onModeChange={setMode}
+               freezeRecommended={convergence.isConverged}
+             />
          </div>
        </div>
         <div className="flex items-center gap-3 text-[11px] tracking-widest">
@@ -118,6 +155,7 @@ function App() {
           >
             UPLOAD TRACE
          </button>
+         <SimulateDropdown onSpawn={handleSpawn} durationSecs={durationSecs} onDurationChange={setDurationSecs} />
           <div
             className="flex items-center gap-3 text-[11px] tracking-widest"
             data-testid="metrics-strip"
@@ -184,15 +222,47 @@ function App() {
                 ? 'COLLAPSED TOPOLOGY // INFERENCE'
                 : 'FLOATING WEB // TRAINING'}
            </span>
-            <span className="text-ink">
-              MODE: <span className="text-heat">{mode.toUpperCase()}</span>
-           </span>
+           <div className="flex items-center gap-3">
+             {mode === 'training' && convergence.uniqueHashes > 0 && (
+               <div className="flex items-center gap-2" data-testid="convergence-meters">
+                 <div className="flex items-center gap-1">
+                   <span className="text-ink-faint">TOPO</span>
+                   <div className="w-16 h-1 bg-ink-faint/30">
+                     <div
+                       className="h-full bg-heat transition-all"
+                       style={{ width: `${Math.round(convergence.topologyProgress * 100)}%` }}
+                     />
+                   </div>
+                 </div>
+                 <div className="flex items-center gap-1">
+                   <span className="text-ink-faint">STAB</span>
+                   <div className="w-16 h-1 bg-ink-faint/30">
+                     <div
+                       className="h-full bg-heat transition-all"
+                       style={{ width: `${Math.round(convergence.stabilityProgress * 100)}%` }}
+                     />
+                   </div>
+                 </div>
+                 {convergence.isConverged && (
+                   <span
+                     className="text-heat animate-pulse font-bold"
+                     data-testid="suggest-freeze"
+                   >
+                     ★ SUGGEST FREEZE
+                   </span>
+                 )}
+               </div>
+             )}
+             <span className="text-ink">
+               MODE: <span className="text-heat">{mode.toUpperCase()}</span>
+             </span>
+           </div>
          </div>
           <div className="flex-1 relative min-h-[400px]">
             {mode === 'inference' ? (
               <CollapsedTopology refreshKey={records.length} />
             ) : (
-              <FloatingWebLazy />
+              <FloatingWebLazy records={records} />
             )}
          </div>
        </section>
@@ -233,6 +303,23 @@ function App() {
       {traceModalOpen && (
         <TraceUploadModal onClose={() => setTraceModalOpen(false)} />
       )}
+
+     {simPanelOpen && (
+       <SimulationPanel
+         events={simEvents}
+         active={activeSims}
+         onClose={() => setSimPanelOpen(false)}
+       />
+     )}
+
+     {toast && (
+       <Toast
+         key={toast.key}
+         message={toast.message}
+         level={toast.level}
+         onDismiss={() => setToast(null)}
+       />
+     )}
    </div>
   );
 }

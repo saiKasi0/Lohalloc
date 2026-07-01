@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import type { TelemetryRecord } from '../types/telemetry';
+import type { SimulationEvent } from '../types/ws';
 import { WEBSOCKET_URL } from '../utils/constants';
 
 // Cap at 5000 records (~1MB) so percentile charts, FloatingWeb, and HeapMap
@@ -12,6 +13,7 @@ export function useTelemetry(): {
   isConnected: boolean;
   paused: boolean;
   setPaused: (p: boolean) => void;
+  subscribeSimEvents: (cb: (ev: SimulationEvent) => void) => () => void;
 } {
   const [records, setRecords] = useState<TelemetryRecord[]>([]);
   const [isConnected, setIsConnected] = useState(false);
@@ -20,6 +22,7 @@ export function useTelemetry(): {
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const bufferRef = useRef<TelemetryRecord[]>([]);
   const pausedRef = useRef(paused);
+  const simListenersRef = useRef<Set<(ev: SimulationEvent) => void>>(new Set());
 
   // Keep pausedRef in sync so the WS onmessage closure reads the latest value.
   useEffect(() => {
@@ -57,7 +60,13 @@ export function useTelemetry(): {
       ws.onmessage = (event: MessageEvent) => {
         if (cancelled) return;
         try {
-          const record: TelemetryRecord = JSON.parse(event.data as string);
+          const parsed = JSON.parse(event.data as string);
+          if (parsed && parsed.type === 'simulation' && parsed.event) {
+            const ev = parsed.event as SimulationEvent;
+            simListenersRef.current.forEach((cb) => cb(ev));
+            return;
+          }
+          const record: TelemetryRecord = parsed;
           if (pausedRef.current) {
             bufferRef.current.push(record);
             // Bound buffer to prevent unbounded growth during long pause.
@@ -100,6 +109,7 @@ export function useTelemetry(): {
         reconnectTimerRef.current = null;
       }
       if (wsRef.current) {
+        // Null handlers first so the close event doesn't trigger reconnect.
         wsRef.current.onopen = null;
         wsRef.current.onmessage = null;
         wsRef.current.onerror = null;
@@ -110,5 +120,10 @@ export function useTelemetry(): {
     };
   }, []);
 
-  return { records, isConnected, paused, setPaused };
+  const subscribeSimEvents = useCallback((cb: (ev: SimulationEvent) => void): (() => void) => {
+    simListenersRef.current.add(cb);
+    return () => { simListenersRef.current.delete(cb); };
+  }, []);
+
+  return { records, isConnected, paused, setPaused, subscribeSimEvents };
 }

@@ -62,6 +62,7 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
     raf: number;
     resizeObs: ResizeObserver;
     nodes: Map<number, THREE.Mesh>;
+    prevNodeCount: number;
   } | null>(null);
 
   // One-time Three.js setup + teardown. Empty deps so React 18 strict-mode's
@@ -115,6 +116,7 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
       raf,
       resizeObs,
       nodes: new Map(),
+      prevNodeCount: 0,
     };
 
     return () => {
@@ -130,11 +132,11 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
     };
   }, []);
 
-  // Rebuild nodes + edges whenever the records array changes.
+    // Rebuild nodes + edges whenever the records array changes.
   useEffect(() => {
     const state = stateRef.current;
     if (!state) return;
-    const { group, nodes } = state;
+    const { group, nodes, controls, camera } = state;
 
     // Tear down previous frame's geometry/materials.
     disposeGroup(group);
@@ -228,6 +230,37 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
         mb.position,
       ]);
       group.add(new THREE.Line(geom, edgeMat));
+    }
+
+    // Auto-fit camera when node count changes. Set minDistance/maxDistance
+    // based on the bounding sphere so the graph always fills the viewport.
+    const nodeCount = uniqueHashes.length;
+    if (nodeCount !== state.prevNodeCount) {
+      state.prevNodeCount = nodeCount;
+
+      // Compute bounding box of all node positions.
+      const box = new THREE.Box3();
+      for (const mesh of nodes.values()) {
+        box.expandByPoint(mesh.position);
+      }
+      const center = box.getCenter(new THREE.Vector3());
+      const size = box.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z);
+
+      // Distance to frame the bounding sphere at ~80% of the viewport.
+      // d = radius / sin(fov/2), then scale by 1/0.8 to fill 80%.
+      const fov = camera.fov * (Math.PI / 180);
+      const radius = maxDim / 2;
+      const fitDistance = (radius / Math.sin(fov / 2)) / 0.8;
+
+      controls.minDistance = fitDistance;
+      controls.maxDistance = fitDistance * 4;
+
+      // Position camera along the current view direction from center.
+      const dir = camera.position.clone().sub(controls.target).normalize();
+      camera.position.copy(center.clone().add(dir.multiplyScalar(fitDistance)));
+      controls.target.copy(center);
+      controls.update();
     }
   }, [records]);
 

@@ -15,5 +15,10 @@ export default defineConfig({
     environment: 'jsdom',
     setupFiles: './src/test/setup.ts',
     css: true,
+    exclude: [
+      '**/node_modules/**',
+      '**/dist/**',
+      'tests/**', // Playwright e2e tests live here — run via `npx playwright test`, not vitest.
+    ],
   },
 });

@@ -69,7 +69,7 @@ The Vite dev server listens on `5173` and proxies `/api` and `/ws` to the Axum s
 
 | Component             | Responsibility                                                           |
 |-----------------------|--------------------------------------------------------------------------|
-| `App.tsx`             | Root layout: `ModeToggle`, conditional `FloatingWeb`/`CollapsedTopology`, telemetry sidebar |
+| `App.tsx`             | Root layout: `ModeToggle`, conditional `FloatingWeb`/`CollapsedTopology`, telemetry sidebar, simulation panel |
 | `ModeToggle.tsx`      | TRAINING ↔ INFERENCE switch, calls `POST /api/freeze` to collapse the MAB |
 | `FloatingWeb.tsx`     | Three.js 3D force-directed graph of allocation sites (training mode)     |
 | `CollapsedTopology.tsx`| 2D routing matrix — read-only view of the frozen Perfect Hash Table     |
@@ -77,8 +77,12 @@ The Vite dev server listens on `5173` and proxies `/api` and `/ws` to the Axum s
 | `PolicyMatrix.tsx`    | Hash → backend heatmap, colored by backend type and recency              |
 | `PerfTraceView.tsx`   | Recharts latency and fragmentation time-series                          |
 | `StrategyToggle.tsx`  | Backend strategy picker; emits `Freeze & Export` action                 |
-| `TraceUpload.tsx`     | Drag-and-drop trace file (`.json` / `.csv`) uploader                     |
+| `TraceUpload.tsx`     | Drag-and-drop trace file (`.json` / `.csv`) uploader (inside modal)      |
+| `TraceUploadModal.tsx`| Modal wrapper for TraceUpload + how-to docs + export live stream        |
 | `TelemetrySidebar.tsx`| Right-anchored scrolling terminal log of live allocation events          |
+| `ExampleRunButtons.tsx`| Three synthetic workload presets (VEC CHURN / BURSTY / MIXED)          |
+| `SimulationPanel.tsx`| Floating panel showing running simulations + history                   |
+| `SimulateDropdown.tsx`| Top-bar dropdown to spawn real Lohalloc workloads via shim             |
 
 ## API ENDPOINTS
 
@@ -94,6 +98,8 @@ The GUI consumes the following endpoints on the Axum server. All paths are relat
 | POST   | `/api/upload-trace`   | Upload a `.json` or `.csv` trace file         |
 | POST   | `/api/freeze-export`  | Freeze the model and export a `.lohalloc`     |
 | POST   | `/api/telemetry`      | Live-mode ingest (single record or array)     |
+| POST   | `/api/run-simulation` | Spawn a real Lohalloc workload under the shim   |
+| GET    | `/api/simulation-history` | Recent simulation lifecycle events           |
 | WS     | `/ws/telemetry`       | Live allocation telemetry stream              |
 
 ## TELEMETRY FORMAT

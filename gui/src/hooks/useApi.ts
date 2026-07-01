@@ -1,10 +1,14 @@
 import type { Strategy, TelemetryRecord, TraceOp } from '../types/telemetry';
 import {
   FREEZE_EXPORT_URL,
+  FREEZE_LIVE_URL,
   MODE_URL,
+  RESET_TRAINING_URL,
   ROUTING_TABLE_URL,
+  RUN_SIMULATION_URL,
   STRATEGY_URL,
   TELEMETRY_URL,
+  TRAINING_STATUS_URL,
   UPLOAD_TRACE_URL,
 } from '../utils/constants';
 
@@ -13,6 +17,18 @@ export type Mode = 'training' | 'inference';
 export interface RoutingTableEntry {
   hash: string; // u64 as string for JS precision
   backend: string;
+}
+
+export interface TrainingStatus {
+  signatures: number;
+  live_allocations: number;
+  inference: boolean;
+}
+
+export interface FreezeLiveResult {
+  frozen_entries: number;
+  signatures: number;
+  already_frozen: boolean;
 }
 
 /**
@@ -96,6 +112,47 @@ export async function freezeExport(): Promise<ArrayBuffer> {
 }
 
 /**
+ * Freeze the live training allocator (TensorBoard-style "commit").
+ * Collapses the live MAB's bandit weights into a frozen routing
+ * table and stores the resulting `.lohalloc` bytes for download.
+ *
+ * Idempotent — calling when already in Inference mode returns
+ * `{ already_frozen: true }` with the current entry count.
+ */
+export async function freezeLive(): Promise<FreezeLiveResult> {
+  const res = await fetch(FREEZE_LIVE_URL, { method: 'POST' });
+  if (!res.ok) {
+    throw new Error(`freezeLive failed: ${res.status} ${res.statusText}`);
+  }
+  return (await res.json()) as FreezeLiveResult;
+}
+
+/**
+ * Reset the live training allocator back to fresh Training mode,
+ * discarding the frozen routing table and any live pointers.
+ */
+export async function resetTraining(): Promise<Mode> {
+  const res = await fetch(RESET_TRAINING_URL, { method: 'POST' });
+  if (!res.ok) {
+    throw new Error(`resetTraining failed: ${res.status} ${res.statusText}`);
+  }
+  const data = await res.json();
+  return (data.mode as Mode) ?? 'training';
+}
+
+/**
+ * Fetch live-training diagnostics (signature count, live
+ * allocations, current mode) for the GUI's convergence indicator.
+ */
+export async function getTrainingStatus(): Promise<TrainingStatus> {
+  const res = await fetch(TRAINING_STATUS_URL);
+  if (!res.ok) {
+    throw new Error(`getTrainingStatus failed: ${res.status} ${res.statusText}`);
+  }
+  return (await res.json()) as TrainingStatus;
+}
+
+/**
  * Get the current allocator strategy from the backend.
  */
 export async function getStrategy(): Promise<Strategy> {
@@ -164,4 +221,38 @@ export async function postTelemetryRecords(
   } catch {
     return 0;
   }
+}
+
+/**
+ * Spawn a real Lohalloc simulation via the server's subprocess runner.
+ * Returns `{ pid, kind }` on success or throws with the server's error
+ * message (e.g. "SHIM_NOT_FOUND: cd shim && make").
+ */
+export interface SimulationSpawnResult {
+  pid: number;
+  kind: string;
+}
+
+export async function runSimulation(
+  kind: string,
+  args: Record<string, unknown> = {},
+): Promise<SimulationSpawnResult> {
+  const res = await fetch(RUN_SIMULATION_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind, args }),
+  });
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const body = await res.json();
+      detail = body.message ?? body.code ?? JSON.stringify(body);
+    } catch {
+      detail = await res.text().catch(() => '');
+    }
+    throw new Error(
+      `simulation spawn failed (${res.status}): ${detail || res.statusText}`,
+    );
+  }
+  return (await res.json()) as SimulationSpawnResult;
 }

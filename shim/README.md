@@ -49,19 +49,38 @@ make test       # runs build/test_ring (unit tests for the buffer + JSON encoder
 
 Both targets produce **zero compiler warnings** with `-Wall -Wextra`.
 
-## Use with the Lohalloc demo binary
+## Use with the Lohalloc example binary
+
+The `lohalloc-example` binary now ships with built-in shim sink support.
+Build it with `--features install-shim-sink` and preload the shim:
 
 ```bash
 # macOS
-DYLD_INSERT_LIBRARIES=$PWD/build/liblohalloc_obs.dylib cargo run -p lohalloc-example --features lohalloc-alloc/telemetry-observer
+DYLD_INSERT_LIBRARIES=$PWD/build/liblohalloc_obs.dylib \
+  cargo run -p lohalloc-example --release --features install-shim-sink -- --duration-secs 60
 
 # Linux
-LD_PRELOAD=$PWD/build/liblohalloc_obs.so cargo run -p lohalloc-example --features lohalloc-alloc/telemetry-observer
+LD_PRELOAD=$PWD/build/liblohalloc_obs.so \
+  cargo run -p lohalloc-example --release --features install-shim-sink -- --duration-secs 60
 ```
 
-(Substitute the actual feature flag your allocator uses for the C-ABI
-sink — the demo binary calls `dlsym` on `lohalloc_telemetry_emit` and
-installs it as the observer sink.)
+The `install-shim-sink` feature makes the binary `dlsym` the shim's
+`lohalloc_telemetry_emit` symbol at startup and install it as the
+allocator's observer sink. The `telemetry-observer` feature on
+`lohalloc-alloc` (pulled in automatically) enables the emit calls on the
+hot path.
+
+For the dedicated training-demo binary that always installs the sink:
+
+```bash
+# macOS
+DYLD_INSERT_LIBRARIES=$PWD/build/liblohalloc_obs.dylib \
+  cargo run -p lohalloc-demo --features install-shim-sink --release
+
+# Linux
+LD_PRELOAD=$PWD/build/liblohalloc_obs.so \
+  cargo run -p lohalloc-demo --features install-shim-sink --release
+```
 
 ## Configuration
 

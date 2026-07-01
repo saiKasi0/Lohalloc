@@ -170,6 +170,36 @@ impl AllocatorState {
         }
     }
 
+    /// Snapshot the current "best backend per Signature" without
+    /// transitioning to Inference mode. Used during live training to show
+    /// the routing-table-as-it-is-being-built to the GUI — a TensorBoard-style
+    /// view of the MAB's progress before the user commits to freezing.
+    ///
+    /// Returns an empty Vec if in Inference mode (the routing table there is
+    /// already exposed via `export()`).
+    pub fn routing_snapshot(&self) -> Vec<(u64, Backend)> {
+        match self {
+            Self::Training { bandit } => bandit.freeze(),
+            Self::Inference { .. } => Vec::new(),
+        }
+    }
+
+    /// Number of distinct Signatures observed so far (Training mode only).
+    /// Returns 0 in Inference mode.
+    pub fn signature_count(&self) -> usize {
+        match self {
+            Self::Training { bandit } => bandit.len(),
+            Self::Inference { .. } => 0,
+        }
+    }
+
+    /// Reset back to a fresh Training state, discarding any frozen routing
+    /// table or learned bandit weights. Used by the GUI's "back to
+    /// training" button after the user has explored inference.
+    pub fn reset_to_training(&mut self) {
+        *self = Self::new_training();
+    }
+
     /// Export the routing table to `.lohalloc` binary bytes.
     ///
     /// Only valid in Inference mode (after `freeze()`). Returns `None` if
@@ -404,5 +434,68 @@ mod tests {
     #[test]
     fn load_empty_returns_none() {
         assert!(AllocatorState::load(&[]).is_none());
+    }
+
+    #[test]
+    fn routing_snapshot_in_training_returns_observed_signatures() {
+        let mut state = AllocatorState::new_training();
+        // No observations yet → empty snapshot.
+        assert!(state.routing_snapshot().is_empty());
+        assert_eq!(state.signature_count(), 0);
+
+        // Train hash 100 a few times.
+        for _ in 0..5 {
+            let b = state.route(100, 64);
+            state.record(100, b, 64);
+        }
+        // Train hash 200 a few times.
+        for _ in 0..5 {
+            let b = state.route(200, 128);
+            state.record(200, b, 128);
+        }
+        assert_eq!(state.signature_count(), 2);
+
+        let snap = state.routing_snapshot();
+        assert_eq!(snap.len(), 2);
+        let hashes: Vec<u64> = snap.iter().map(|(h, _)| *h).collect();
+        assert!(hashes.contains(&100));
+        assert!(hashes.contains(&200));
+    }
+
+    #[test]
+    fn routing_snapshot_in_inference_returns_empty() {
+        let mut state = AllocatorState::new_training();
+        for _ in 0..10 {
+            let b = state.route(42, 64);
+            state.record(42, b, 64);
+        }
+        state.freeze();
+        assert!(state.routing_snapshot().is_empty());
+        assert_eq!(state.signature_count(), 0);
+    }
+
+    #[test]
+    fn reset_to_training_clears_state() {
+        let mut state = AllocatorState::new_training();
+        for _ in 0..10 {
+            let b = state.route(42, 64);
+            state.record(42, b, 64);
+        }
+        assert!(!state.is_inference());
+        assert_eq!(state.signature_count(), 1);
+
+        state.freeze();
+        assert!(state.is_inference());
+        assert_eq!(state.signature_count(), 0);
+
+        state.reset_to_training();
+        assert!(!state.is_inference());
+        assert_eq!(state.signature_count(), 0);
+        // State should be fresh — fresh MAB returns a valid backend.
+        let b = state.route(7, 64);
+        assert!(matches!(
+            b,
+            Backend::Slab | Backend::Buddy | Backend::System | Backend::Arena
+        ));
     }
 }

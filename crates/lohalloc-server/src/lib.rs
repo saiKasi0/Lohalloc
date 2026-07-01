@@ -15,6 +15,7 @@
 
 pub mod replay;
 pub mod server;
+pub mod simulation;
 pub mod telemetry;
 
 pub use replay::{
@@ -23,7 +24,13 @@ pub use replay::{
     replay_trace_json_with_strategy, ReplayError, ReplayResult,
 };
 pub use server::{build_app, build_app_with_options, AppState};
+pub use simulation::{
+    allow_remote_spawn, build_command as build_simulation_command, find_shim_path,
+    find_simulation_binary, is_loopback as is_loopback_addr, missing_binary_error,
+    missing_shim_error, spawn_simulation, SimulationArgs, SimulationError, SimulationEvent,
+    SimulationKind,
+};
 pub use telemetry::{
-    telemetry_channel, telemetry_channel_with_capacity, TelemetryReceiver, TelemetrySender,
-    DEFAULT_CAPACITY,
+    telemetry_channel, telemetry_channel_with_capacity, RawWsMessage, TelemetryReceiver,
+    TelemetrySender, DEFAULT_CAPACITY,
 };

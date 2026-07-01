@@ -32,6 +32,7 @@ impl Signature {
 /// and surfaced in the GUI's Policy Matrix.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[repr(u8)]
 pub enum Backend {
     Slab = 0,

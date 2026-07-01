@@ -12,7 +12,7 @@ vi.mock('three', () => {
       this.y = y;
       this.z = z;
     }
-    set() { return this; }
+    set(x: number, y: number, z: number) { this.x = x; this.y = y; this.z = z; return this; }
     copy(v: any) {
       if (v) {
         this.x = v.x ?? 0;
@@ -21,6 +21,17 @@ vi.mock('three', () => {
       }
       return this;
     }
+    clone() { return new FakeVector3(this.x, this.y, this.z); }
+    add(v: any) { this.x += v.x ?? 0; this.y += v.y ?? 0; this.z += v.z ?? 0; return this; }
+    sub(v: any) { this.x -= v.x ?? 0; this.y -= v.y ?? 0; this.z -= v.z ?? 0; return this; }
+    multiplyScalar(s: number) { this.x *= s; this.y *= s; this.z *= s; return this; }
+    normalize() { return this; }
+  }
+  class FakeBox3 {
+    setFromObject() { return this; }
+    expandByPoint() { return this; }
+    getCenter() { return new FakeVector3(); }
+    getSize() { return new FakeVector3(1, 1, 1); }
   }
   class FakeObject3D {
     children: any[] = [];
@@ -64,6 +75,7 @@ vi.mock('three', () => {
     Float32BufferAttribute: FakeFloat32BufferAttribute,
     AmbientLight: vi.fn(() => new FakeObject3D()),
     DirectionalLight: vi.fn(() => new FakeObject3D()),
+    Box3: vi.fn(() => new FakeBox3()),
     BoxGeometry: vi.fn(() => ({ dispose: vi.fn() })),
     MeshStandardMaterial: vi.fn(() => new FakeObject3D()),
     Mesh: vi.fn(() => new FakeObject3D()),
@@ -89,6 +101,9 @@ vi.mock('three/examples/jsm/controls/OrbitControls.js', () => ({
   OrbitControls: vi.fn(() => ({
     update: vi.fn(),
     dispose: vi.fn(),
+    target: { copy: vi.fn() },
+    minDistance: 0,
+    maxDistance: 0,
   })),
 }));
 

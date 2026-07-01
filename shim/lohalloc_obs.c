@@ -164,10 +164,10 @@ static int buf_append_f32(char *buf, int cap, int *pos, float f) {
 
 static const char *backend_name(uint8_t b) {
     switch (b) {
-        case 0:  return "Slab";
-        case 1:  return "Buddy";
-        case 2:  return "System";
-        case 3:  return "Arena";
+        case 0:  return "slab";
+        case 1:  return "buddy";
+        case 2:  return "system";
+        case 3:  return "arena";
         default: return NULL; /* 0xFF or anything else → omit (matches Rust `Option::is_none`) */
     }
 }

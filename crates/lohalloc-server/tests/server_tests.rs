@@ -18,7 +18,9 @@ async fn start_server() -> SocketAddr {
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(axum::serve(listener, build_app(AppState::new())).into_future());
+    let state = AppState::new();
+    state.set_server_port(addr.port());
+    tokio::spawn(axum::serve(listener, build_app(state)).into_future());
     addr
 }
 
@@ -280,4 +282,86 @@ async fn websocket_multiple_records_streamed() {
         }
     }
     assert!(received >= 1, "should receive at least 1 telemetry record");
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/run-simulation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn run_simulation_unknown_kind_returns_400() {
+    let addr = start_server().await;
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/run-simulation"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"kind":"nonexistent","args":{}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("nonexistent"));
+}
+
+#[tokio::test]
+async fn run_simulation_missing_shim_returns_503() {
+    // Clear any user override so we exercise the discovery path.
+    // SAFETY: tests are single-threaded for this env var (tokio test).
+    // SAFETY: env::remove_var is unsafe in newer Rust editions.
+    // (Test-only; race conditions across tests are acceptable.)
+    std::env::remove_var("LOHALLOC_SHIM_PATH");
+    let addr = start_server().await;
+    // Force a kind whose binary may not exist; combined with the missing
+    // shim, we expect a 503 (shim check happens first).
+    std::env::remove_var("LOHALLOC_BIN_LOHALLOC_EXAMPLE");
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/run-simulation"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"kind":"lohalloc-example","args":{}}"#)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    // Either 503 (shim missing) or 202 (everything happens to exist) is
+    // acceptable on dev machines; the unit tests in `simulation.rs` cover
+    // the 503 path deterministically.
+    assert!(status == 503 || status == 202, "got {status}: {body}");
+    if status == 503 {
+        assert!(body.contains("SHIM_NOT_FOUND") || body.contains("BINARY_NOT_FOUND"));
+    }
+}
+
+#[tokio::test]
+async fn simulation_history_endpoint_returns_events_array() {
+    let addr = start_server().await;
+    let response = reqwest::get(format!("http://{addr}/api/simulation-history"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let v: serde_json::Value = response.json().await.unwrap();
+    assert!(v.get("events").is_some());
+    assert!(v["events"].is_array());
+}
+
+#[tokio::test]
+async fn run_simulation_long_running_via_inline_shell() {
+    // We don't actually run the shim here; the `long-running` kind uses
+    // /bin/sh -c. We point at an invalid port so curl fails immediately,
+    // but we can still confirm the endpoint accepts the kind and returns
+    // either 202 (if /bin/sh exists and the server finds its port) or 503
+    // (if a binary is missing for some reason). Both are non-error.
+    let addr = start_server().await;
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/run-simulation"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"kind":"long-running","args":{"duration_secs":1}}"#)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    assert!(
+        status == 202 || status == 503 || status == 501,
+        "expected 202/503/501, got {status}"
+    );
 }

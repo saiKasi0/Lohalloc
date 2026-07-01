@@ -4,11 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Binary that installs Lohalloc as the global allocator for cross-platform smoke testing."
+description = "Binary that installs Lohalloc as the global allocator for cross-platform smoke testing. With --features install-shim-sink, also dlsym-installs the LD_PRELOAD shim's telemetry sink so every alloc/free produces a record that flows to the Lohalloc server."
 
 [[bin]]
 name = "lohalloc-example"
 path = "src/main.rs"
 
 [dependencies]
-lohalloc-alloc.workspace = true
+# `telemetry-observer` enables the observer module's emit_alloc/emit_free calls
+# on every alloc/dealloc. Required for the shim sink to receive any records.
+lohalloc-alloc = { workspace = true, features = ["telemetry-observer"] }
+libc = "0.2"
+
+[features]
+default = []
+# When enabled, the binary dlsym's the shim's sink symbol at startup and
+# installs it as the allocator's observer sink. Requires the
+# `liblohalloc_obs.{so,dylib}` shim to be built (cd shim && make) and to be
+# preloaded via LD_PRELOAD / DYLD_INSERT_LIBRARIES at launch.
+install-shim-sink = []

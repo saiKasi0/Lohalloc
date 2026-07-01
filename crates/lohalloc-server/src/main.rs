@@ -20,8 +20,11 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     eprintln!("Lohalloc server listening on {addr}");
 
+    let state = AppState::new();
+    state.set_server_port(addr.port());
+
     // Serve static frontend files from gui/dist/ in production.
-    axum::serve(listener, build_app_with_options(AppState::new(), true))
+    axum::serve(listener, build_app_with_options(state, true))
         .await
         .unwrap();
 }

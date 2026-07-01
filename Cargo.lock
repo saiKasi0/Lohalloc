@@ -712,6 +712,7 @@ dependencies = [
 name = "lohalloc-example"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "lohalloc-alloc",
 ]
 

@@ -2,6 +2,8 @@ COPILOT.md
 .vscode
 .claude
 target/
-.github/*.md
+.github/copilot-instructions.md
 dist/
 node_modules
+*.png
+test-results
