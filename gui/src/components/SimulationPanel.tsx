@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import type { SimulationEvent } from '../types/ws';
+import { stopSimulation } from '../hooks/useApi';
 
 /**
  * Floating panel showing currently-running simulations (top) and the
@@ -66,30 +67,49 @@ function SimulationRow({ ev }: { ev: SimulationEvent }) {
   const statusColor =
     ev.status === 'running' || ev.status === 'started'
      ? 'text-heat'
-      : ev.status === 'failed'
+     : ev.status === 'failed'
        ? 'text-heat'
        : 'text-ink-muted';
 
+  const isRunning = ev.status === 'running' || ev.status === 'started';
+
+  const handleKill = async () => {
+   try {
+     await stopSimulation(ev.pid);
+   } catch {
+     // ignore — the WS event will update the status
+   }
+  };
+
   return (
-    <div className="flex items-center justify-between px-3 py-1 border-b border-ink-faint">
-      <div className="flex items-center gap-2 min-w-0">
-        <span className={statusColor}>[{ev.status.toUpperCase()}]</span>
+   <div className="flex items-center justify-between px-3 py-1 border-b border-ink-faint">
+     <div className="flex items-center gap-2 min-w-0">
+       <span className={statusColor}>[{ev.status.toUpperCase()}]</span>
        <span className="text-ink truncate">{ev.kind}</span>
        <span className="text-ink-faint text-[10px]">
-          pid={ev.pid}
+         pid={ev.pid}
        </span>
      </div>
      <div className="flex items-center gap-3 text-[10px] text-ink-muted shrink-0">
-        <span>{formatDuration(ev.duration_ms)}</span>
-        {ev.exit_code !== undefined ? (
-          <span
-            className={
+       <span>{formatDuration(ev.duration_ms)}</span>
+       {ev.exit_code !== undefined ? (
+         <span
+           className={
              ev.exit_code === 0 ? 'text-ink-muted' : 'text-heat'
-            }
-          >
-            exit={ev.exit_code}
+           }
+         >
+           exit={ev.exit_code}
          </span>
-        ) : null}
+       ) : null}
+       {isRunning && (
+         <button
+           onClick={handleKill}
+           className="text-heat hover:text-canvas hover:bg-heat px-1 border border-heat transition-colors"
+           data-testid={`kill-sim-${ev.pid}`}
+         >
+           KILL
+         </button>
+       )}
      </div>
    </div>
   );

@@ -17,9 +17,11 @@ lohalloc-alloc = { workspace = true, features = ["telemetry-observer"] }
 libc = "0.2"
 
 [features]
-default = []
+default = ["install-shim-sink"]
 # When enabled, the binary dlsym's the shim's sink symbol at startup and
 # installs it as the allocator's observer sink. Requires the
 # `liblohalloc_obs.{so,dylib}` shim to be built (cd shim && make) and to be
 # preloaded via LD_PRELOAD / DYLD_INSERT_LIBRARIES at launch.
+# Enabled by default so simulations always emit telemetry when the shim is
+# preloaded. No-op when the shim is absent.
 install-shim-sink = []

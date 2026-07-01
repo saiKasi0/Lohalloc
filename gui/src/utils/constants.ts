@@ -12,4 +12,5 @@ export const MODE_URL = '/api/mode';
 export const ROUTING_TABLE_URL = '/api/routing-table';
 export const TELEMETRY_URL = '/api/telemetry';
 export const RUN_SIMULATION_URL = '/api/run-simulation';
+export const STOP_SIMULATION_URL = '/api/stop-simulation';
 export const SIMULATION_HISTORY_URL = '/api/simulation-history';

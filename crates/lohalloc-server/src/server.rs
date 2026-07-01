@@ -57,7 +57,7 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Path, State,
     },
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -240,6 +240,17 @@ impl AppState {
             .and_then(|mut g| g.remove(&pid).map(|h| h.kind))
     }
 
+    /// Kill a running simulation by pid. Sends `kill` (SIGKILL) to the child
+    /// process. Returns the kind if the simulation was found and killed.
+    pub async fn kill_simulation(&self, pid: u32) -> Option<crate::simulation::SimulationKind> {
+        let child_arc = self.get_simulation(pid)?;
+        let mut guard = child_arc.lock().await;
+        let _ = guard.kill();
+        let kind = self.get_simulation_kind(pid);
+        self.unregister_simulation(pid);
+        kind
+    }
+
     /// Append a finished lifecycle event to the bounded history.
     pub fn push_simulation_history(&self, event: crate::simulation::SimulationEvent) {
         if let Ok(mut g) = self.simulation_history.lock() {
@@ -389,10 +400,7 @@ impl AppState {
         };
         match record.op {
             AllocOp::Alloc => {
-                let ptr = unsafe {
-                    self.live_alloc
-                        .alloc_with_hash(layout, record.stack_hash)
-                };
+                let ptr = unsafe { self.live_alloc.alloc_with_hash(layout, record.stack_hash) };
                 if !ptr.is_null() {
                     if let Ok(mut live) = self.live_allocations.lock() {
                         live.push((ptr as usize, record.size));
@@ -503,6 +511,7 @@ pub fn build_app_with_options(state: AppState, serve_static: bool) -> Router {
         .route("/api/routing-table", get(get_routing_table_handler))
         .route("/api/telemetry", post(post_telemetry_handler))
         .route("/api/run-simulation", post(run_simulation_handler))
+        .route("/api/stop-simulation/{pid}", post(stop_simulation_handler))
         .route(
             "/api/simulation-history",
             get(get_simulation_history_handler),
@@ -960,7 +969,7 @@ async fn run_simulation_handler(
 
     // Spawn a background task that polls the child and emits "exited"/"failed"
     // events when the process terminates.
-    spawn_simulation_watcher(state.clone(), pid, kind);
+    spawn_simulation_watcher(state.clone(), pid, kind, args.duration_secs);
 
     (
         StatusCode::ACCEPTED,
@@ -971,18 +980,53 @@ async fn run_simulation_handler(
 
 /// Background task: poll a spawned simulation's exit status and emit
 /// lifecycle events. Runs on the tokio runtime; uses `try_wait` so it does
-/// not block other tasks.
-fn spawn_simulation_watcher(state: AppState, pid: u32, kind: SimulationKind) {
+/// not block other tasks. Auto-kills the process after `max_duration_secs`
+/// if set (applies to HttpServer which has no built-in duration limit).
+fn spawn_simulation_watcher(
+    state: AppState,
+    pid: u32,
+    kind: SimulationKind,
+    max_duration_secs: Option<u64>,
+) {
     tokio::spawn(async move {
         // Tiny initial delay so the "started" event arrives first.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let started_at = std::time::Instant::now();
+        let max_duration = max_duration_secs.map(std::time::Duration::from_secs);
 
         loop {
             let Some(child_arc) = state.get_simulation(pid) else {
                 // Already cleaned up.
                 return;
             };
+
+            // Check duration timeout (for HttpServer which runs forever).
+            if let Some(max) = max_duration {
+                if started_at.elapsed() >= max {
+                    // Kill the process.
+                    let mut guard = child_arc.lock().await;
+                    let _ = guard.kill();
+                    drop(guard);
+
+                    let duration_ms = started_at.elapsed().as_millis() as u64;
+                    let ev = SimulationEvent {
+                        pid,
+                        kind: kind.as_str().to_string(),
+                        status: "exited".to_string(),
+                        duration_ms,
+                        exit_code: Some(0),
+                        stdout_tail: None,
+                        error: Some("duration limit reached".to_string()),
+                    };
+                    let envelope = ev.clone().into_ws_message();
+                    if let Ok(s) = serde_json::to_string(&envelope) {
+                        state.telemetry_tx.send_raw(s);
+                    }
+                    state.push_simulation_history(ev);
+                    state.unregister_simulation(pid);
+                    return;
+                }
+            }
 
             // Poll once.
             let exit_status = {
@@ -1080,6 +1124,36 @@ async fn get_simulation_history_handler(State(state): State<AppState>) -> Respon
     let mut history = state.snapshot_simulation_history();
     events.append(&mut history);
     Json(serde_json::json!({ "events": events })).into_response()
+}
+
+/// `POST /api/stop-simulation/:pid` — Kill a running simulation by pid.
+/// Sends SIGKILL to the child process and emits a "failed" lifecycle event.
+async fn stop_simulation_handler(State(state): State<AppState>, Path(pid): Path<u32>) -> Response {
+    let kind = state.kill_simulation(pid).await;
+    match kind {
+        Some(k) => {
+            let ev = SimulationEvent {
+                pid,
+                kind: k.as_str().to_string(),
+                status: "failed".to_string(),
+                duration_ms: 0,
+                exit_code: Some(-1),
+                stdout_tail: None,
+                error: Some("killed by operator".to_string()),
+            };
+            let envelope = ev.clone().into_ws_message();
+            if let Ok(s) = serde_json::to_string(&envelope) {
+                state.telemetry_tx.send_raw(s);
+            }
+            state.push_simulation_history(ev);
+            Json(serde_json::json!({ "pid": pid, "killed": true })).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "simulation not found", "pid": pid })),
+        )
+            .into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1950,10 +2024,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 2);
-        let mut hashes: Vec<u64> = arr
-            .iter()
-            .map(|e| e["hash"].as_u64().unwrap())
-            .collect();
+        let mut hashes: Vec<u64> = arr.iter().map(|e| e["hash"].as_u64().unwrap()).collect();
         hashes.sort();
         assert_eq!(hashes, vec![100, 200]);
         // Backend should be a valid string.
@@ -2035,7 +2106,10 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
-        assert!(!bytes.is_empty(), "model bytes should be present after freeze");
+        assert!(
+            !bytes.is_empty(),
+            "model bytes should be present after freeze"
+        );
     }
 
     #[tokio::test]

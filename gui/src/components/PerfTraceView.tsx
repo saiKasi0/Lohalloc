@@ -104,7 +104,7 @@ function EmptyState({ label }: { label: string }): JSX.Element {
 
 function LatencyChart({ data }: { data: PerfDataPoint[] }): JSX.Element {
   return (
-    <div className="flex-1 p-2 min-h-[120px]" style={{ flexBasis: '60%' }}>
+   <div className="h-full w-full p-2">
       {data.length === 0 ? (
         <EmptyState label="AWAITING TELEMETRY..." />
       ) : (
@@ -112,7 +112,16 @@ function LatencyChart({ data }: { data: PerfDataPoint[] }): JSX.Element {
           <LineChart data={data} margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
             <CartesianGrid strokeDasharray="3 3" stroke={INK_FAINT} />
             <XAxis dataKey="index" stroke={INK_MUTED} fontSize={10} tick={{ fill: INK_MUTED }} />
-            <YAxis stroke={INK_MUTED} fontSize={10} tick={{ fill: INK_MUTED }} />
+            <YAxis
+              stroke={INK_MUTED}
+              fontSize={10}
+              tick={{ fill: INK_MUTED }}
+              domain={([dataMin, dataMax]: [number, number]) => [
+                Math.max(0, Math.floor(dataMin * 0.9)),
+                Math.ceil(dataMax * 1.1),
+              ]}
+              allowDataOverflow={false}
+            />
             <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={{ color: INK_MUTED }} />
             <Line type="monotone" dataKey="p50" stroke={INK} strokeWidth={2} dot={false} name="P50" />
             <Line
@@ -125,16 +134,16 @@ function LatencyChart({ data }: { data: PerfDataPoint[] }): JSX.Element {
               name="P90"
             />
             <Line type="monotone" dataKey="p99" stroke={HEAT} strokeWidth={2} dot={false} name="P99" />
-     </LineChart>
-   </ResponsiveContainer>
-      )}
- </div>
+         </LineChart>
+       </ResponsiveContainer>
+     )}
+   </div>
   );
 }
 
 function ThroughputChart({ data }: { data: PerfDataPoint[] }): JSX.Element {
   return (
-    <div className="flex-1 p-2 min-h-[80px]" style={{ flexBasis: '40%' }}>
+   <div className="h-full w-full p-2">
       {data.length === 0 ? (
         <EmptyState label="AWAITING TELEMETRY..." />
       ) : (
@@ -146,6 +155,8 @@ function ThroughputChart({ data }: { data: PerfDataPoint[] }): JSX.Element {
               stroke={INK_MUTED}
               fontSize={10}
               tick={{ fill: INK_MUTED }}
+              domain={([_dataMin, dataMax]: [number, number]) => [0, Math.ceil(dataMax * 1.1)]}
+              allowDataOverflow={false}
               tickFormatter={(v: number) => {
                 if (v >= 1e6) return `${(v / 1e6).toFixed(1)}Mops/s`;
                 if (v >= 1e3) return `${(v / 1e3).toFixed(1)}Kops/s`;
@@ -165,10 +176,10 @@ function ThroughputChart({ data }: { data: PerfDataPoint[] }): JSX.Element {
               dot={false}
               name="OPS/SEC"
             />
-     </LineChart>
-   </ResponsiveContainer>
-      )}
- </div>
+         </LineChart>
+       </ResponsiveContainer>
+     )}
+   </div>
   );
 }
 
@@ -177,18 +188,26 @@ export function PerfTraceView({ records }: { records: TelemetryRecord[] }): JSX.
 
   return (
     <div
-      className="h-full w-full bg-canvas text-ink font-mono flex flex-col"
+     className="h-full w-full bg-canvas text-ink font-mono flex flex-row overflow-hidden"
       data-testid="perf-trace-view"
     >
-      <div className="px-3 py-2 border-b border-ink-faint text-[10px] tracking-widest text-ink-muted flex items-center justify-between">
-        <span>LATENCY P50/P90/P99</span>
-        <span className="text-ink">{data.length.toString().padStart(5, '0')} PT</span>
+     <div className="flex-1 flex flex-col border-r border-ink-faint min-w-0">
+       <div className="px-3 py-1.5 border-b border-ink-faint text-[10px] tracking-widest text-ink-muted flex items-center justify-between">
+         <span>LATENCY P50/P90/P99</span>
+         <span className="text-ink">{data.length.toString().padStart(5, '0')} PT</span>
+       </div>
+       <div className="flex-1 min-h-0 overflow-hidden">
+         <LatencyChart data={data} />
+       </div>
+     </div>
+     <div className="flex-1 flex flex-col min-w-0">
+       <div className="px-3 py-1.5 border-b border-ink-faint text-[10px] tracking-widest text-ink-muted">
+         THROUGHPUT (OPS/SEC)
+       </div>
+       <div className="flex-1 min-h-0 overflow-hidden">
+         <ThroughputChart data={data} />
+       </div>
+     </div>
    </div>
-      <LatencyChart data={data} />
-      <div className="px-3 py-1 border-y border-ink-faint text-[10px] tracking-widest text-ink-muted">
-        THROUGHPUT (OPS/SEC)
-   </div>
-      <ThroughputChart data={data} />
- </div>
-  );
+ );
 }

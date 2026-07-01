@@ -14,7 +14,8 @@
     background: #0A0A0A;
     color: #E5E0D8;
     font-family: 'JetBrains Mono', ui-monospace, monospace;
-    font-feature-settings: 'liga' 0, 'calt' 0;
+    font-feature-settings: 'liga' 0, 'calt' 0, 'tnum' 1;
+    font-variant-numeric: tabular-nums;
     -webkit-font-smoothing: antialiased;
     margin: 0;
   }

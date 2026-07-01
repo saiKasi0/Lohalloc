@@ -128,4 +128,38 @@ describe('FloatingWeb', () => {
       expect(screen.getByText(/FLOATING WEB/i)).toBeDefined();
     });
   });
+
+  it('handles dense data with 15+ unique stack hashes', async () => {
+    const FloatingWeb = (await import('../FloatingWeb')).default;
+    const records = Array.from({ length: 150 }, (_, i) => ({
+      timestamp: i,
+      op: 'alloc' as const,
+      size: 64 * (i % 8 + 1),
+      stack_hash: 1000 + (i % 20),  // 20 unique hashes
+      thread_id: i % 4,
+      result_ptr: `0x${(0x1000 + i * 64).toString(16)}`,
+      latency_ns: 50 + (i % 10) * 10,
+      fragmentation_pct: (i % 5) * 5.0,
+      backend: (['slab', 'buddy', 'arena', 'system'] as const)[i % 4],
+    }));
+    render(<FloatingWeb records={records} />);
+    await waitFor(() => {
+      expect(screen.getByText(/FLOATING WEB/i)).toBeDefined();
+    });
+  });
+
+  it('handles mixed alloc and free operations', async () => {
+    const FloatingWeb = (await import('../FloatingWeb')).default;
+    const records = [
+      { timestamp: 0, op: 'alloc' as const, size: 64, stack_hash: 100, thread_id: 0, result_ptr: '0x1000', latency_ns: 100, fragmentation_pct: 5, backend: 'slab' as const },
+      { timestamp: 1, op: 'free' as const, size: 64, stack_hash: 100, thread_id: 0, result_ptr: '0x1000', latency_ns: 50, fragmentation_pct: 4, backend: 'slab' as const },
+      { timestamp: 2, op: 'alloc' as const, size: 128, stack_hash: 200, thread_id: 0, result_ptr: '0x2000', latency_ns: 200, fragmentation_pct: 10, backend: 'buddy' as const },
+      { timestamp: 3, op: 'alloc' as const, size: 256, stack_hash: 300, thread_id: 0, result_ptr: '0x3000', latency_ns: 150, fragmentation_pct: 8, backend: 'arena' as const },
+      { timestamp: 4, op: 'free' as const, size: 128, stack_hash: 200, thread_id: 0, result_ptr: '0x2000', latency_ns: 40, fragmentation_pct: 3, backend: 'buddy' as const },
+    ];
+    render(<FloatingWeb records={records} />);
+    await waitFor(() => {
+      expect(screen.getByText(/FLOATING WEB/i)).toBeDefined();
+    });
+  });
 });

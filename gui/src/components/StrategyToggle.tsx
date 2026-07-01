@@ -3,16 +3,102 @@ import type { Strategy } from '../types/telemetry';
 import {
   getStrategy,
   setStrategy,
+  freezeLive,
   freezeExport,
   downloadLohalloc,
 } from '../hooks/useApi';
 
-const STRATEGIES: { value: Strategy; label: string }[] = [
-  { value: 'default', label: 'DEFAULT (MAB)' },
-  { value: 'latency_priority', label: 'LATENCY PRIORITY' },
-  { value: 'throughput_priority', label: 'THROUGHPUT PRIORITY' },
+const STRATEGIES: { value: Strategy; label: string; short: string }[] = [
+  { value: 'default', label: 'DEFAULT (MAB)', short: 'MAB' },
+  { value: 'latency_priority', label: 'LATENCY PRIORITY', short: 'LAT' },
+  { value: 'throughput_priority', label: 'THROUGHPUT PRIORITY', short: 'THR' },
 ];
 
+/**
+ * Compact strategy buttons for embedding in the topology pane header bar.
+ * Renders 3 small strategy toggle buttons + a FREEZE & EXPORT button.
+ */
+export function StrategyButtons(): JSX.Element {
+  const [current, setCurrent] = useState<Strategy>('default');
+  const [loading, setLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
+
+  useEffect(() => {
+    getStrategy()
+      .then(setCurrent)
+      .catch(() => {});
+  }, []);
+
+  const handleSetStrategy = useCallback(async (s: Strategy) => {
+    setLoading(true);
+    try {
+      await setStrategy(s);
+      setCurrent(s);
+    } catch {
+      // ignore in compact mode
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const handleFreezeExport = useCallback(async () => {
+    setExporting(true);
+    try {
+      // First freeze the live allocator, then export the .lohalloc model.
+      await freezeLive();
+      const bytes = await freezeExport();
+      downloadLohalloc(bytes, 'model.lohalloc');
+    } catch {
+      // ignore in compact mode
+    } finally {
+      setExporting(false);
+    }
+  }, []);
+
+  return (
+    <div className="flex items-center gap-1" data-testid="strategy-buttons">
+      {STRATEGIES.map((s) => {
+        const active = current === s.value;
+        return (
+          <button
+            key={s.value}
+            onClick={() => handleSetStrategy(s.value)}
+            disabled={loading}
+            className={[
+              'px-1.5 py-0.5 text-[9px] tracking-widest uppercase border',
+              active
+                ? 'bg-heat text-canvas border-heat'
+                : 'bg-canvas text-ink-muted border-ink-faint hover:border-ink-muted hover:text-ink',
+              'disabled:opacity-50 disabled:cursor-not-allowed',
+              'transition-colors duration-75',
+            ].join(' ')}
+            data-testid={`strategy-btn-${s.value}`}
+          >
+            {s.short}
+          </button>
+        );
+      })}
+      <button
+        onClick={handleFreezeExport}
+        disabled={exporting}
+        className={[
+          'px-1.5 py-0.5 text-[9px] tracking-widest uppercase border font-bold',
+          'bg-canvas text-ink border-ink hover:bg-ink hover:text-canvas',
+          'disabled:opacity-50 disabled:cursor-not-allowed',
+          'transition-colors duration-75',
+        ].join(' ')}
+        data-testid="freeze-export-btn"
+      >
+        {exporting ? '...' : 'FREEZE'}
+      </button>
+    </div>
+  );
+}
+
+/**
+ * Full-size strategy toggle panel (legacy — no longer used in main layout
+ * but kept for backward compat and tests).
+ */
 export function StrategyToggle(): JSX.Element {
   const [current, setCurrent] = useState<Strategy>('default');
   const [loading, setLoading] = useState(false);

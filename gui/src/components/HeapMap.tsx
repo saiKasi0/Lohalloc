@@ -126,8 +126,14 @@ export function HeapMap({ records }: { records: TelemetryRecord[] }): JSX.Elemen
   }, [records]);
 
   return (
-    <div className="h-full w-full">
-      <div ref={mountRef} className="h-full w-full" data-testid="heap-map-canvas" />
+    <div className="h-full w-full flex flex-col" data-testid="heapmap-root">
+      <div className="px-3 py-1.5 border-b border-ink-faint text-[10px] tracking-widest text-ink-muted flex items-center justify-between">
+        <span>HEAP MAP // 64×64</span>
+        <span className="text-ink-faint">SLAB / BUDDY / SYSTEM</span>
+      </div>
+      <div className="flex-1 overflow-hidden">
+        <div ref={mountRef} className="h-full w-full" data-testid="heap-map-canvas" />
+      </div>
     </div>
   );
 }

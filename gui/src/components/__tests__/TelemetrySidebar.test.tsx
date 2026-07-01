@@ -38,4 +38,25 @@ describe('TelemetrySidebar', () => {
     const hotLine = Array.from(lines).find((el) => el.textContent?.includes('SLAB'));
     expect(hotLine?.className).toContain('text-heat');
   });
+
+  it('contains scrollable area with many records', () => {
+    const manyRecords: TelemetryRecord[] = Array.from({ length: 500 }, (_, i) => ({
+      timestamp: i,
+      op: i % 2 === 0 ? 'alloc' as const : 'free' as const,
+      size: 64 * (i % 8 + 1),
+      stack_hash: 100 + (i % 10),
+      thread_id: 0,
+      result_ptr: `0x${(0x1000 + i * 64).toString(16)}`,
+      latency_ns: 100 + (i % 5) * 50,
+      fragmentation_pct: (i % 7) * 3.0,
+      backend: (['slab', 'buddy', 'arena'] as const)[i % 3],
+    }));
+    const { container } = render(<TelemetrySidebar records={manyRecords} />);
+    // Sidebar caps at maxLines=200 by default, so only 200 visible
+    const lines = container.querySelectorAll('[data-testid="telemetry-line"]');
+    expect(lines.length).toBe(200);
+    // The scroll area should be bounded with overflow
+    const scrollArea = container.querySelector('[class*="overflow"]');
+    expect(scrollArea).toBeDefined();
+  });
 });

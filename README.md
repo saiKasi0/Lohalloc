@@ -56,9 +56,10 @@ is in progress.
 
 ```bash
 cargo build                            # build all crates
-cargo test --workspace                 # run 164 Rust tests
+cargo test --workspace                 # run 184 Rust tests
 cargo clippy --all-targets --workspace # must be warning-free
 cargo run -p lohalloc-example          # smoke binary
+cargo run -p lohalloc-example -- --diverse --duration-secs 30  # diverse workloads
 ```
 
 ### Run the GUI stack

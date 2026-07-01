@@ -144,7 +144,7 @@ impl SimulationKind {
         match self {
             Self::LohallocExample => "lohalloc-example",
             Self::HttpServer => "lohalloc-server",
-            Self::LongRunning => "lohalloc-server", // uses inline shell, no real crate
+            Self::LongRunning => "lohalloc-example", // reuses the example binary
         }
     }
 
@@ -152,7 +152,7 @@ impl SimulationKind {
         match self {
             Self::LohallocExample => "lohalloc-example",
             Self::HttpServer => "lohalloc-server",
-            Self::LongRunning => "sh", // uses /bin/sh -c
+            Self::LongRunning => "lohalloc-example", // reuses the example binary
         }
     }
 
@@ -276,7 +276,7 @@ pub fn build_command(
     let mut cmd = match kind {
         SimulationKind::LohallocExample => {
             let mut c = Command::new(&binary);
-            c.arg("--release");
+            c.arg("--diverse");
             if let Some(d) = args.duration_secs {
                 c.arg("--duration-secs").arg(d.to_string());
             }
@@ -285,16 +285,16 @@ pub fn build_command(
         SimulationKind::HttpServer => {
             let mut c = Command::new(&binary);
             let port = args.port.unwrap_or(4000);
-            c.arg("--port").arg(port.to_string());
-            // The nested server's own telemetry will POST to the parent
-            // (server_port) because we set LOHALLOC_OBS_PORT below.
+            // lohalloc-server uses LOHALLOC_ADDR env var, not CLI args.
+            c.env("LOHALLOC_ADDR", format!("127.0.0.1:{}", port));
             c
         }
         SimulationKind::LongRunning => {
-            // Run lohalloc-example with --duration-secs to generate real
-            // allocation traffic under the shim for the requested duration.
+            // Run lohalloc-example with --diverse and --duration-secs to
+            // generate real allocation traffic under the shim for the
+            // requested duration.
             let mut c = Command::new(&binary);
-            c.arg("--release");
+            c.arg("--diverse");
             let duration = args.duration_secs.unwrap_or(60);
             c.arg("--duration-secs").arg(duration.to_string());
             c

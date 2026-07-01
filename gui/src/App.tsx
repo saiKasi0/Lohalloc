@@ -5,7 +5,7 @@ import { useSimulationEvents } from './hooks/useSimulationEvents';
 import { useConvergence } from './hooks/useConvergence';
 import { runSimulation } from './hooks/useApi';
 import { PerfTraceView } from './components/PerfTraceView';
-import { StrategyToggle } from './components/StrategyToggle';
+import { StrategyButtons } from './components/StrategyToggle';
 import { HeapMap } from './components/HeapMap';
 import ModeToggle from './components/ModeToggle';
 import CollapsedTopology from './components/CollapsedTopology';
@@ -42,7 +42,7 @@ const FloatingWebLazy = ({ records }: { records: TelemetryRecord[] }) => {
     return (
       <div className="flex items-center justify-center h-full text-ink-muted text-xs tracking-widest">
         LOADING WEB...
-     </div>
+      </div>
     );
   }
   return <Cmp records={records} />;
@@ -91,13 +91,29 @@ function App() {
   // Track timestamps of records arriving for OPS/SEC computation.
   const opTimestampsRef = useRef<number[]>([]);
   const lastSeenLenRef = useRef<number>(0);
-  if (records.length !== lastSeenLenRef.current) {
-    const now = performance.now();
-    const buf = opTimestampsRef.current;
-    buf.push(now);
-    while (buf.length > 0 && now - buf[0] > 1000) buf.shift();
-    lastSeenLenRef.current = records.length;
-  }
+  const [tick, setTick] = useState(0);
+
+  // Push timestamp when new records arrive (in useEffect, not render body).
+  useEffect(() => {
+    if (records.length !== lastSeenLenRef.current) {
+      const now = performance.now();
+      const buf = opTimestampsRef.current;
+      buf.push(now);
+      while (buf.length > 0 && now - buf[0] > 1000) buf.shift();
+      lastSeenLenRef.current = records.length;
+    }
+  }, [records.length]);
+
+  // 1-second interval to force re-render so OPS/sec decays to 0 when stream stops.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const buf = opTimestampsRef.current;
+      const now = performance.now();
+      while (buf.length > 0 && now - buf[0] > 1000) buf.shift();
+      setTick((t) => t + 1);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
 
   const metrics = useMemo(() => {
     const now = performance.now();
@@ -124,7 +140,7 @@ function App() {
       opsPerSec: buf.length,
       fragAvg,
     };
-  }, [records]);
+  }, [records, tick]);
 
   return (
     <div
@@ -138,14 +154,14 @@ function App() {
             <span className="text-ink">LOHA</span>
             <span className="text-heat">//</span>
             <span className="text-ink">ALLOC</span>
-         </h1>
+          </h1>
           <div className="w-64">
-             <ModeToggle
-               onModeChange={setMode}
-               freezeRecommended={convergence.isConverged}
-             />
-         </div>
-       </div>
+            <ModeToggle
+              onModeChange={setMode}
+              freezeRecommended={convergence.isConverged}
+            />
+          </div>
+        </div>
         <div className="flex items-center gap-3 text-[11px] tracking-widest">
           <button
             type="button"
@@ -154,27 +170,27 @@ function App() {
             className="border border-ink-faint px-3 py-1 text-ink-muted hover:text-ink hover:border-ink uppercase tracking-widest"
           >
             UPLOAD TRACE
-         </button>
-         <SimulateDropdown onSpawn={handleSpawn} durationSecs={durationSecs} onDurationChange={setDurationSecs} />
+          </button>
+          <SimulateDropdown onSpawn={handleSpawn} durationSecs={durationSecs} onDurationChange={setDurationSecs} />
           <div
-            className="flex items-center gap-3 text-[11px] tracking-widest"
+            className="flex items-center gap-3 text-[11px] tracking-widest tabular-nums"
             data-testid="metrics-strip"
           >
             <span className="text-heat uppercase">BYTES</span>
-            <span className="text-ink" data-testid="metric-bytes">
+            <span className="text-ink inline-block min-w-[72px] text-right" data-testid="metric-bytes">
               {formatBytes(metrics.bytesAlloc)}
-           </span>
+            </span>
             <span className="text-ink-faint">|</span>
             <span className="text-heat uppercase">OPS</span>
-            <span className="text-ink" data-testid="metric-ops">
+            <span className="text-ink inline-block min-w-[48px] text-right" data-testid="metric-ops">
               {metrics.opsPerSec}/s
-           </span>
+            </span>
             <span className="text-ink-faint">|</span>
             <span className="text-heat uppercase">FRAG</span>
-            <span className="text-ink" data-testid="metric-frag">
+            <span className="text-ink inline-block min-w-[48px] text-right" data-testid="metric-frag">
               {metrics.fragAvg.toFixed(1)}%
-           </span>
-         </div>
+            </span>
+          </div>
           <span className="text-ink-faint">|</span>
           <div className="flex items-center gap-1.5">
             <span
@@ -186,141 +202,137 @@ function App() {
             />
             <span className="text-ink-muted uppercase">
               {isConnected ? 'LINK UP' : 'LINK DN'}
-           </span>
-         </div>
+            </span>
+          </div>
           {isLive && (
             <div className="flex items-center gap-1.5" data-testid="live-indicator">
               <span className="inline-block h-1.5 w-1.5 bg-heat heat-glow-box" />
               <span className="text-heat tracking-widest uppercase">LIVE</span>
-           </div>
+            </div>
           )}
           <span className="text-ink-faint">|</span>
           <span className="text-ink">
             {records.length.toString().padStart(6, '0')} REC
-         </span>
+          </span>
           <span className="text-ink-faint">|</span>
           <span className="text-ink-muted">
             ALLOC {allocCount.toString().padStart(5, '0')} / FREE{' '}
             {freeCount.toString().padStart(5, '0')}
-         </span>
-       </div>
-     </header>
+          </span>
+        </div>
+      </header>
 
       {/* MAIN GRID */}
       <main
-        className="grid grid-cols-12 gap-2 p-2 flex-1"
-        style={{ minHeight: 'calc(100vh - 64px)' }}
+        className="grid grid-cols-12 gap-2 p-2 flex-1 overflow-hidden"
+        style={{
+          gridTemplateRows: '3fr 2fr', // Top row slightly larger
+          height: 'calc(100vh - 64px)',
+        }}
       >
-        {/* CENTER: Topology (3D web or 2D matrix) — spans 2 rows */}
+        {/* TOP LEFT: Topology */}
         <section
-          className="col-span-7 row-span-2 border border-ink-faint bg-canvas flex flex-col"
+          className="col-span-8 border border-ink-faint bg-canvas flex flex-col overflow-hidden min-h-0"
           data-testid="topology-pane"
         >
-          <div className="px-3 py-2 border-b border-ink-faint text-[10px] tracking-widest text-ink-muted flex items-center justify-between">
+          <div className="px-3 py-2 border-b border-ink-faint text-[10px] tracking-widest text-ink-muted flex items-center justify-between flex-wrap gap-y-1 shrink-0">
             <span>
               {mode === 'inference'
                 ? 'COLLAPSED TOPOLOGY // INFERENCE'
                 : 'FLOATING WEB // TRAINING'}
-           </span>
-           <div className="flex items-center gap-3">
-             {mode === 'training' && convergence.uniqueHashes > 0 && (
-               <div className="flex items-center gap-2" data-testid="convergence-meters">
-                 <div className="flex items-center gap-1">
-                   <span className="text-ink-faint">TOPO</span>
-                   <div className="w-16 h-1 bg-ink-faint/30">
-                     <div
-                       className="h-full bg-heat transition-all"
-                       style={{ width: `${Math.round(convergence.topologyProgress * 100)}%` }}
-                     />
-                   </div>
-                 </div>
-                 <div className="flex items-center gap-1">
-                   <span className="text-ink-faint">STAB</span>
-                   <div className="w-16 h-1 bg-ink-faint/30">
-                     <div
-                       className="h-full bg-heat transition-all"
-                       style={{ width: `${Math.round(convergence.stabilityProgress * 100)}%` }}
-                     />
-                   </div>
-                 </div>
-                 {convergence.isConverged && (
-                   <span
-                     className="text-heat animate-pulse font-bold"
-                     data-testid="suggest-freeze"
-                   >
-                     ★ SUGGEST FREEZE
-                   </span>
-                 )}
-               </div>
-             )}
-             <span className="text-ink">
-               MODE: <span className="text-heat">{mode.toUpperCase()}</span>
-             </span>
-           </div>
-         </div>
-          <div className="flex-1 relative min-h-[400px]">
+            </span>
+            <div className="flex items-center gap-2 flex-wrap">
+              {mode === 'training' && convergence.uniqueHashes > 0 && (
+                <div className="flex items-center gap-2" data-testid="convergence-meters">
+                  <div className="flex items-center gap-1">
+                    <span className="text-ink-faint">TOPO</span>
+                    <div className="w-16 h-1 bg-ink-faint/30">
+                      <div
+                        className="h-full bg-heat transition-all"
+                        style={{ width: `${Math.round(convergence.topologyProgress * 100)}%` }}
+                      />
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <span className="text-ink-faint">STAB</span>
+                    <div className="w-16 h-1 bg-ink-faint/30">
+                      <div
+                        className="h-full bg-heat transition-all"
+                        style={{ width: `${Math.round(convergence.stabilityProgress * 100)}%` }}
+                      />
+                    </div>
+                  </div>
+                  {convergence.isConverged && (
+                    <span
+                      className="text-heat animate-pulse font-bold"
+                      data-testid="suggest-freeze"
+                    >
+                      ★ SUGGEST FREEZE
+                    </span>
+                  )}
+                </div>
+              )}
+              <StrategyButtons />
+              <span className="text-ink">
+                MODE: <span className="text-heat">{mode.toUpperCase()}</span>
+              </span>
+            </div>
+          </div>
+          <div className="flex-1 relative overflow-hidden min-h-0">
             {mode === 'inference' ? (
               <CollapsedTopology refreshKey={records.length} />
             ) : (
               <FloatingWebLazy records={records} />
             )}
-         </div>
-       </section>
+          </div>
+        </section>
 
-        {/* RIGHT: Telemetry Sidebar — row-span-2 to match topology height */}
+        {/* TOP RIGHT: Telemetry Sidebar */}
         <section
-          className="col-span-5 row-span-2 border border-ink-faint bg-canvas overflow-hidden"
+          className="col-span-4 border border-ink-faint bg-canvas flex flex-col overflow-hidden min-h-0"
           data-testid="telemetry-pane"
         >
           <TelemetrySidebar records={records} />
-       </section>
+        </section>
 
         {/* BOTTOM LEFT: HeapMap */}
         <section
-          className="col-span-4 border border-ink-faint bg-canvas"
+          className="col-span-4 border border-ink-faint bg-canvas overflow-hidden min-h-0"
           data-testid="heapmap-pane"
         >
           <HeapMap records={records} />
-       </section>
+        </section>
 
-        {/* BOTTOM MIDDLE: StrategyToggle */}
+        {/* BOTTOM RIGHT: PerfTraceView (Latency & Throughput) */}
         <section
-          className="col-span-4 border border-ink-faint bg-canvas p-3"
-          data-testid="strategy-pane"
-        >
-          <StrategyToggle />
-       </section>
-
-        {/* BOTTOM RIGHT: PerfTraceView */}
-        <section
-          className="col-span-4 border border-ink-faint bg-canvas"
+          className="col-span-8 border border-ink-faint bg-canvas overflow-hidden min-h-0"
           data-testid="perf-pane"
         >
           <PerfTraceView records={records} />
-       </section>
-     </main>
+        </section>
+      </main>
 
       {traceModalOpen && (
         <TraceUploadModal onClose={() => setTraceModalOpen(false)} />
       )}
 
-     {simPanelOpen && (
-       <SimulationPanel
-         events={simEvents}
-         active={activeSims}
-         onClose={() => setSimPanelOpen(false)}
-       />
-     )}
+      {simPanelOpen && (
+        <SimulationPanel
+          events={simEvents}
+          active={activeSims}
+          onClose={() => setSimPanelOpen(false)}
+        />
+      )}
 
-     {toast && (
-       <Toast
-         key={toast.key}
-         message={toast.message}
-         level={toast.level}
-         onDismiss={() => setToast(null)}
-       />
-     )}
-   </div>
+      {toast && (
+        <Toast
+          key={toast.key}
+          message={toast.message}
+          level={toast.level}
+          onDismiss={() => setToast(null)}
+        />
+      )}
+    </div>
   );
 }
 

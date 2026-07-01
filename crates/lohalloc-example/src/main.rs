@@ -62,7 +62,9 @@ fn try_install_shim_sink() -> bool {
     // SAFETY: sym_name is a valid C string, handle is valid.
     let sym = unsafe { libc::dlsym(handle, sym_name.as_ptr()) };
     if sym.is_null() {
-        eprintln!("[example] dlsym('lohalloc_telemetry_emit') returned NULL — is the shim preloaded?");
+        eprintln!(
+            "[example] dlsym('lohalloc_telemetry_emit') returned NULL — is the shim preloaded?"
+        );
         return false;
     }
 
@@ -82,11 +84,13 @@ fn try_install_shim_sink() -> bool {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let duration_secs = parse_duration_secs(&args);
+    let diverse = parse_diverse_flag(&args);
 
     println!(
-        "Lohalloc smoke test — host: {} {}",
+        "Lohalloc smoke test — host: {} {}{}",
         std::env::consts::OS,
-        std::env::consts::ARCH
+        std::env::consts::ARCH,
+        if diverse { " [diverse]" } else { "" }
     );
 
     // Install the shim sink before running any allocations so the very
@@ -102,15 +106,28 @@ fn main() {
         println!("Running for {}s...", secs);
         let deadline = Instant::now() + Duration::from_secs(secs);
         let mut iter = 0;
-        while Instant::now() < deadline {
-            run_workload();
-            iter += 1;
-            println!("Iteration {} complete", iter);
+        if diverse {
+            while Instant::now() < deadline {
+                run_diverse_workload(iter);
+                iter += 1;
+                println!("Diverse iteration {} complete", iter);
+            }
+        } else {
+            while Instant::now() < deadline {
+                run_workload();
+                iter += 1;
+                println!("Iteration {} complete", iter);
+            }
         }
         println!("Completed {} iterations in {}s", iter, secs);
     } else {
-        run_workload();
-        println!("Lohalloc smoke test PASSED");
+        if diverse {
+            run_diverse_workload(0);
+            println!("Lohalloc diverse smoke test PASSED");
+        } else {
+            run_workload();
+            println!("Lohalloc smoke test PASSED");
+        }
     }
 
     // Give the shim time to flush remaining buffered records before exit.
@@ -119,6 +136,10 @@ fn main() {
         #[cfg(feature = "install-shim-sink")]
         observer::clear_sink();
     }
+}
+
+fn parse_diverse_flag(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--diverse")
 }
 
 fn parse_duration_secs(args: &[String]) -> Option<u64> {
@@ -171,4 +192,117 @@ fn run_workload() {
         "OK: completed {} vec entries, large buffer, 100k hashmap entries",
         v.len()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Diverse workloads — each is a separate function so the topology engine
+// sees a distinct call-stack hash for every pattern.
+// ---------------------------------------------------------------------------
+
+/// Rotate through all diverse workloads. `idx` selects which workload runs
+/// so successive iterations exercise different allocation patterns.
+fn run_diverse_workload(idx: usize) {
+    match idx % 10 {
+        0 => workload_vec_small(),
+        1 => workload_vec_medium(),
+        2 => workload_boxes_32(),
+        3 => workload_boxes_128(),
+        4 => workload_string_build(),
+        5 => workload_hashmap_small(),
+        6 => workload_hashmap_large(),
+        7 => workload_nested_structs(),
+        8 => workload_buffer_1mib(),
+        _ => workload_buffer_4mib(),
+    }
+}
+
+fn workload_vec_small() {
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..1_000u64 {
+        v.push(i);
+    }
+    let sum: u64 = v.iter().sum();
+    assert_eq!(sum, 1_000 * 999 / 2);
+}
+
+fn workload_vec_medium() {
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..100_000u64 {
+        v.push(i);
+    }
+    let sum: u64 = v.iter().sum();
+    assert_eq!(sum, 100_000 * 99_999 / 2);
+}
+
+fn workload_boxes_32() {
+    let boxes: Vec<Box<[u8; 32]>> = (0..5_000).map(|_| Box::new([0u8; 32])).collect();
+    for b in &boxes {
+        assert!(b.iter().all(|&x| x == 0));
+    }
+}
+
+fn workload_boxes_128() {
+    let boxes: Vec<Box<[u8; 128]>> = (0..2_000).map(|_| Box::new([0u8; 128])).collect();
+    for b in &boxes {
+        assert!(b.iter().all(|&x| x == 0));
+    }
+}
+
+fn workload_string_build() {
+    let s = "Lohalloc".repeat(500);
+    assert_eq!(s.len(), "Lohalloc".len() * 500);
+    let t = s.clone() + &s;
+    assert_eq!(t.len(), s.len() * 2);
+    let parts: Vec<&str> = t.split('o').collect();
+    assert!(!parts.is_empty());
+}
+
+fn workload_hashmap_small() {
+    let mut m: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for i in 0..1_000u64 {
+        m.insert(i, i * 2);
+    }
+    assert_eq!(m.get(&500u64), Some(&1000));
+}
+
+fn workload_hashmap_large() {
+    let mut m: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for i in 0..50_000u64 {
+        m.insert(i, i * 2);
+    }
+    assert_eq!(m.get(&25_000u64), Some(&50_000));
+}
+
+struct Inner {
+    data: [u8; 64],
+}
+
+struct Outer {
+    inner: Box<Inner>,
+    tag: u64,
+}
+
+fn workload_nested_structs() {
+    let items: Vec<Outer> = (0..3_000)
+        .map(|i| Outer {
+            inner: Box::new(Inner {
+                data: [i as u8; 64],
+            }),
+            tag: i,
+        })
+        .collect();
+    assert_eq!(items.len(), 3_000);
+    assert_eq!(items[100].tag, 100);
+}
+
+fn workload_buffer_1mib() {
+    let buf: Vec<u8> = vec![0xCD; 1024 * 1024];
+    assert_eq!(buf.len(), 1024 * 1024);
+    assert!(buf.iter().all(|&x| x == 0xCD));
+}
+
+fn workload_buffer_4mib() {
+    let buf: Vec<u8> = vec![0xAB; 4 * 1024 * 1024];
+    assert_eq!(buf.len(), 4 * 1024 * 1024);
+    assert!(buf.iter().all(|&x| x == 0xAB));
 }

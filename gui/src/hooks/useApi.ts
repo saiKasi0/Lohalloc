@@ -6,6 +6,7 @@ import {
   RESET_TRAINING_URL,
   ROUTING_TABLE_URL,
   RUN_SIMULATION_URL,
+  STOP_SIMULATION_URL,
   STRATEGY_URL,
   TELEMETRY_URL,
   TRAINING_STATUS_URL,
@@ -255,4 +256,14 @@ export async function runSimulation(
     );
   }
   return (await res.json()) as SimulationSpawnResult;
+}
+
+/**
+ * Stop a running simulation by pid. Sends a kill signal to the child process.
+ */
+export async function stopSimulation(pid: number): Promise<void> {
+  const res = await fetch(`${STOP_SIMULATION_URL}/${pid}`, { method: 'POST' });
+  if (!res.ok) {
+    throw new Error(`stopSimulation failed: ${res.status} ${res.statusText}`);
+  }
 }
