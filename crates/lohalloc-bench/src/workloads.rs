@@ -197,6 +197,15 @@ pub fn workload_system_large<D: AllocDriver>(driver: &D, hash: u64, ops: usize) 
         let size = SYSTEM_SIZES[i % SYSTEM_SIZES.len()];
         let layout = Layout::from_size_align(size, 16).unwrap();
         let p = unsafe { driver.alloc(layout, hash) };
+        // Touch the allocation — mirrors the volatile write in the C
+        // generator (`bench/native/workloads.c`), where it is load-bearing:
+        // a bare malloc/free pair with an unused pointer gets *deleted
+        // entirely* by GCC/Clang at -O2. Kept identical here so the
+        // cross-language workload shapes (and their page-fault behavior)
+        // match exactly.
+        if !p.is_null() {
+            unsafe { p.write_volatile(i as u8) };
+        }
         unsafe { driver.dealloc(p, layout, hash) };
     }
 }

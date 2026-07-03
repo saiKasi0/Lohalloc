@@ -111,7 +111,9 @@ jobs:
           mkdir -p results/merged/raw
           find results/x86_64 -type f -path '*/raw/*.json' -exec cp {} results/merged/raw/ \; 2>/dev/null || true
           find results/arm64  -type f -path '*/raw/*.json' -exec cp {} results/merged/raw/ \; 2>/dev/null || true
-          cargo run -p lohalloc-bench --bin aggregate --release -- --results-dir results/merged
+          # --gate: enforce the regression gate here (exit non-zero on a
+          # regression) — this merged x86+arm aggregate is the CI gate.
+          cargo run -p lohalloc-bench --bin aggregate --release -- --run-dir results/merged --gate
 
       - name: Upload results
         if: always()

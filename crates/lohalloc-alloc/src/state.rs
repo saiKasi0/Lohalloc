@@ -241,11 +241,21 @@ impl AllocatorState {
         let routing_table = PerfectHashTable::deserialize(data)?;
         Some(Self::Inference { routing_table })
     }
+
+    /// Borrow the frozen routing table (Inference mode only). Used by
+    /// `Lohalloc::freeze()`/`load()` to publish a lock-free copy for the
+    /// Inference alloc fast path.
+    pub fn routing_table(&self) -> Option<&PerfectHashTable> {
+        match self {
+            Self::Inference { routing_table } => Some(routing_table),
+            Self::Training { .. } => None,
+        }
+    }
 }
 
 /// Default backend for a given size (used when the hash is not in the
 /// frozen routing table, or as a sanity fallback).
-fn default_backend_for_size(size: usize) -> Backend {
+pub(crate) fn default_backend_for_size(size: usize) -> Backend {
     let total_with_header = size + 48; // Header is 48 bytes.
     if total_with_header <= lohalloc_core::SLAB_MAX {
         Backend::Slab

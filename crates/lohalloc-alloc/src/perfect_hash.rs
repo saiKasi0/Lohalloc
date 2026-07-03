@@ -116,6 +116,10 @@ fn fastrange(x: u64, n: usize) -> usize {
 /// per-bucket displacement seed array. Once constructed, it is never mutated
 /// — the Inference hot path does a single O(1) `lookup()` with zero heap
 /// allocations.
+///
+/// `Clone` so `Lohalloc::freeze()`/`load()` can publish an immutable copy
+/// through a lock-free `AtomicPtr` for the Inference alloc fast path.
+#[derive(Clone)]
 pub struct PerfectHashTable {
     /// Seed folded into every hash; advanced when construction retries.
     global_seed: u64,

@@ -37,6 +37,36 @@ pub fn freeze_global_lohalloc() {
     ALLOC.freeze();
 }
 
+/// Load a `.lohalloc` model into the process-wide Lohalloc allocator,
+/// starting it directly in Inference mode. Mirrors `lohalloc-cabi`'s
+/// `LOHALLOC_MODEL` behavior for the `native_workload` bin's
+/// `#[global_allocator]` builds.
+#[cfg(feature = "alloc-lohalloc")]
+pub fn load_global_lohalloc(bytes: &[u8]) -> bool {
+    ALLOC.load(bytes)
+}
+
+/// Export the process-wide Lohalloc allocator's frozen routing table
+/// (`None` if still training — call [`freeze_global_lohalloc`] first).
+#[cfg(feature = "alloc-lohalloc")]
+pub fn export_global_lohalloc() -> Option<Vec<u8>> {
+    ALLOC.export()
+}
+
+/// Whether the process-wide Lohalloc allocator is frozen (Inference mode).
+#[cfg(feature = "alloc-lohalloc")]
+pub fn global_lohalloc_is_inference() -> bool {
+    ALLOC.is_inference()
+}
+
+/// Process-wide count of frozen-table lookup misses — see
+/// `Lohalloc::pht_miss_count`. ~0 on a model-loaded run proves the model's
+/// (ASLR-normalized) keys matched this process's call sites.
+#[cfg(feature = "alloc-lohalloc")]
+pub fn global_lohalloc_pht_misses() -> u64 {
+    lohalloc_alloc::Lohalloc::pht_miss_count()
+}
+
 /// Human-readable label for whichever allocator this build selected. Used to
 /// tag criterion baselines and latency-profile output so results are
 /// self-describing.

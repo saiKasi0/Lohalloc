@@ -50,7 +50,7 @@ pub mod topology;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::Cell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use lohalloc_core::{align_up, BUDDY_MAX, MIN_ALIGN, SLAB_MAX};
 use std::sync::Mutex;
 
@@ -219,7 +219,25 @@ pub struct Lohalloc {
     /// `freeze()`/`load()` (which already touch the state lock) — a single
     /// relaxed atomic load costs far less than a `Mutex` lock/unlock pair.
     frozen: AtomicBool,
+    /// Lock-free copy of the frozen `PerfectHashTable`, published by
+    /// `freeze()`/`load()` (null while in Training mode). The Inference
+    /// alloc fast path loads this pointer instead of taking the `state`
+    /// Mutex — before this existed, *every* allocation serialized on that
+    /// global lock even in frozen mode, which showed up directly in the
+    /// Phase 6 cross-allocator numbers. The pointed-to table is immutable
+    /// and deliberately leaked on `reset_to_training()` (a concurrent
+    /// reader may still hold `&*table`; a full RCU scheme is overkill for
+    /// a GUI dev button, and leakage is bounded by freeze/reset cycles).
+    frozen_table: AtomicPtr<perfect_hash::PerfectHashTable>,
 }
+
+/// Count of Inference-mode lookups whose key was *not* in the frozen table
+/// (falling back to size-based routing). Only incremented on a miss — the
+/// hit path stays untouched. This is the observability hook that lets the
+/// Phase 6 benchmark verify a pre-trained model actually matches a fresh
+/// process's call sites (ASLR-stable hashes): a model-loaded run whose
+/// workload was trained in an earlier process should see ~0 misses.
+static PHT_MISSES: AtomicU64 = AtomicU64::new(0);
 
 impl Default for Lohalloc {
     fn default() -> Self {
@@ -238,6 +256,7 @@ impl Lohalloc {
             // Decision Engine starts in Training mode.
             state: Mutex::new(state::AllocatorState::new_training_const()),
             frozen: AtomicBool::new(false),
+            frozen_table: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 }
@@ -459,6 +478,31 @@ impl Lohalloc {
         total: usize,
     ) -> *mut u8 {
         let size_class = state::size_class_for(size);
+
+        // Inference fast path: the frozen table is immutable and published
+        // via an atomic pointer, so a frozen allocator routes with zero
+        // locks on the decision plane (the serving backend's own Mutex is
+        // still taken inside `try_backend`). Before this existed, every
+        // alloc — frozen or not — serialized on the global `state` Mutex.
+        let table = self.frozen_table.load(Ordering::Acquire);
+        if !table.is_null() {
+            // SAFETY: the pointed-to table is heap-allocated, immutable,
+            // and never freed while non-null (see `frozen_table`'s doc —
+            // `reset_to_training` nulls the pointer and leaks the table).
+            let key = state::combine_hash_size_class(hash, size_class);
+            let backend = match unsafe { (*table).lookup(key) } {
+                Some(b) => b,
+                None => {
+                    // Miss-only counter: the hit path pays nothing extra.
+                    PHT_MISSES.fetch_add(1, Ordering::Relaxed);
+                    state::default_backend_for_size(size)
+                }
+            };
+            if let Some(ptr) = self.try_backend(backend, total, align, pad, hash, size_class) {
+                return ptr;
+            }
+            return self.route_by_size(total, align, pad, hash, size_class);
+        }
 
         let (recommended, is_training) = if let Ok(mut st) = self.state.lock() {
             (Some(st.route(hash, size)), !st.is_inference())
@@ -788,9 +832,22 @@ impl Lohalloc {
         Self::with_realloc_guard(|| {
             if let Ok(mut state) = self.state.lock() {
                 state.freeze();
+                self.publish_frozen_table(&state);
             }
         });
         self.frozen.store(true, Ordering::Release);
+    }
+
+    /// Publish a lock-free copy of the state's frozen routing table for the
+    /// Inference alloc fast path (see the `frozen_table` field doc). Must be
+    /// called inside `with_realloc_guard` with the state lock held — the
+    /// clone + `Box` allocation take the `IN_ALLOC` bypass when this
+    /// instance is the process's global allocator.
+    fn publish_frozen_table(&self, state: &state::AllocatorState) {
+        if let Some(table) = state.routing_table() {
+            let leaked: *mut perfect_hash::PerfectHashTable = Box::leak(Box::new(table.clone()));
+            self.frozen_table.store(leaked, Ordering::Release);
+        }
     }
 
     /// Snapshot the current "best backend per Signature" without
@@ -822,6 +879,13 @@ impl Lohalloc {
     /// any frozen routing table or learned bandit weights. Used by the GUI's
     /// "back to training" button.
     pub fn reset_to_training(&self) {
+        // Unpublish the fast-path table *before* resetting the state so no
+        // new reader can pick it up mid-reset. The old table is
+        // intentionally leaked — a concurrent alloc may still be reading
+        // through the pointer it loaded; leakage is bounded by the number
+        // of freeze/reset cycles (a GUI dev action, not a hot path).
+        self.frozen_table
+            .store(core::ptr::null_mut(), Ordering::Release);
         Self::with_realloc_guard(|| {
             if let Ok(mut state) = self.state.lock() {
                 state.reset_to_training();
@@ -854,6 +918,7 @@ impl Lohalloc {
             if let Some(s) = new_state {
                 if let Ok(mut state) = self.state.lock() {
                     *state = s;
+                    self.publish_frozen_table(&state);
                     self.frozen.store(true, Ordering::Release);
                     return true;
                 }
@@ -869,6 +934,14 @@ impl Lohalloc {
         } else {
             false
         }
+    }
+
+    /// Process-wide count of Inference-mode routing lookups that missed the
+    /// frozen table (and fell back to size-based routing). ~0 on a
+    /// model-loaded run means the model's keys matched this process's call
+    /// sites — the end-to-end proof that hashes are stable across runs.
+    pub fn pht_miss_count() -> u64 {
+        PHT_MISSES.load(Ordering::Relaxed)
     }
 
     // -----------------------------------------------------------------
@@ -1115,6 +1188,88 @@ mod integration_tests {
             assert!(!ptr.is_null(), "alloc should succeed in inference");
             unsafe { alloc.dealloc(ptr, layout) };
         }
+    }
+
+    #[test]
+    fn frozen_alloc_uses_published_table() {
+        // Load a hand-built model routing (hash, size_class(64)) → Buddy.
+        // Size 64 would default to Slab, so getting Buddy back proves the
+        // lock-free published table (not the size fallback) made the call.
+        let hash = 0xDEAD_BEEF_u64;
+        let size = 64usize;
+        let sc = state::size_class_for(size);
+        let key = state::combine_hash_size_class(hash, sc);
+        let table = perfect_hash::PerfectHashTable::from_entries(vec![(
+            key,
+            sc,
+            lohalloc_core::Backend::Buddy,
+        )]);
+        let alloc = Lohalloc::new();
+        assert!(alloc.load(&table.serialize()), "model load should succeed");
+
+        let layout = Layout::from_size_align(size, 16).unwrap();
+        let ptr = unsafe { alloc.alloc_with_hash(layout, hash) };
+        assert!(!ptr.is_null());
+        assert_eq!(
+            unsafe { alloc.backend_for_ptr(ptr) },
+            Some(lohalloc_core::Backend::Buddy),
+            "published frozen table must drive routing"
+        );
+        unsafe { alloc.dealloc_with_hash(ptr, layout) };
+    }
+
+    #[test]
+    fn frozen_alloc_multithreaded_smoke() {
+        use std::sync::Arc;
+
+        let alloc = Arc::new(Lohalloc::new());
+        for _ in 0..200 {
+            let layout = Layout::from_size_align(64, 16).unwrap();
+            let ptr = unsafe { alloc.alloc(layout) };
+            assert!(!ptr.is_null());
+            unsafe { alloc.dealloc(ptr, layout) };
+        }
+        alloc.freeze();
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let a = Arc::clone(&alloc);
+            handles.push(std::thread::spawn(move || {
+                let layout = Layout::from_size_align(64, 16).unwrap();
+                for _ in 0..10_000 {
+                    let ptr = unsafe { a.alloc(layout) };
+                    assert!(!ptr.is_null());
+                    unsafe { a.dealloc(ptr, layout) };
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+    }
+
+    #[test]
+    fn reset_after_freeze_returns_to_training() {
+        let alloc = Lohalloc::new();
+        let layout = Layout::from_size_align(64, 16).unwrap();
+        for _ in 0..50 {
+            let ptr = unsafe { alloc.alloc(layout) };
+            assert!(!ptr.is_null());
+            unsafe { alloc.dealloc(ptr, layout) };
+        }
+        alloc.freeze();
+        assert!(alloc.is_inference());
+
+        alloc.reset_to_training();
+        assert!(!alloc.is_inference());
+        // Allocations must go back through the training path (state lock),
+        // not the (now unpublished) frozen table.
+        for _ in 0..50 {
+            let ptr = unsafe { alloc.alloc(layout) };
+            assert!(!ptr.is_null());
+            unsafe { alloc.dealloc(ptr, layout) };
+        }
+        assert!(alloc.signature_count() > 0, "bandit must be learning again");
     }
 
     #[test]

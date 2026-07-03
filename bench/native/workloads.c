@@ -70,6 +70,18 @@ NOINLINE void workload_system_large(size_t ops) {
     for (size_t i = 0; i < ops; i++) {
         size_t size = SYSTEM_SIZES[i % 2];
         void *p = malloc(size);
+        // Touch the allocation through a volatile pointer: without this,
+        // GCC/Clang's builtin-malloc semantics let them prove `p` unused
+        // and DELETE the whole malloc/free pair at -O2 — this workload
+        // measured literally nothing for every allocator (caught when the
+        // Phase 6 train+export step saw zero interposed mallocs). The
+        // other workloads escape their pointers through arrays/later
+        // frees, so only this trivial pair was elidable. Mirrored in the
+        // Rust generator (`workloads.rs::workload_system_large`) to keep
+        // the cross-language shapes identical.
+        if (p) {
+            ((volatile char *)p)[0] = (char)i;
+        }
         free(p);
     }
 }

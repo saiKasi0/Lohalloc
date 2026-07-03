@@ -49,4 +49,14 @@ COPY . .
 RUN cargo build -p lohalloc-cabi --release
 RUN make -C bench/native
 
+# Rust rows of the native matrix: one native_workload binary per allocator
+# (#[global_allocator] chosen by feature — Rust's idiomatic adoption path,
+# vs. LD_PRELOAD for C/C++). Baked here so the container never compiles at
+# benchmark time.
+RUN for feat in system lohalloc jemalloc mimalloc; do \
+        cargo build -p lohalloc-bench --bin native_workload --release --features alloc-$feat \
+        && cp target/release/native_workload bench/native/build/native_workload_$feat \
+        || exit 1; \
+    done
+
 ENTRYPOINT ["bash", "bench/run_native.sh"]

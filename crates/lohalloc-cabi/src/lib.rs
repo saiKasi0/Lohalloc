@@ -90,8 +90,21 @@ fn libc_malloc_usable_size() -> Option<MallocUsableSizeFn> {
 }
 
 // ---------------------------------------------------------------------------
-// LOHALLOC_FREEZE_AFTER: let an unmodified C/C++ program exercise Inference
-// mode by auto-freezing after N successful mallocs.
+// Env-var control surface for unmodified C/C++ programs:
+//
+// - LOHALLOC_FREEZE_AFTER=<n>     auto-freeze after n successful mallocs.
+// - LOHALLOC_EXPORT_MODEL=<path>  write the frozen `.lohalloc` model to
+//                                 <path> the moment the freeze happens
+//                                 (auto or explicit). Enables the Phase 6
+//                                 "train once, measure inference in a fresh
+//                                 process" benchmark methodology.
+// - LOHALLOC_MODEL=<path>         load a `.lohalloc` model before the first
+//                                 top-level malloc — the process starts
+//                                 directly in Inference mode with zero
+//                                 training. Only meaningful now that stack
+//                                 hashes are module-base-normalized
+//                                 (ASLR-stable); the model must come from
+//                                 the same binary/architecture.
 // ---------------------------------------------------------------------------
 
 static MALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -135,7 +148,94 @@ fn maybe_auto_freeze() {
     // threshold simultaneously; exactly one wins the swap and freezes.
     if count >= threshold && !FREEZE_FIRED.swap(true, Ordering::Relaxed) {
         ALLOC.freeze();
+        // Safe here: we are inside `with_freeze_check`'s depth bump, so any
+        // allocation the export triggers (env read, Vec, file I/O buffers)
+        // re-enters `malloc` at depth > 0 and skips this whole layer.
+        maybe_export_model();
     }
+}
+
+/// If `LOHALLOC_EXPORT_MODEL` is set, write the (just-frozen) routing table
+/// there — tmp-file + rename so a crash mid-write never leaves a truncated
+/// model. Failures warn on stderr and continue; the benchmark script is the
+/// layer that treats a missing model file as fatal.
+///
+/// Must only be called with `IN_ALLOC_FN` depth > 0 (i.e. from inside
+/// `with_freeze_check` or another depth bump): `std::env::var`, `format!`,
+/// and `std::fs` all allocate, and those nested mallocs must skip the
+/// top-level init/freeze layer (see `with_freeze_check`'s doc).
+fn maybe_export_model() {
+    let Ok(path) = std::env::var("LOHALLOC_EXPORT_MODEL") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    match ALLOC.export() {
+        Some(bytes) => {
+            let tmp = format!("{path}.tmp");
+            if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &path))
+            {
+                eprintln!("lohalloc: failed to write model to {path}: {e}");
+            }
+        }
+        None => eprintln!("lohalloc: LOHALLOC_EXPORT_MODEL set but allocator is not frozen"),
+    }
+}
+
+/// If `LOHALLOC_MODEL` is set, load that `.lohalloc` model exactly once,
+/// before the first top-level allocation is served. On success the process
+/// runs pure Inference from its very first malloc (and `FREEZE_FIRED` is
+/// set so the `LOHALLOC_FREEZE_AFTER` counter is never touched). On any
+/// failure: warn once on stderr and stay in Training.
+///
+/// Re-entrancy: only ever called at `IN_ALLOC_FN` depth 0, from
+/// `with_freeze_check`, *after* the depth bump — so the nested allocations
+/// its own body triggers (env read, `fs::read`'s Vec, the deserialized
+/// table) re-enter `malloc` at depth > 0 and can never re-enter this
+/// non-reentrant `OnceLock` on the same thread. This is the same structure
+/// that fixed the documented `LOHALLOC_FREEZE_AFTER` env-var deadlock.
+fn ensure_model_loaded() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let Ok(path) = std::env::var("LOHALLOC_MODEL") else {
+            return;
+        };
+        if path.is_empty() {
+            return;
+        }
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                if ALLOC.load(&bytes) {
+                    FREEZE_FIRED.store(true, Ordering::Relaxed);
+                    // Debug probe: report at exit how many Inference
+                    // lookups missed the loaded model — ~0 proves the
+                    // model's (ASLR-normalized) keys matched this fresh
+                    // process's call sites end to end.
+                    if std::env::var("LOHALLOC_DEBUG").is_ok() {
+                        unsafe {
+                            libc::atexit(report_pht_misses_at_exit);
+                        }
+                    }
+                } else {
+                    eprintln!("lohalloc: LOHALLOC_MODEL={path} is malformed — staying in training");
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "lohalloc: could not read LOHALLOC_MODEL={path}: {e} — staying in training"
+                );
+            }
+        }
+    });
+}
+
+/// atexit hook installed by `ensure_model_loaded` under `LOHALLOC_DEBUG`.
+extern "C" fn report_pht_misses_at_exit() {
+    eprintln!(
+        "lohalloc: pht_misses={} (model-loaded run; ~0 means the model matched this process)",
+        Lohalloc::pht_miss_count()
+    );
 }
 
 /// Runs `f` (an `ALLOC.alloc(...)` call), then — only for a true top-level,
@@ -158,6 +258,12 @@ fn maybe_auto_freeze() {
 fn with_freeze_check(f: impl FnOnce() -> *mut c_void) -> *mut c_void {
     let depth = IN_ALLOC_FN.with(|c| c.get());
     IN_ALLOC_FN.with(|c| c.set(depth + 1));
+    // Model load must happen before the first top-level allocation is
+    // served, and — like `maybe_auto_freeze` below — only while the depth
+    // bump is active, so its own nested allocations skip this layer.
+    if depth == 0 {
+        ensure_model_loaded();
+    }
     let ptr = f();
     // Guard must still be held (depth+1) through `maybe_auto_freeze()`
     // itself, not just around `f()` — its first-ever call reads
@@ -372,17 +478,35 @@ fn set_errno(value: c_int) {
 // ---------------------------------------------------------------------------
 
 /// Freeze the process-wide allocator: collapse Training-mode learning into
-/// the frozen Inference routing table.
+/// the frozen Inference routing table (and export it if
+/// `LOHALLOC_EXPORT_MODEL` is set).
 #[no_mangle]
 pub extern "C" fn lohalloc_freeze() {
     FREEZE_FIRED.store(true, Ordering::Relaxed);
+    // Bump the same depth guard `with_freeze_check` uses: the export path
+    // reads env vars and does file I/O, whose nested allocations must not
+    // look like fresh top-level mallocs (they'd re-enter the non-reentrant
+    // init `OnceLock`s on this same thread).
+    let depth = IN_ALLOC_FN.with(|c| c.get());
+    IN_ALLOC_FN.with(|c| c.set(depth + 1));
     ALLOC.freeze();
+    maybe_export_model();
+    IN_ALLOC_FN.with(|c| c.set(depth));
 }
 
 /// True (`1`) if the process-wide allocator is currently in Inference mode.
 #[no_mangle]
 pub extern "C" fn lohalloc_is_inference() -> c_int {
     ALLOC.is_inference() as c_int
+}
+
+/// Process-wide count of Inference-mode routing lookups that missed the
+/// frozen table (fell back to size-based routing). ~0 on a model-loaded run
+/// proves the model's keys matched this process's call sites — the
+/// end-to-end check that hashes are stable across runs (ASLR-normalized).
+#[no_mangle]
+pub extern "C" fn lohalloc_pht_misses() -> u64 {
+    Lohalloc::pht_miss_count()
 }
 
 /// Load a `.lohalloc` model file, starting the process-wide allocator

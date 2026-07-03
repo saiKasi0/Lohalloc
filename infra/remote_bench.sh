@@ -32,16 +32,21 @@ if ! command -v hyperfine >/dev/null 2>&1; then
     cargo install hyperfine --locked
 fi
 
+# One timestamped run directory shared across every step (each `make` call
+# below would otherwise mint its own $(RUN_DIR) and fragment the results).
+RUN_DIR="results/$(date +%Y%m%dT%H%M%S)"
+echo "== Run directory: $RUN_DIR =="
+
 echo "== Running Rust criterion + latency_profile suite =="
-make bench
+make bench RUN_DIR="$RUN_DIR"
 
 echo "== Running native (LD_PRELOAD) cross-allocator timing suite =="
-make bench-native-host
+make bench-native-host RUN_DIR="$RUN_DIR"
 
 echo "== Running native cachegrind cache-miss suite =="
-make bench-cache-host
+make bench-cache-host RUN_DIR="$RUN_DIR"
 
 echo "== Aggregating =="
-make bench-report
+make bench-report RUN_DIR="$RUN_DIR"
 
-echo "Done. results/ is ready for retrieval (scp)."
+echo "Done. $RUN_DIR is ready for retrieval (scp)."

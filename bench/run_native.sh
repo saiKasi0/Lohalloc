@@ -26,15 +26,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 NATIVE_DIR="$SCRIPT_DIR/native"
 RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/results}"
-# Raw per-invocation JSON is staged in results/raw/; `aggregate` later moves a
-# whole batch into a timestamped run dir (results/<timestamp>/raw/) alongside
-# the report and graphs. Keeping producers pointed at a fixed staging dir is
-# what lets separate make invocations (timing, cachegrind, rust latency) all
-# feed the same consolidation step.
+# Where each per-invocation JSON is written. The Makefile passes RAW_DIR as
+# results/<timestamp>/raw so producers write straight into the final run dir
+# (the aggregator then reads it in place — no staging, no move). The default
+# below is only for a bare `bash run_native.sh` with no RAW_DIR set.
 RAW_DIR="${RAW_DIR:-$RESULTS_DIR/raw}"
 # Cachegrind simulates every memory access in software (~20-50x slower than
 # native execution), so its pass uses a much smaller op count by default.
 OPS="${OPS:-$([ "$CACHEGRIND" = 1 ] && echo 2000 || echo 50000)}"
+
+# Trained .lohalloc models live in a temp dir OUTSIDE the run dir so they are
+# never mistaken for result JSON by the aggregator. One model per
+# (lang, workload): module-base-normalized hashes make a model stable
+# across processes *of the same binary*, not across binaries.
+MODEL_DIR="$(mktemp -d)"
+trap 'rm -rf "$MODEL_DIR"' EXIT
 
 mkdir -p "$RAW_DIR"
 
@@ -64,6 +70,22 @@ if [ ! -f "$CABI_LIB" ]; then
     echo "Building lohalloc-cabi (release)..."
     (cd "$REPO_ROOT" && cargo build -p lohalloc-cabi --release >/dev/null)
 fi
+
+# Rust picks its allocator at build time (#[global_allocator] via the
+# mutually-exclusive alloc-* features), not via LD_PRELOAD — so there is one
+# binary per allocator. cargo reuses the same bin name across feature sets,
+# hence the copy-out to distinct names. Built here only if missing
+# (docker/Dockerfile.bench and `make bench-native-host` pre-build them).
+RUST_ALLOCATORS=(system lohalloc jemalloc mimalloc)
+for feat in "${RUST_ALLOCATORS[@]}"; do
+    bin="$NATIVE_DIR/build/native_workload_$feat"
+    if [ ! -x "$bin" ]; then
+        echo "Building native_workload (alloc-$feat)..."
+        (cd "$REPO_ROOT" && cargo build -p lohalloc-bench --bin native_workload --release --features "alloc-$feat" >/dev/null)
+        mkdir -p "$NATIVE_DIR/build"
+        cp "$REPO_ROOT/target/release/native_workload" "$bin"
+    fi
+done
 
 # Allocator name -> preload path (empty = system default). True symbol
 # interposition (LD_PRELOAD) only works on Linux — DYLD_INSERT_LIBRARIES on
@@ -101,8 +123,17 @@ run_timing() {
     # (verified: hyperfine spawned zero child processes for 8+ minutes).
     # hyperfine's default shell wrapper applies env assignments in the
     # command string only to that one child invocation.
+    # --warmup 8 (not hyperfine's more typical 2): a freshly started
+    # container's first several mmap-heavy process launches pay a VM-level
+    # memory-subsystem warm-up cost specific to a given allocation-size
+    # pattern — reproduced directly: the buddy workload's first ~5 process
+    # launches after `docker run` took 1.6-1.8s each before settling to a
+    # steady ~115-135ms from the 6th launch on (same binary, same model,
+    # no code involved — a Docker Desktop VM artifact, not an allocator
+    # regression). 2 warmup runs left that cold-start inside the 10 measured
+    # runs and inflated the reported mean by ~10x on that one row.
     hyperfine \
-        --warmup 2 \
+        --warmup 8 \
         --min-runs 10 \
         --export-json "$out" \
         "env $extra_env $PRELOAD_VAR=$preload $binary $workload $OPS" >/dev/null
@@ -167,6 +198,41 @@ run_one() {
     fi
 }
 
+# Ops for the untimed training run. Decoupled from the measured OPS so the
+# freeze threshold is always reached: the sparsest workload (`system`) does
+# only ops/20 allocations, so at the cachegrind OPS (2000) it would allocate
+# just 100 times and never cross FREEZE_AFTER=1000 — the export would fail
+# and abort the whole matrix. Training is untimed, so a fixed large count
+# here costs nothing and guarantees every workload freezes (system does
+# TRAIN_OPS/20 = 2500 >> 1000).
+TRAIN_OPS="${TRAIN_OPS:-50000}"
+TRAIN_FREEZE_AFTER="${TRAIN_FREEZE_AFTER:-1000}"
+
+# The lohalloc pre/post-training triple, shared by every language:
+#   1. "training" (timed)     — the whole run learns online.
+#   2. train+export (UNTIMED) — freeze after TRAIN_FREEZE_AFTER allocs, export
+#      the model. Earlier versions instead ran "inference" as
+#      LOHALLOC_FREEZE_AFTER inside every timed invocation — but hyperfine
+#      spawns a fresh process per run, so that *retrained from scratch every
+#      time* and never actually measured post-training behavior.
+#   3. "inference" (timed)    — every run loads the pre-trained model at
+#      startup: pure frozen-path routing, zero training ops. Requires
+#      ASLR-stable (module-relative) stack hashes; verify with
+#      lohalloc_pht_misses() ~ 0 (LOHALLOC_DEBUG=1 prints it).
+run_lohalloc_triple() {
+    local lang="$1" binary="$2" workload="$3" preload="$4"
+    run_one "$lang" "$binary" "$workload" "lohalloc" "$preload" "training" ""
+    local model="$MODEL_DIR/model-${lang}-${workload}.lohalloc"
+    echo "==> [train+export] $lang/$workload -> $model (train ops=$TRAIN_OPS)"
+    env LOHALLOC_FREEZE_AFTER="$TRAIN_FREEZE_AFTER" LOHALLOC_EXPORT_MODEL="$model" \
+        "$PRELOAD_VAR=$preload" "$binary" "$workload" "$TRAIN_OPS" >/dev/null
+    if [ ! -f "$model" ]; then
+        echo "FATAL: model export failed for $lang/$workload" >&2
+        exit 1
+    fi
+    run_one "$lang" "$binary" "$workload" "lohalloc" "$preload" "inference" "LOHALLOC_MODEL=$model"
+}
+
 for lang_binary in "c:$NATIVE_DIR/build/bench_main_c:${C_WORKLOADS[*]}" "cpp:$NATIVE_DIR/build/bench_main_cpp:${CPP_WORKLOADS[*]}"; do
     IFS=: read -r lang binary workloads_str <<<"$lang_binary"
     read -r -a workloads <<<"$workloads_str"
@@ -174,8 +240,7 @@ for lang_binary in "c:$NATIVE_DIR/build/bench_main_c:${C_WORKLOADS[*]}" "cpp:$NA
         preload="${ALLOCATORS[$allocator]}"
         for workload in "${workloads[@]}"; do
             if [ "$allocator" = "lohalloc" ]; then
-                run_one "$lang" "$binary" "$workload" "$allocator" "$preload" "training" ""
-                run_one "$lang" "$binary" "$workload" "$allocator" "$preload" "inference" "LOHALLOC_FREEZE_AFTER=1000"
+                run_lohalloc_triple "$lang" "$binary" "$workload" "$preload"
             else
                 run_one "$lang" "$binary" "$workload" "$allocator" "$preload" "baseline" ""
             fi
@@ -183,4 +248,23 @@ for lang_binary in "c:$NATIVE_DIR/build/bench_main_c:${C_WORKLOADS[*]}" "cpp:$NA
     done
 done
 
-echo "Raw results staged in $RAW_DIR (run 'make bench-report' to consolidate into results/<timestamp>/)"
+# ---- Rust: allocator chosen at build time, no preload -----------------------
+# One binary per allocator (native_workload_<alloc>), so these rows run
+# meaningfully on macOS too — nothing here depends on LD_PRELOAD.
+RUST_WORKLOADS=(slab arena buddy system adv-mixed)
+for allocator in "${RUST_ALLOCATORS[@]}"; do
+    binary="$NATIVE_DIR/build/native_workload_$allocator"
+    if [ ! -x "$binary" ]; then
+        echo "NOTE: $binary missing — skipping rust/$allocator rows" >&2
+        continue
+    fi
+    for workload in "${RUST_WORKLOADS[@]}"; do
+        if [ "$allocator" = "lohalloc" ]; then
+            run_lohalloc_triple "rust" "$binary" "$workload" ""
+        else
+            run_one "rust" "$binary" "$workload" "$allocator" "" "baseline" ""
+        fi
+    done
+done
+
+echo "Raw results written to $RAW_DIR (run 'make bench-report RUN_DIR=$(dirname "$RAW_DIR")' to build the report + graphs)"

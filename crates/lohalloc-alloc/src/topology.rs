@@ -22,15 +22,306 @@
 //! System/Buddy fallback — never a segfault. This catches pre-compiled
 //! `.so` files built without frame pointers.
 //!
-//! # `#![no_std]` Compatibility
+//! # ASLR-stable hashing (module-base PC normalization)
 //!
-//! This module uses only `core` features (`core::arch::asm!`, integer math).
-//! No `Vec`, `String`, or heap allocations on the hot path.
+//! Raw return addresses are absolute virtual addresses, which shift every
+//! run under ASLR/PIE — a hash folded from them identifies a call site only
+//! within one process lifetime, making exported `.lohalloc` models useless
+//! in any later process. Before mixing, each collected PC is therefore
+//! normalized to `module_ident ^ (pc - module_base)`: a lazily-built,
+//! fixed-capacity table of loaded-module ranges (Linux: `dl_iterate_phdr`;
+//! macOS: dyld image APIs) is binary-searched per PC, and the module's
+//! identity is an FNV-1a hash of its basename — stable across runs and
+//! independent of load order. PCs outside every known module (JIT pages,
+//! vdso, or beyond the 64-module cap) fall back to the raw address:
+//! correctness is unaffected, those sites just degrade to per-run hashes.
+//! Models remain per-binary/per-architecture — offsets are only meaningful
+//! against the same module contents.
+//!
+//! # Hot-path cost & allocation discipline
+//!
+//! The stack walk + hash itself uses only `core` features (inline asm,
+//! integer math) and makes no heap allocations. The module table adds one
+//! `OnceLock` acquire-load plus, per PC, a ~6-level binary search over
+//! ≤64 entries. Table construction runs at most once, is allocation-free
+//! (`dl_iterate_phdr` fills a fixed array via callback; the dyld APIs are
+//! straight reads of mapped memory), and any incidental allocation would
+//! anyway hit the caller's `IN_ALLOC` bypass since `fast_stack_hash` runs
+//! inside `alloc`'s re-entrancy guard. Caveat (documented, accepted):
+//! `dl_iterate_phdr` takes the loader lock, so a first-ever malloc racing a
+//! concurrent `dlopen` on another thread could in theory contend; the
+//! escape hatch would be eager init from an `.init_array` constructor.
+
+use std::sync::OnceLock;
 
 /// Sentinel hash returned when the frame pointer fails the heuristic guard
 /// or when no valid instruction pointers could be collected. Routes to the
 /// System/Buddy fallback.
 pub const SENTINEL_HASH: u64 = 0;
+
+// ---------------------------------------------------------------------------
+// Module table: loaded-image ranges for ASLR-stable PC normalization.
+// ---------------------------------------------------------------------------
+
+/// Fixed capacity of the module table — allocation-free by construction.
+/// Typical benchmark/server processes load well under 64 images; anything
+/// past the cap silently degrades to raw (per-run) PCs.
+const MAX_MODULES: usize = 64;
+
+/// One loaded module's address range plus a load-order-independent identity.
+#[derive(Clone, Copy)]
+struct ModuleRange {
+    /// Lowest mapped address of the module's PT_LOAD/segment span.
+    base: usize,
+    /// One past the highest mapped address.
+    end: usize,
+    /// FNV-1a hash of the module path's basename (`""` for the main
+    /// executable on Linux — a fixed, documented identity). Stable across
+    /// runs and across load-order changes, unlike the base address.
+    ident: u64,
+}
+
+const EMPTY_RANGE: ModuleRange = ModuleRange {
+    base: 0,
+    end: 0,
+    ident: 0,
+};
+
+/// Fixed-capacity, sorted-by-base table of loaded modules (~1.5 KiB).
+struct ModuleTable {
+    entries: [ModuleRange; MAX_MODULES],
+    len: usize,
+}
+
+impl ModuleTable {
+    fn entries(&self) -> &[ModuleRange] {
+        &self.entries[..self.len]
+    }
+
+    /// In-place insertion sort by base — allocation-free, runs once at
+    /// table build over ≤64 entries.
+    fn sort(&mut self) {
+        for i in 1..self.len {
+            let mut j = i;
+            while j > 0 && self.entries[j - 1].base > self.entries[j].base {
+                self.entries.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+    }
+}
+
+static MODULE_TABLE: OnceLock<ModuleTable> = OnceLock::new();
+
+/// The process's module table, built lazily on first use. Construction is
+/// allocation-free; see the module doc for the loader-lock caveat.
+fn module_table() -> &'static ModuleTable {
+    MODULE_TABLE.get_or_init(build_module_table)
+}
+
+/// FNV-1a over the basename of a nul-terminated C path string. The empty
+/// string hashes to the FNV offset basis — the fixed identity used for the
+/// main executable on Linux (its `dlpi_name` is `""`).
+///
+/// # Safety
+/// `path` must be null or point to a nul-terminated C string.
+unsafe fn fnv1a_basename(path: *const core::ffi::c_char) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    if path.is_null() {
+        return FNV_OFFSET;
+    }
+    // Find the byte after the last '/', then hash to the nul.
+    let mut start = path;
+    let mut p = path;
+    unsafe {
+        while *p != 0 {
+            if *p as u8 == b'/' {
+                start = p.add(1);
+            }
+            p = p.add(1);
+        }
+        let mut hash = FNV_OFFSET;
+        let mut q = start;
+        while *q != 0 {
+            hash ^= *q as u8 as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+            q = q.add(1);
+        }
+        hash
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn build_module_table() -> ModuleTable {
+    unsafe extern "C" fn callback(
+        info: *mut libc::dl_phdr_info,
+        _size: libc::size_t,
+        data: *mut core::ffi::c_void,
+    ) -> core::ffi::c_int {
+        // SAFETY: `data` is the &mut ModuleTable we passed below; `info` is
+        // valid for the duration of the callback per dl_iterate_phdr's
+        // contract.
+        let table = unsafe { &mut *(data as *mut ModuleTable) };
+        if table.len >= MAX_MODULES {
+            return 0; // cap reached: remaining modules degrade to raw PCs
+        }
+        let info = unsafe { &*info };
+        let phdrs =
+            unsafe { core::slice::from_raw_parts(info.dlpi_phdr, info.dlpi_phnum as usize) };
+        let mut lo = usize::MAX;
+        let mut hi = 0usize;
+        for ph in phdrs {
+            if ph.p_type == libc::PT_LOAD {
+                let start = info.dlpi_addr as usize + ph.p_vaddr as usize;
+                let end = start + ph.p_memsz as usize;
+                lo = lo.min(start);
+                hi = hi.max(end);
+            }
+        }
+        if lo < hi {
+            let ident = unsafe { fnv1a_basename(info.dlpi_name) };
+            table.entries[table.len] = ModuleRange {
+                base: lo,
+                end: hi,
+                ident,
+            };
+            table.len += 1;
+        }
+        0
+    }
+
+    let mut table = ModuleTable {
+        entries: [EMPTY_RANGE; MAX_MODULES],
+        len: 0,
+    };
+    unsafe {
+        libc::dl_iterate_phdr(
+            Some(callback),
+            &mut table as *mut ModuleTable as *mut core::ffi::c_void,
+        );
+    }
+    table.sort();
+    table
+}
+
+#[cfg(target_os = "macos")]
+fn build_module_table() -> ModuleTable {
+    use core::ffi::{c_char, c_uint};
+
+    // Raw dyld APIs — all straight reads of already-mapped memory, no
+    // allocation. Declared here rather than via the libc crate to avoid
+    // depending on which of them libc happens to expose.
+    extern "C" {
+        fn _dyld_image_count() -> c_uint;
+        fn _dyld_get_image_header(image_index: c_uint) -> *const MachHeader64;
+        fn _dyld_get_image_vmaddr_slide(image_index: c_uint) -> isize;
+        fn _dyld_get_image_name(image_index: c_uint) -> *const c_char;
+    }
+
+    #[repr(C)]
+    struct MachHeader64 {
+        magic: u32,
+        cputype: i32,
+        cpusubtype: i32,
+        filetype: u32,
+        ncmds: u32,
+        sizeofcmds: u32,
+        flags: u32,
+        reserved: u32,
+    }
+
+    #[repr(C)]
+    struct SegmentCommand64 {
+        cmd: u32,
+        cmdsize: u32,
+        segname: [u8; 16],
+        vmaddr: u64,
+        vmsize: u64,
+        fileoff: u64,
+        filesize: u64,
+        maxprot: i32,
+        initprot: i32,
+        nsects: u32,
+        flags: u32,
+    }
+
+    const LC_SEGMENT_64: u32 = 0x19;
+
+    let mut table = ModuleTable {
+        entries: [EMPTY_RANGE; MAX_MODULES],
+        len: 0,
+    };
+
+    unsafe {
+        let count = _dyld_image_count();
+        for i in 0..count {
+            if table.len >= MAX_MODULES {
+                break;
+            }
+            let header = _dyld_get_image_header(i);
+            if header.is_null() {
+                continue;
+            }
+            let slide = _dyld_get_image_vmaddr_slide(i) as usize;
+            // Walk the load commands directly after the 64-bit mach header.
+            let mut cmd_ptr = (header as *const u8).add(core::mem::size_of::<MachHeader64>());
+            let mut lo = usize::MAX;
+            let mut hi = 0usize;
+            for _ in 0..(*header).ncmds {
+                let cmd = &*(cmd_ptr as *const SegmentCommand64);
+                if cmd.cmd == LC_SEGMENT_64 && cmd.initprot != 0 && cmd.vmsize > 0 {
+                    // initprot == 0 filters out __PAGEZERO, whose 4 GiB
+                    // span would swallow every low address.
+                    let start = cmd.vmaddr as usize + slide;
+                    let end = start + cmd.vmsize as usize;
+                    lo = lo.min(start);
+                    hi = hi.max(end);
+                }
+                cmd_ptr = cmd_ptr.add(cmd.cmdsize as usize);
+            }
+            if lo < hi {
+                let ident = fnv1a_basename(_dyld_get_image_name(i));
+                table.entries[table.len] = ModuleRange {
+                    base: lo,
+                    end: hi,
+                    ident,
+                };
+                table.len += 1;
+            }
+        }
+    }
+    table.sort();
+    table
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn build_module_table() -> ModuleTable {
+    // Unknown platform: empty table → every PC passes through raw
+    // (per-run hashes, exactly the pre-normalization behavior).
+    ModuleTable {
+        entries: [EMPTY_RANGE; MAX_MODULES],
+        len: 0,
+    }
+}
+
+/// Normalize one PC against a sorted module table:
+/// `module_ident ^ (pc - module_base)` when the PC falls inside a known
+/// module, raw passthrough otherwise. Same (module, offset) → same value in
+/// every run regardless of where ASLR placed the module.
+#[inline]
+fn normalize_pc_with(pc: u64, entries: &[ModuleRange]) -> u64 {
+    let addr = pc as usize;
+    // Last entry with base <= addr (entries are sorted by base).
+    let idx = entries.partition_point(|m| m.base <= addr);
+    if idx > 0 {
+        let m = &entries[idx - 1];
+        if addr < m.end {
+            return m.ident ^ (addr - m.base) as u64;
+        }
+    }
+    pc
+}
 
 /// Maximum number of frames to walk.
 const NUM_FRAMES: usize = 3;
@@ -65,6 +356,9 @@ pub fn fast_stack_hash() -> u64 {
         return SENTINEL_HASH;
     }
 
+    // One OnceLock acquire-load per call after first init; see module doc.
+    let modules = module_table().entries();
+
     let mut ips: [u64; NUM_FRAMES] = [0; NUM_FRAMES];
     let mut current_fp = fp;
     let mut collected = 0usize;
@@ -84,7 +378,9 @@ pub fn fast_stack_hash() -> u64 {
             break;
         }
 
-        *ips_slot = return_addr as u64;
+        // ASLR-stable: hash the (module identity, offset) form of the PC,
+        // not its absolute (per-run) virtual address.
+        *ips_slot = normalize_pc_with(return_addr as u64, modules);
         collected += 1;
 
         if next_fp == 0 || next_fp == current_fp {
@@ -305,5 +601,100 @@ mod tests {
     #[test]
     fn sentinel_hash_is_zero() {
         assert_eq!(SENTINEL_HASH, 0);
+    }
+
+    // ---- PC normalization (ASLR stability) --------------------------------
+
+    fn fake_table(bases: &[(usize, usize, u64)]) -> Vec<ModuleRange> {
+        let mut v: Vec<ModuleRange> = bases
+            .iter()
+            .map(|&(base, end, ident)| ModuleRange { base, end, ident })
+            .collect();
+        v.sort_by_key(|m| m.base);
+        v
+    }
+
+    #[test]
+    fn normalize_same_offset_different_bases_identical() {
+        // The ASLR property: the same module (same ident) loaded at two
+        // different bases yields the same normalized value for the same
+        // in-module offset.
+        let ident = 0xABCD_EF01_2345_6789u64;
+        let run_a = fake_table(&[(0x5555_0000_0000, 0x5555_0010_0000, ident)]);
+        let run_b = fake_table(&[(0x7FFF_0000_0000, 0x7FFF_0010_0000, ident)]);
+        let offset = 0x4_2000u64;
+        let pc_a = 0x5555_0000_0000u64 + offset;
+        let pc_b = 0x7FFF_0000_0000u64 + offset;
+        assert_eq!(
+            normalize_pc_with(pc_a, &run_a),
+            normalize_pc_with(pc_b, &run_b),
+            "same (module, offset) must normalize identically across bases"
+        );
+    }
+
+    #[test]
+    fn normalize_different_modules_differ() {
+        // Same offset in two *different* modules must not collide (their
+        // idents differ).
+        let table = fake_table(&[
+            (0x1000_0000, 0x2000_0000, 0x1111),
+            (0x3000_0000, 0x4000_0000, 0x2222),
+        ]);
+        let a = normalize_pc_with(0x1000_4000, &table);
+        let b = normalize_pc_with(0x3000_4000, &table);
+        assert_ne!(a, b, "different modules at same offset must differ");
+    }
+
+    #[test]
+    fn normalize_outside_all_modules_passes_through() {
+        let table = fake_table(&[(0x1000_0000, 0x2000_0000, 0x1111)]);
+        // Below the first module, in a gap, and with an empty table.
+        assert_eq!(normalize_pc_with(0x0FFF_FFFF, &table), 0x0FFF_FFFF);
+        assert_eq!(normalize_pc_with(0x2000_0000, &table), 0x2000_0000);
+        assert_eq!(normalize_pc_with(0xDEAD_BEEF, &[]), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn normalize_picks_containing_module_among_many() {
+        let table = fake_table(&[
+            (0x1000, 0x2000, 0xA),
+            (0x2000, 0x3000, 0xB),
+            (0x5000, 0x6000, 0xC),
+        ]);
+        assert_eq!(normalize_pc_with(0x2800, &table), 0xB ^ 0x800);
+        assert_eq!(normalize_pc_with(0x5000, &table), 0xC); // offset 0
+        assert_eq!(normalize_pc_with(0x4000, &table), 0x4000); // gap
+    }
+
+    #[test]
+    fn real_module_table_covers_our_own_code() {
+        // The running test binary's code must be inside some module range,
+        // so PCs from our own frames get normalized (not passed through).
+        let table = module_table();
+        assert!(
+            table.len > 0,
+            "module table should see at least the test binary"
+        );
+        let our_pc = real_module_table_covers_our_own_code as fn() as usize as u64;
+        let normalized = normalize_pc_with(our_pc, table.entries());
+        assert_ne!(
+            normalized, our_pc,
+            "a PC inside our own binary must be module-normalized"
+        );
+    }
+
+    #[test]
+    fn fnv_basename_ignores_directories() {
+        // Nul-terminated byte strings (not c"" literals — those would bump
+        // the workspace MSRV past its declared 1.74).
+        let a = b"/usr/lib/libfoo.so\0".as_ptr() as *const core::ffi::c_char;
+        let b = b"/opt/other/path/libfoo.so\0".as_ptr() as *const core::ffi::c_char;
+        let bare = b"libfoo.so\0".as_ptr() as *const core::ffi::c_char;
+        let other = b"libbar.so\0".as_ptr() as *const core::ffi::c_char;
+        unsafe {
+            assert_eq!(fnv1a_basename(a), fnv1a_basename(b));
+            assert_eq!(fnv1a_basename(a), fnv1a_basename(bare));
+            assert_ne!(fnv1a_basename(a), fnv1a_basename(other));
+        }
     }
 }

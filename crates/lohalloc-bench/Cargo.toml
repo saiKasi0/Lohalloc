@@ -53,3 +53,10 @@ path = "src/bin/latency_profile.rs"
 [[bin]]
 name = "aggregate"
 path = "src/bin/aggregate.rs"
+
+# Rust entry in the native cross-allocator matrix: same CLI as
+# bench/native/bench_main.c, allocator chosen at build time via the alloc-*
+# features (built once per feature by bench/run_native.sh — see the bin's doc).
+[[bin]]
+name = "native_workload"
+path = "src/bin/native_workload.rs"
