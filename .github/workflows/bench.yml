@@ -1,0 +1,124 @@
+name: Phase 6 Hybrid-Cloud Benchmark
+
+# Manual dispatch only — each run provisions 2 dedicated EC2 instances for
+# ~45-60 minutes (~$0.20/run) and needs AWS credentials in CI, so it never
+# runs automatically on push/PR. Trigger from the Actions tab.
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_allowed_cidr:
+        description: "CIDR allowed to SSH into the benchmark instances (defaults to open; tighten if you know the runner's egress IP)"
+        required: false
+        default: "0.0.0.0/0"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: Provision, benchmark, teardown
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.BENCH_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.BENCH_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Generate ephemeral SSH keypair
+        run: |
+          ssh-keygen -t ed25519 -f "$RUNNER_TEMP/bench_key" -N "" -C "lohalloc-bench-ci"
+          echo "SSH_KEY_PATH=$RUNNER_TEMP/bench_key" >> "$GITHUB_ENV"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.5"
+
+      - name: Terraform init
+        working-directory: infra
+        run: terraform init
+
+      - name: Terraform apply
+        working-directory: infra
+        run: |
+          terraform apply -auto-approve \
+            -var="ssh_public_key=$(cat "$SSH_KEY_PATH.pub")" \
+            -var="ssh_allowed_cidr=${{ inputs.ssh_allowed_cidr }}"
+
+      - name: Capture instance IPs
+        working-directory: infra
+        run: |
+          echo "X86_IP=$(terraform output -raw x86_64_public_ip)" >> "$GITHUB_ENV"
+          echo "ARM_IP=$(terraform output -raw arm64_public_ip)" >> "$GITHUB_ENV"
+
+      - name: Wait for SSH on both instances
+        run: |
+          for ip in "$X86_IP" "$ARM_IP"; do
+            echo "waiting for ssh on $ip..."
+            for i in $(seq 1 30); do
+              if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                     -i "$SSH_KEY_PATH" "ubuntu@$ip" true 2>/dev/null; then
+                echo "$ip is up"
+                break
+              fi
+              [ "$i" -eq 30 ] && { echo "timed out waiting for $ip"; exit 1; }
+              sleep 10
+            done
+          done
+
+      - name: Sync repo to both instances
+        run: |
+          for ip in "$X86_IP" "$ARM_IP"; do
+            ssh -o StrictHostKeyChecking=no -i "$SSH_KEY_PATH" "ubuntu@$ip" \
+              "mkdir -p ~/lohalloc"
+            rsync -az -e "ssh -o StrictHostKeyChecking=no -i $SSH_KEY_PATH" \
+              --exclude target --exclude node_modules --exclude .git \
+              --exclude bench/native/build --exclude results \
+              ./ "ubuntu@$ip:~/lohalloc/"
+          done
+
+      - name: Run benchmark suite on both architectures (parallel)
+        run: |
+          ssh -o StrictHostKeyChecking=no -i "$SSH_KEY_PATH" "ubuntu@$X86_IP" \
+            "cd ~/lohalloc && bash infra/remote_bench.sh" &
+          x86_pid=$!
+          ssh -o StrictHostKeyChecking=no -i "$SSH_KEY_PATH" "ubuntu@$ARM_IP" \
+            "cd ~/lohalloc && bash infra/remote_bench.sh" &
+          arm_pid=$!
+          wait "$x86_pid" && wait "$arm_pid"
+
+      - name: Retrieve results
+        run: |
+          mkdir -p results/x86_64 results/arm64
+          rsync -az -e "ssh -o StrictHostKeyChecking=no -i $SSH_KEY_PATH" \
+            "ubuntu@$X86_IP:~/lohalloc/results/" results/x86_64/
+          rsync -az -e "ssh -o StrictHostKeyChecking=no -i $SSH_KEY_PATH" \
+            "ubuntu@$ARM_IP:~/lohalloc/results/" results/arm64/
+
+      - name: Merge and evaluate regression gate
+        run: |
+          mkdir -p results/merged
+          cp results/x86_64/*.json results/arm64/*.json results/merged/ 2>/dev/null || true
+          cargo run -p lohalloc-bench --bin aggregate --release -- --results-dir results/merged
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: results/
+          retention-days: 30
+
+      - name: Terraform destroy
+        if: always()
+        working-directory: infra
+        run: |
+          terraform destroy -auto-approve \
+            -var="ssh_public_key=$(cat "$SSH_KEY_PATH.pub" 2>/dev/null || echo placeholder)" \
+            -var="ssh_allowed_cidr=${{ inputs.ssh_allowed_cidr || '0.0.0.0/0' }}"

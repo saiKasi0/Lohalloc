@@ -29,10 +29,21 @@
 //!
 //! # Determinism
 //!
-//! Feeding the same trace twice (from the same fresh allocator state) produces
-//! identical routing decisions — the MAB's UCB1 formula is deterministic
-//! given the same reward sequence, and `freeze()` collapses weights
-//! deterministically.
+//! Feeding the same trace twice (from the same fresh allocator state)
+//! produces *structurally* identical models: the same set of observed
+//! Signatures, the same op count, a validly-frozen table each time. It does
+//! **not** guarantee byte-identical `.lohalloc` output (Phase 6 changed
+//! this): the bandit's reward now comes from real measured alloc/dealloc
+//! latency (`lohalloc_alloc::state::record_latency`), and replay drives the
+//! same real backends the live allocator does — so run-to-run timing jitter
+//! (scheduler noise, cache state, mmap variance) can occasionally flip which
+//! backend wins a Signature where two backends perform near-identically.
+//! This is the same tradeoff real-latency learning makes everywhere else;
+//! replay is not a special case. Before Phase 6, rewards were a static
+//! per-backend baseline, so replay's output genuinely was bit-for-bit
+//! reproducible — that guarantee traded away real performance signal for
+//! reproducibility, which no longer matches what the rest of the system
+//! measures.
 //!
 //! # Private Allocator
 //!
@@ -537,8 +548,20 @@ mod tests {
         ]"#;
         let r1 = replay_trace_json(json, None).unwrap();
         let r2 = replay_trace_json(json, None).unwrap();
-        // Same trace → same frozen model (deterministic MAB + freeze).
-        assert_eq!(r1.lohalloc_bytes, r2.lohalloc_bytes);
+        // Same trace → structurally identical models (same Signatures
+        // observed, same op count). Not byte-identical: rewards now come
+        // from real measured latency (Phase 6), so run-to-run timing jitter
+        // can occasionally flip which backend wins a near-tied Signature —
+        // see the module doc's "Determinism" section.
+        let t1 = lohalloc_alloc::perfect_hash::PerfectHashTable::deserialize(&r1.lohalloc_bytes)
+            .expect("r1 model should deserialize");
+        let t2 = lohalloc_alloc::perfect_hash::PerfectHashTable::deserialize(&r2.lohalloc_bytes)
+            .expect("r2 model should deserialize");
+        assert_eq!(
+            t1.len(),
+            t2.len(),
+            "same trace should observe the same Signature count"
+        );
         assert_eq!(r1.ops_executed, r2.ops_executed);
     }
 

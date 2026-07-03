@@ -1,0 +1,55 @@
+[package]
+name = "lohalloc-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Phase 6 hypothesis-validation benchmarks: backend-favorable workloads, forced-routing and trained-routing validation, and cross-allocator comparison."
+publish = false
+
+[dependencies]
+lohalloc-core.workspace = true
+lohalloc-alloc = { workspace = true, features = ["telemetry-observer"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hdrhistogram = "7"
+libc = "0.2"
+
+# Mutually-exclusive global-allocator choices for the `comparison` bench
+# binary (see src/global_alloc.rs). Not used by default — the default build
+# leaves the process on the platform allocator.
+tikv-jemallocator = { version = "0.7", optional = true }
+mimalloc = { version = "0.1", optional = true, default-features = false }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[features]
+alloc-system = []
+alloc-lohalloc = []
+alloc-jemalloc = ["dep:tikv-jemallocator"]
+alloc-mimalloc = ["dep:mimalloc"]
+
+[[bench]]
+name = "backend_micro"
+harness = false
+
+[[bench]]
+name = "hypothesis"
+harness = false
+
+[[bench]]
+name = "inference_overhead"
+harness = false
+
+[[bench]]
+name = "comparison"
+harness = false
+
+[[bin]]
+name = "latency_profile"
+path = "src/bin/latency_profile.rs"
+
+[[bin]]
+name = "aggregate"
+path = "src/bin/aggregate.rs"

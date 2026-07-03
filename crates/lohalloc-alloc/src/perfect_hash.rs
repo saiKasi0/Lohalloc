@@ -35,19 +35,32 @@
 //!
 //! ```text
 //! [8 bytes]  magic:     0x434f4c4c41484f4c  (LE bytes spell "LOHALLOC")
-//! [4 bytes]  version:   u32 (1)
+//! [4 bytes]  version:   u32 (2)
 //! [4 bytes]  entry_count: u32
-//! [N × 12]   entries:   (hash: u64 le, backend: u8, _pad: [u8; 3])
+//! [N × 12]   entries:   (hash: u64 le, backend: u8, size_class: u8, _pad: [u8; 2])
 //! [8 bytes]  checksum:  XOR of all hash values
 //! ```
 //!
+//! **v2** (Phase 6): `hash` is `state::combine_hash_size_class(caller_pc,
+//! size_class)`, not the raw call-site hash — v1 keyed the frozen table on
+//! `caller_pc` alone, so two Signatures sharing a call site but trained at
+//! different size classes silently clobbered each other into one ambiguous
+//! entry. `size_class` is carried alongside purely for introspection/GUI
+//! display (`lookup()` only ever compares the full `hash`, never
+//! `size_class`); it is **not** recoverable from `hash` alone; the mix in
+//! `combine_hash_size_class` is one-way by design. The version bump exists
+//! specifically so a v1 file is rejected outright (`deserialize` returns
+//! `None`) rather than silently loaded and never matching any lookup — v1's
+//! keys are raw call-site hashes, which essentially never equal a v2
+//! `combine_hash_size_class` output.
+//!
 //! The MPHF metadata (seeds) is deliberately **not** serialized: entries are
 //! written sorted by hash (deterministic output) and the hash structure is
-//! rebuilt at `deserialize()` time, keeping the v1 wire format unchanged for
+//! rebuilt at `deserialize()` time, keeping the wire format stable for
 //! external parsers (e.g. the server's `decode_routing_entries`).
 //!
-//! `deserialize` validates the magic header and checksum. Malformed data
-//! returns `None`, not a panic.
+//! `deserialize` validates the magic header, version, and checksum.
+//! Malformed data returns `None`, not a panic.
 
 use lohalloc_core::Backend;
 
@@ -55,15 +68,20 @@ use lohalloc_core::Backend;
 /// "LOHALLOC".
 const MAGIC: u64 = 0x434f4c4c41484f4c;
 
-/// Current serialization format version.
-const VERSION: u32 = 1;
+/// Current serialization format version. Bumped to 2 in Phase 6: `hash` is
+/// now `combine_hash_size_class(caller_pc, size_class)` rather than a raw
+/// call-site hash — see the module doc's "Serialization" section.
+const VERSION: u32 = 2;
 
-/// One routing entry: a topological hash mapped to the backend that won the
-/// bandit's training for that signature.
+/// One routing entry: a combined `(hash, size_class)` key
+/// (`state::combine_hash_size_class`) mapped to the backend that won the
+/// bandit's training for that signature. `size_class` is carried alongside
+/// the key for introspection/display only — lookups compare `hash` alone.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Entry {
     hash: u64,
     backend: Backend,
+    size_class: u8,
 }
 
 /// Average keys per bucket in the primary CHD construction attempt.
@@ -109,14 +127,21 @@ pub struct PerfectHashTable {
 }
 
 impl PerfectHashTable {
-    /// Build a `PerfectHashTable` from `(hash, backend)` pairs.
+    /// Build a `PerfectHashTable` from `(hash, size_class, backend)`
+    /// triples. `hash` is expected to already be the combined
+    /// `state::combine_hash_size_class(caller_pc, size_class)` key;
+    /// `size_class` is carried along purely for introspection/display.
     ///
     /// Deduplicates first (last entry for a duplicate hash wins), then
     /// constructs the minimal perfect hash over the distinct keys.
-    pub fn from_entries(pairs: Vec<(u64, Backend)>) -> Self {
-        let mut entries: Vec<Entry> = pairs
+    pub fn from_entries(triples: Vec<(u64, u8, Backend)>) -> Self {
+        let mut entries: Vec<Entry> = triples
             .into_iter()
-            .map(|(hash, backend)| Entry { hash, backend })
+            .map(|(hash, size_class, backend)| Entry {
+                hash,
+                backend,
+                size_class,
+            })
             .collect();
 
         // Sort by hash — canonicalizes input so construction is
@@ -198,6 +223,7 @@ impl PerfectHashTable {
             Entry {
                 hash: 0,
                 backend: Backend::System,
+                size_class: 0,
             };
             n
         ];
@@ -269,9 +295,8 @@ impl PerfectHashTable {
     /// Serialize the routing table to a `.lohalloc` binary byte vector.
     ///
     /// Entries are written sorted by hash so the output is deterministic
-    /// (independent of which construction seed the MPHF landed on) and the
-    /// v1 wire format is preserved — MPHF metadata is rebuilt at
-    /// `deserialize()` time, never serialized.
+    /// (independent of which construction seed the MPHF landed on) — MPHF
+    /// metadata is rebuilt at `deserialize()` time, never serialized.
     pub fn serialize(&self) -> Vec<u8> {
         let mut entries = self.slots.clone();
         entries.sort_by_key(|e| e.hash);
@@ -292,7 +317,8 @@ impl PerfectHashTable {
         for entry in &entries {
             buf.extend_from_slice(&entry.hash.to_le_bytes());
             buf.push(entry.backend as u8);
-            buf.extend_from_slice(&[0u8; 3]); // padding
+            buf.push(entry.size_class);
+            buf.extend_from_slice(&[0u8; 2]); // padding
             checksum ^= entry.hash;
         }
 
@@ -345,7 +371,8 @@ impl PerfectHashTable {
             let hash = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
             pos += 8;
             let backend_byte = data[pos];
-            pos += 4; // backend(1) + padding(3)
+            let size_class = data[pos + 1];
+            pos += 4; // backend(1) + size_class(1) + padding(2)
 
             let backend = match backend_byte {
                 0 => Backend::Slab,
@@ -355,7 +382,11 @@ impl PerfectHashTable {
                 _ => return None,
             };
 
-            entries.push(Entry { hash, backend });
+            entries.push(Entry {
+                hash,
+                backend,
+                size_class,
+            });
             checksum ^= hash;
         }
 
@@ -365,10 +396,13 @@ impl PerfectHashTable {
             return None;
         }
 
-        // Rebuild the MPHF from the parsed pairs. Also re-applies last-wins
-        // dedup in case the file carries duplicate hashes.
+        // Rebuild the MPHF from the parsed triples. Also re-applies
+        // last-wins dedup in case the file carries duplicate hashes.
         Some(Self::from_entries(
-            entries.into_iter().map(|e| (e.hash, e.backend)).collect(),
+            entries
+                .into_iter()
+                .map(|e| (e.hash, e.size_class, e.backend))
+                .collect(),
         ))
     }
 }
@@ -381,8 +415,13 @@ impl PerfectHashTable {
 mod tests {
     use super::*;
 
+    /// Test helper: builds a table from plain `(hash, backend)` pairs with a
+    /// placeholder `size_class` of 0 — these tests exercise the CHD
+    /// construction/lookup mechanics, which don't care what `size_class`
+    /// is (it's carried for introspection only; `combine_hash_size_class`
+    /// is tested separately in `state.rs` and `bandit.rs`).
     fn make_table(pairs: &[(u64, Backend)]) -> PerfectHashTable {
-        PerfectHashTable::from_entries(pairs.to_vec())
+        PerfectHashTable::from_entries(pairs.iter().map(|&(h, b)| (h, 0, b)).collect())
     }
 
     #[test]
@@ -508,8 +547,8 @@ mod tests {
 
     #[test]
     fn serialize_deserialize_large_table() {
-        let pairs: Vec<(u64, Backend)> = (0..1000u64)
-            .map(|i| (i * 1000, test_backend_from_index(i)))
+        let pairs: Vec<(u64, u8, Backend)> = (0..1000u64)
+            .map(|i| (i * 1000, 0, test_backend_from_index(i)))
             .collect();
         let original = PerfectHashTable::from_entries(pairs);
         let bytes = original.serialize();
@@ -545,10 +584,10 @@ mod tests {
     #[test]
     fn mphf_is_minimal_and_collision_free() {
         let keys = splitmix_stream(5000);
-        let pairs: Vec<(u64, Backend)> = keys
+        let pairs: Vec<(u64, u8, Backend)> = keys
             .iter()
             .enumerate()
-            .map(|(i, &k)| (k, test_backend_from_index(i as u64)))
+            .map(|(i, &k)| (k, 0, test_backend_from_index(i as u64)))
             .collect();
         let table = PerfectHashTable::from_entries(pairs);
         assert_eq!(table.len(), 5000);
@@ -561,8 +600,9 @@ mod tests {
     fn mphf_misses_return_none() {
         let keys = splitmix_stream(15000);
         let (present, absent) = keys.split_at(5000);
-        let table =
-            PerfectHashTable::from_entries(present.iter().map(|&k| (k, Backend::Slab)).collect());
+        let table = PerfectHashTable::from_entries(
+            present.iter().map(|&k| (k, 0, Backend::Slab)).collect(),
+        );
         for &k in absent {
             assert_eq!(table.lookup(k), None);
         }
@@ -570,11 +610,11 @@ mod tests {
 
     #[test]
     fn hash_zero_is_a_valid_key() {
-        let mut pairs: Vec<(u64, Backend)> = splitmix_stream(100)
+        let mut pairs: Vec<(u64, u8, Backend)> = splitmix_stream(100)
             .into_iter()
-            .map(|k| (k, Backend::Slab))
+            .map(|k| (k, 0, Backend::Slab))
             .collect();
-        pairs.push((0, Backend::Buddy));
+        pairs.push((0, 0, Backend::Buddy));
         let table = PerfectHashTable::from_entries(pairs);
         assert_eq!(table.lookup(0), Some(Backend::Buddy));
         // Misses must still miss even though 0 occupies a real slot.
@@ -587,8 +627,8 @@ mod tests {
     fn sequential_low_entropy_keys() {
         // Worst case for the mixer: dense sequential keys with identical
         // high bits. Construction must succeed within the retry budget.
-        let pairs: Vec<(u64, Backend)> = (0..2048u64)
-            .map(|k| (k, test_backend_from_index(k)))
+        let pairs: Vec<(u64, u8, Backend)> = (0..2048u64)
+            .map(|k| (k, 0, test_backend_from_index(k)))
             .collect();
         let table = PerfectHashTable::from_entries(pairs);
         assert_eq!(table.len(), 2048);
@@ -607,17 +647,17 @@ mod tests {
     }
 
     #[test]
-    fn serialized_bytes_are_sorted_and_v1() {
+    fn serialized_bytes_are_sorted_and_v2() {
         let table = make_table(&[
             (300, Backend::Arena),
             (100, Backend::Slab),
             (200, Backend::Buddy),
         ]);
         let bytes = table.serialize();
-        // Exact v1 layout: magic, version, count, 12-byte entries, checksum.
+        // Exact v2 layout: magic, version, count, 12-byte entries, checksum.
         assert_eq!(bytes.len(), 16 + 3 * 12 + 8);
         assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), MAGIC);
-        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 3);
         let mut prev = 0u64;
         for i in 0..3 {
@@ -625,7 +665,12 @@ mod tests {
             let hash = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
             assert!(hash > prev || i == 0, "entries must be sorted by hash");
             prev = hash;
-            assert_eq!(bytes[off + 9..off + 12], [0, 0, 0], "padding");
+            assert_eq!(
+                bytes[off + 9],
+                0,
+                "size_class (placeholder 0 in make_table)"
+            );
+            assert_eq!(bytes[off + 10..off + 12], [0, 0], "padding");
         }
         assert_eq!(prev, 300);
         let checksum = u64::from_le_bytes(bytes[52..60].try_into().unwrap());
@@ -634,7 +679,7 @@ mod tests {
 
     #[test]
     fn duplicate_hashes_in_wire_format_dedup_last_wins() {
-        // Hand-craft a valid v1 buffer containing hash 7 twice: first as
+        // Hand-craft a valid v2 buffer containing hash 7 twice: first as
         // Slab (0), then as Arena (3). Deserialize must keep the later one.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&MAGIC.to_le_bytes());
@@ -643,7 +688,8 @@ mod tests {
         for backend_byte in [0u8, 3u8] {
             bytes.extend_from_slice(&7u64.to_le_bytes());
             bytes.push(backend_byte);
-            bytes.extend_from_slice(&[0u8; 3]);
+            bytes.push(0); // size_class placeholder
+            bytes.extend_from_slice(&[0u8; 2]);
         }
         bytes.extend_from_slice(&(7u64 ^ 7u64).to_le_bytes());
 
@@ -654,10 +700,10 @@ mod tests {
 
     #[test]
     fn construction_is_deterministic() {
-        let pairs: Vec<(u64, Backend)> = splitmix_stream(1000)
+        let pairs: Vec<(u64, u8, Backend)> = splitmix_stream(1000)
             .into_iter()
             .enumerate()
-            .map(|(i, k)| (k, test_backend_from_index(i as u64)))
+            .map(|(i, k)| (k, 0, test_backend_from_index(i as u64)))
             .collect();
         let a = PerfectHashTable::from_entries(pairs.clone());
         let mut shuffled = pairs.clone();

@@ -34,7 +34,8 @@ endif
 
 # ---- Phony targets ----
 .PHONY: help all shim example-sink demo-sink binaries \
-        server server-debug gui dev test e2e lint fmt clean
+        server server-debug gui dev test e2e lint fmt clean \
+        bench bench-native bench-cache bench-native-host bench-cache-host bench-report
 
 help:
 	@echo "Lohalloc — available targets:"
@@ -52,6 +53,10 @@ help:
 	@echo "  make lint           — cargo clippy --all-targets --workspace"
 	@echo "  make fmt            — cargo fmt --all"
 	@echo "  make clean          — cargo clean + remove shim/build/"
+	@echo "  make bench          — Rust criterion + latency_profile hypothesis suite (Phase 6)"
+	@echo "  make bench-native   — native C/C++ cross-allocator timing (Docker, Linux LD_PRELOAD)"
+	@echo "  make bench-cache    — native cachegrind cache-miss pass (Docker)"
+	@echo "  make bench-report   — aggregate results/*.json into bench-report.{json,md}"
 
 # ---- Builds ----
 shim:
@@ -103,6 +108,65 @@ lint:
 fmt:
 	cargo fmt --all
 
+# ---- Phase 6: hypothesis-validation benchmarking ----
+RESULTS_DIR := results
+
+# Layer 1 (forced-routing) criterion benches, Layer 2 hypothesis benches,
+# and per-op latency profiles across every workload x mode combination.
+# Cross-allocator `comparison` runs once per allocator so criterion can
+# diff baselines (--save-baseline). See crates/lohalloc-bench.
+bench:
+	mkdir -p $(RESULTS_DIR)
+	cargo bench -p lohalloc-bench --bench backend_micro
+	cargo bench -p lohalloc-bench --bench hypothesis
+	cargo bench -p lohalloc-bench --bench inference_overhead
+	cargo bench -p lohalloc-bench --bench comparison -- --save-baseline system
+	cargo bench -p lohalloc-bench --bench comparison --no-default-features --features alloc-lohalloc -- --save-baseline lohalloc
+	cargo bench -p lohalloc-bench --bench comparison --no-default-features --features alloc-jemalloc -- --save-baseline jemalloc
+	cargo bench -p lohalloc-bench --bench comparison --no-default-features --features alloc-mimalloc -- --save-baseline mimalloc
+	@for workload in slab arena buddy system adv-mixed; do \
+		for mode in training inference baseline forced:slab forced:buddy forced:system forced:arena; do \
+			out="$(RESULTS_DIR)/rust_$${workload}_$$(echo $$mode | tr ':' '-').json"; \
+			echo "latency_profile $$workload $$mode -> $$out"; \
+			cargo run -p lohalloc-bench --bin latency_profile --release -- \
+				--workload "$$workload" --mode "$$mode" --ops 100000 --out "$$out" || exit 1; \
+		done; \
+	done
+	$(MAKE) bench-report
+
+# Native (C/C++) cross-allocator wall-time comparison via LD_PRELOAD —
+# Linux-only, run inside Docker (see docker/Dockerfile.bench) even on a
+# Linux host, for a consistent, isolated environment.
+bench-native:
+	docker build -f docker/Dockerfile.bench -t lohalloc-bench .
+	mkdir -p $(RESULTS_DIR)
+	docker run --rm -v "$(CURDIR)/$(RESULTS_DIR):/lohalloc/results" lohalloc-bench
+
+# Cache-miss simulation (cachegrind) for the same native harness — much
+# slower than bench-native, so run separately and on demand.
+bench-cache:
+	docker build -f docker/Dockerfile.bench -t lohalloc-bench .
+	mkdir -p $(RESULTS_DIR)
+	docker run --rm -v "$(CURDIR)/$(RESULTS_DIR):/lohalloc/results" \
+		--entrypoint bash lohalloc-bench bench/run_native.sh --cachegrind
+
+# Host variants (no Docker) — for the CI runners in infra/remote_bench.sh,
+# which already run natively on the provisioned Linux EC2 instances.
+bench-native-host:
+	cargo build -p lohalloc-cabi --release
+	make -C bench/native
+	mkdir -p $(RESULTS_DIR)
+	bash bench/run_native.sh
+
+bench-cache-host:
+	cargo build -p lohalloc-cabi --release
+	make -C bench/native
+	mkdir -p $(RESULTS_DIR)
+	bash bench/run_native.sh --cachegrind
+
+bench-report:
+	cargo run -p lohalloc-bench --bin aggregate --release -- --results-dir $(RESULTS_DIR)
+
 # ---- Clean ----
 clean:
 	cargo clean
@@ -110,3 +174,5 @@ clean:
 	rm -rf $(GUI_DIR)/dist
 	rm -rf $(GUI_DIR)/test-results
 	rm -rf $(GUI_DIR)/playwright-report
+	rm -rf bench/native/build
+	rm -rf $(RESULTS_DIR)

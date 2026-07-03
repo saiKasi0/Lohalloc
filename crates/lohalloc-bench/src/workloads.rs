@@ -1,0 +1,393 @@
+//! Backend-pure and adversarial workload generators.
+//!
+//! Each generator is written once against [`AllocDriver`] and reused by
+//! routing-validation tests (`tests/routing_validation.rs`), criterion
+//! benches (`benches/*.rs`), and the latency profiler
+//! (`src/bin/latency_profile.rs`). Request sizes are chosen relative to
+//! [`HEADER_PAD`] so they land exactly on backend size-class boundaries —
+//! see `crates/lohalloc-alloc/src/lib.rs::header_pad` for why every
+//! allocation carries 48 bytes of header overhead at the default 16-byte
+//! alignment.
+
+use core::alloc::Layout;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
+
+use lohalloc_alloc::Lohalloc;
+use lohalloc_core::Backend;
+
+/// Bytes of header padding prepended to every Lohalloc allocation at the
+/// default 16-byte alignment. A user request of `class - HEADER_PAD` bytes
+/// lands exactly on `class` after the header is added.
+pub const HEADER_PAD: usize = 48;
+
+/// Request size that lands exactly on the 256-byte Slab class. The
+/// canonical "small, fixed-size, high-churn" request used by W-SLAB and
+/// W-ARENA.
+pub const SMALL_FIXED_REQUEST: usize = 256 - HEADER_PAD; // 208
+
+/// Variable medium sizes (32 KiB .. 256 KiB), all safely above `SLAB_MAX`
+/// (16 KiB) and below `BUDDY_MAX` (1 MiB) even after the header is added, so
+/// only Buddy or System can structurally serve them.
+pub const BUDDY_SIZES: [usize; 4] = [32 * 1024, 64 * 1024, 128 * 1024, 256 * 1024];
+
+/// Sizes above `BUDDY_MAX`; only the System backend can serve these.
+pub const SYSTEM_SIZES: [usize; 2] = [2 * 1024 * 1024, 8 * 1024 * 1024];
+
+/// Deterministic synthetic hashes identifying each workload's call site.
+/// Used with [`HarnessDriver`] (via `alloc_with_hash`) so routing outcomes
+/// are assertable regardless of inlining or call depth — see
+/// `crate::forced` and `tests/routing_validation.rs`.
+pub mod hashes {
+    pub const W_SLAB: u64 = 0x5AA5_0001;
+    pub const W_ARENA: u64 = 0x5AA5_0002;
+    pub const W_BUDDY: u64 = 0x5AA5_0003;
+    pub const W_SYSTEM: u64 = 0x5AA5_0004;
+    pub const W_COMBO_SA_SLAB: u64 = 0x5AA5_0005;
+    pub const W_COMBO_SA_ARENA: u64 = 0x5AA5_0006;
+    pub const W_COMBO_BA_BUDDY: u64 = 0x5AA5_0007;
+    pub const W_COMBO_BA_SMALL: u64 = 0x5AA5_0008;
+    pub const W_ADV_MIXED: u64 = 0x5AA5_0009;
+    pub const W_ADV_EXHAUST: u64 = 0x5AA5_000A;
+}
+
+/// A minimal seam so the same workload generator can drive either a private
+/// `Lohalloc` instance with a deterministic synthetic hash ([`HarnessDriver`],
+/// used for routing/forced-model validation) or the process's real global
+/// allocator ([`GlobalDriver`], used for cross-allocator comparison
+/// benches).
+pub trait AllocDriver {
+    /// # Safety
+    /// Same contract as `GlobalAlloc::alloc`.
+    unsafe fn alloc(&self, layout: Layout, hash: u64) -> *mut u8;
+    /// # Safety
+    /// `ptr` must have been returned by a prior `alloc` call on this driver
+    /// with a matching `layout`.
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout, hash: u64);
+    /// Called between bursts in workloads that model a cluster lifetime
+    /// ending (e.g. W-ARENA). No-op for drivers with no such concept.
+    fn phase_end(&self) {}
+}
+
+/// Drives a private `Lohalloc` instance via the replay-engine API
+/// (`alloc_with_hash`/`dealloc_with_hash`), using a caller-supplied
+/// deterministic hash instead of the real stack walk. This is what makes
+/// routing outcomes (`backend_for_ptr`) and forced-model tests
+/// (`crate::forced`) assertable: the hash for a given workload/site is
+/// always the same value regardless of inlining or call depth.
+pub struct HarnessDriver {
+    pub alloc: Lohalloc,
+}
+
+impl HarnessDriver {
+    pub fn new() -> Self {
+        Self {
+            alloc: Lohalloc::new(),
+        }
+    }
+}
+
+impl Default for HarnessDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AllocDriver for HarnessDriver {
+    unsafe fn alloc(&self, layout: Layout, hash: u64) -> *mut u8 {
+        unsafe { self.alloc.alloc_with_hash(layout, hash) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout, _hash: u64) {
+        unsafe { self.alloc.dealloc_with_hash(ptr, layout) }
+    }
+    fn phase_end(&self) {
+        self.alloc.reset_arena();
+    }
+}
+
+/// Drives the process's real global allocator via `std::alloc`. Used only by
+/// the `comparison` bench, which swaps in Lohalloc/jemalloc/mimalloc/system
+/// as `#[global_allocator]` per build (see `crate::global_alloc`) and wants
+/// to measure each one's effect on the same workload shapes. The `hash`
+/// parameter is unused here — the real call-site topology (when the
+/// allocator is Lohalloc) is whatever the process's actual stack walker
+/// sees from the generator function's call stack.
+pub struct GlobalDriver;
+
+impl AllocDriver for GlobalDriver {
+    unsafe fn alloc(&self, layout: Layout, _hash: u64) -> *mut u8 {
+        unsafe { std::alloc::alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout, _hash: u64) {
+        unsafe { std::alloc::dealloc(ptr, layout) }
+    }
+}
+
+/// W-SLAB: tight churn of a single fixed size, bounded 64-deep live window.
+/// Slab-favorable — small, reused, high-frequency alloc/free.
+#[inline(never)]
+pub fn workload_slab_churn<D: AllocDriver>(driver: &D, hash: u64, ops: usize) {
+    let layout = Layout::from_size_align(SMALL_FIXED_REQUEST, 16).unwrap();
+    let mut window: VecDeque<*mut u8> = VecDeque::with_capacity(64);
+    for _ in 0..ops {
+        let p = unsafe { driver.alloc(layout, hash) };
+        window.push_back(p);
+        if window.len() > 64 {
+            let old = window.pop_front().unwrap();
+            unsafe { driver.dealloc(old, layout, hash) };
+        }
+    }
+    for p in window {
+        unsafe { driver.dealloc(p, layout, hash) };
+    }
+}
+
+/// W-ARENA: bursts of short-lived allocations dropped en masse, with
+/// `phase_end` (arena reset) between bursts. Arena-favorable — dense,
+/// same-lifetime clusters; per-allocation free is never on the critical
+/// path.
+#[inline(never)]
+pub fn workload_arena_bursts<D: AllocDriver>(
+    driver: &D,
+    hash: u64,
+    num_bursts: usize,
+    burst_size: usize,
+) {
+    let layout = Layout::from_size_align(SMALL_FIXED_REQUEST, 16).unwrap();
+    for _ in 0..num_bursts {
+        let mut ptrs = Vec::with_capacity(burst_size);
+        for _ in 0..burst_size {
+            ptrs.push(unsafe { driver.alloc(layout, hash) });
+        }
+        for p in ptrs {
+            unsafe { driver.dealloc(p, layout, hash) };
+        }
+        driver.phase_end();
+    }
+}
+
+/// W-BUDDY: variable medium sizes (32 KiB–256 KiB) with interleaved
+/// alloc/free, exercising split/coalesce pressure. Buddy-favorable — too
+/// large for Slab, too frequently freed for Arena's no-op-dealloc model to
+/// help.
+#[inline(never)]
+pub fn workload_buddy_interleaved<D: AllocDriver>(driver: &D, hash: u64, ops: usize) {
+    let mut live: Vec<(*mut u8, Layout)> = Vec::new();
+    for i in 0..ops {
+        let size = BUDDY_SIZES[i % BUDDY_SIZES.len()];
+        let layout = Layout::from_size_align(size, 16).unwrap();
+        let p = unsafe { driver.alloc(layout, hash) };
+        live.push((p, layout));
+        if i % 2 == 1 && !live.is_empty() {
+            let (op, ol) = live.remove(0);
+            unsafe { driver.dealloc(op, ol, hash) };
+        }
+    }
+    for (p, l) in live {
+        unsafe { driver.dealloc(p, l, hash) };
+    }
+}
+
+/// W-SYSTEM: large (2 MiB / 8 MiB) allocations, immediately freed. Control
+/// case — only the System backend can structurally serve these, so every
+/// forced/trained mode should converge identically.
+#[inline(never)]
+pub fn workload_system_large<D: AllocDriver>(driver: &D, hash: u64, ops: usize) {
+    for i in 0..ops {
+        let size = SYSTEM_SIZES[i % SYSTEM_SIZES.len()];
+        let layout = Layout::from_size_align(size, 16).unwrap();
+        let p = unsafe { driver.alloc(layout, hash) };
+        unsafe { driver.dealloc(p, layout, hash) };
+    }
+}
+
+/// W-ADV-MIXED: single call site, erratic sizes (1 B–64 KiB) via a
+/// deterministic xorshift-style PRNG, pseudo-random lifetimes. Adversarial —
+/// no single backend dominates.
+#[inline(never)]
+pub fn workload_adversarial_mixed<D: AllocDriver>(driver: &D, hash: u64, ops: usize) {
+    let mut live: Vec<(*mut u8, Layout)> = Vec::new();
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    for _ in 0..ops {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        let size = 1 + ((state >> 33) as usize % (64 * 1024));
+        let layout = Layout::from_size_align(size, 16).unwrap();
+        let p = unsafe { driver.alloc(layout, hash) };
+        live.push((p, layout));
+        if live.len() > 32 && (state & 1) == 0 {
+            let idx = (state >> 1) as usize % live.len();
+            let (op, ol) = live.swap_remove(idx);
+            unsafe { driver.dealloc(op, ol, hash) };
+        }
+    }
+    for (p, l) in live {
+        unsafe { driver.dealloc(p, l, hash) };
+    }
+}
+
+/// W-ADV-EXHAUST: long-lived small allocations, never freed by the
+/// generator — returned to the caller so it can free them after asserting
+/// on routing/exhaustion behavior. Used with a forced-Arena model to
+/// observe the bounded cost of arena exhaustion + fallthrough.
+#[inline(never)]
+pub fn workload_exhaust_no_free<D: AllocDriver>(
+    driver: &D,
+    hash: u64,
+    ops: usize,
+) -> Vec<(*mut u8, Layout)> {
+    let layout = Layout::from_size_align(SMALL_FIXED_REQUEST, 16).unwrap();
+    let mut live = Vec::with_capacity(ops);
+    for _ in 0..ops {
+        let p = unsafe { driver.alloc(layout, hash) };
+        live.push((p, layout));
+    }
+    live
+}
+
+/// W-COMBO-SA: W-SLAB at one call site interleaved (coarse-grained) with
+/// W-ARENA at another. The headline combination hypothesis — a working
+/// decision engine should route the two sites to different backends.
+#[inline(never)]
+pub fn workload_combo_slab_arena<D: AllocDriver>(
+    driver: &D,
+    slab_hash: u64,
+    arena_hash: u64,
+    rounds: usize,
+) {
+    for _ in 0..rounds {
+        workload_slab_churn(driver, slab_hash, 200);
+        workload_arena_bursts(driver, arena_hash, 1, 500);
+    }
+}
+
+/// W-COMBO-BA: W-BUDDY at one call site interleaved with small Slab-favorable
+/// bursts at another.
+#[inline(never)]
+pub fn workload_combo_buddy_small<D: AllocDriver>(
+    driver: &D,
+    buddy_hash: u64,
+    small_hash: u64,
+    rounds: usize,
+) {
+    for _ in 0..rounds {
+        workload_buddy_interleaved(driver, buddy_hash, 50);
+        workload_slab_churn(driver, small_hash, 200);
+    }
+}
+
+/// Wraps another [`AllocDriver`] and records which backend served each
+/// allocation (read via `backend_for_ptr` immediately after `alloc`, before
+/// the caller frees it — a System-backed pointer becomes invalid the instant
+/// it's `munmap`'d, so inspection must happen at alloc time, not after the
+/// workload generator has already freed everything). Used by
+/// routing-validation tests to check hypothesis distributions without
+/// modifying the workload generators themselves.
+pub struct RecordingDriver<'a, D: AllocDriver> {
+    inner: &'a D,
+    lohalloc: &'a Lohalloc,
+    counts: RefCell<HashMap<Backend, usize>>,
+    total: Cell<usize>,
+}
+
+impl<'a, D: AllocDriver> RecordingDriver<'a, D> {
+    /// `lohalloc` must be the same instance `inner` allocates through (so
+    /// `backend_for_ptr` reads a valid header) — for [`HarnessDriver`] that's
+    /// `&harness.alloc`.
+    pub fn new(inner: &'a D, lohalloc: &'a Lohalloc) -> Self {
+        Self {
+            inner,
+            lohalloc,
+            counts: RefCell::new(HashMap::new()),
+            total: Cell::new(0),
+        }
+    }
+
+    pub fn fraction_served_by(&self, backend: Backend) -> f64 {
+        let total = self.total.get();
+        if total == 0 {
+            return 0.0;
+        }
+        let counts = self.counts.borrow();
+        *counts.get(&backend).unwrap_or(&0) as f64 / total as f64
+    }
+
+    pub fn backend_counts(&self) -> HashMap<Backend, usize> {
+        self.counts.borrow().clone()
+    }
+}
+
+impl<'a, D: AllocDriver> AllocDriver for RecordingDriver<'a, D> {
+    unsafe fn alloc(&self, layout: Layout, hash: u64) -> *mut u8 {
+        let ptr = unsafe { self.inner.alloc(layout, hash) };
+        if !ptr.is_null() {
+            if let Some(backend) = unsafe { self.lohalloc.backend_for_ptr(ptr) } {
+                *self.counts.borrow_mut().entry(backend).or_insert(0) += 1;
+            }
+            self.total.set(self.total.get() + 1);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout, hash: u64) {
+        unsafe { self.inner.dealloc(ptr, layout, hash) }
+    }
+
+    fn phase_end(&self) {
+        self.inner.phase_end();
+    }
+}
+
+/// Wraps another [`AllocDriver`] and records per-call wall-clock latency
+/// (nanoseconds) for `alloc` and `dealloc` separately. Used by
+/// `src/bin/latency_profile.rs` to build hdrhistogram percentile reports —
+/// alloc and dealloc are timed independently rather than stitched into a
+/// single per-pair latency, since backends free asynchronously relative to
+/// the matching alloc (e.g. Arena's dealloc is a no-op).
+pub struct TimingDriver<'a, D: AllocDriver> {
+    inner: &'a D,
+    alloc_ns: RefCell<Vec<u64>>,
+    dealloc_ns: RefCell<Vec<u64>>,
+}
+
+impl<'a, D: AllocDriver> TimingDriver<'a, D> {
+    pub fn new(inner: &'a D) -> Self {
+        Self {
+            inner,
+            alloc_ns: RefCell::new(Vec::new()),
+            dealloc_ns: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub fn alloc_samples(&self) -> Vec<u64> {
+        self.alloc_ns.borrow().clone()
+    }
+
+    pub fn dealloc_samples(&self) -> Vec<u64> {
+        self.dealloc_ns.borrow().clone()
+    }
+}
+
+impl<'a, D: AllocDriver> AllocDriver for TimingDriver<'a, D> {
+    unsafe fn alloc(&self, layout: Layout, hash: u64) -> *mut u8 {
+        let t0 = std::time::Instant::now();
+        let ptr = unsafe { self.inner.alloc(layout, hash) };
+        self.alloc_ns
+            .borrow_mut()
+            .push(t0.elapsed().as_nanos() as u64);
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout, hash: u64) {
+        let t0 = std::time::Instant::now();
+        unsafe { self.inner.dealloc(ptr, layout, hash) };
+        self.dealloc_ns
+            .borrow_mut()
+            .push(t0.elapsed().as_nanos() as u64);
+    }
+
+    fn phase_end(&self) {
+        self.inner.phase_end();
+    }
+}

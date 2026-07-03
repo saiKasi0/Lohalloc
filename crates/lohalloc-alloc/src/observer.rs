@@ -166,20 +166,9 @@ pub fn emit(record: TelemetryCRecord) {
     }
 }
 
-/// Process-wide monotonic epoch, lazily anchored on first use. Every
-/// `now_ns()` call measures elapsed time against this single fixed instant
-/// — never against a fresh `Instant::now()` (which would just measure the
-/// gap between two back-to-back calls, i.e. ~0).
-static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-
-/// Monotonic nanosecond timestamp relative to the shared `EPOCH`, so
-/// readings are meaningfully comparable across calls (and across threads).
-/// Cheap (vDSO on Linux, `mach_absolute_time` on macOS), zero allocations.
-#[inline]
-pub(crate) fn now_ns() -> u64 {
-    let epoch = EPOCH.get_or_init(std::time::Instant::now);
-    epoch.elapsed().as_nanos() as u64
-}
+/// Monotonic nanosecond timestamp — see `crate::clock` (always compiled in;
+/// Layer 2 latency-based rewards need it independent of this feature).
+pub(crate) use crate::clock::now_ns;
 
 /// Current OS thread identifier, truncated to `u32`. Used purely as a
 /// telemetry label — collisions across thousands of threads are tolerable.
@@ -306,21 +295,5 @@ mod tests {
         assert_eq!(offset_of!(TelemetryCRecord, latency_ns), 48);
         assert_eq!(offset_of!(TelemetryCRecord, fragmentation_pct), 56);
         assert_eq!(offset_of!(TelemetryCRecord, backend), 60);
-    }
-
-    #[test]
-    fn now_ns_is_monotonic() {
-        use std::thread;
-        use std::time::Duration;
-        let t1 = now_ns();
-        thread::sleep(Duration::from_millis(5));
-        let t2 = now_ns();
-        assert!(t2 > t1, "now_ns() must be strictly increasing");
-        let delta = t2 - t1;
-        assert!(
-            delta >= 4_000_000,
-            "delta should be at least 5ms (5_000_000ns), got {}ns",
-            delta
-        );
     }
 }

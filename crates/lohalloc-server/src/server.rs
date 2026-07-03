@@ -1402,11 +1402,18 @@ async fn kill_all_simulations_handler(State(state): State<AppState>) -> Response
 ///
 /// ```text
 /// [8]    magic    0x434f4c4c41484f4c — LE bytes spell "LOHALLOC"
-/// [4]    version  (LE u32)
+/// [4]    version  (LE u32, 2)
 /// [4]    count    (LE u32)
-/// [N×12] entries: (hash: u64 LE, backend: u8, _pad: [u8; 3])
+/// [N×12] entries: (hash: u64 LE, backend: u8, size_class: u8, _pad: [u8; 2])
 /// [8]    checksum (XOR of all hashes, LE u64)
 /// ```
+///
+/// **v2** (Phase 6): `hash` is `combine_hash_size_class(caller_pc,
+/// size_class)`, not a raw call-site hash — it no longer matches the
+/// `stack_hash` field on live `TelemetryRecord`s. `size_class` is decoded
+/// but not currently surfaced in the JSON response (kept for future GUI use
+/// — see `lohalloc_alloc::perfect_hash`'s module doc for why the two can't
+/// be recombined into the original call-site hash).
 ///
 /// Returns an empty `Vec` if `bytes` is too short, has bad magic/version,
 /// or fails checksum validation. This is best-effort decoding — the
@@ -1428,7 +1435,7 @@ fn decode_routing_entries(bytes: &[u8]) -> Vec<(u64, String)> {
     }
 
     let version = read_u32_le(bytes, &mut pos);
-    if version != 1 {
+    if version != 2 {
         return Vec::new();
     }
 
@@ -1443,7 +1450,9 @@ fn decode_routing_entries(bytes: &[u8]) -> Vec<(u64, String)> {
     for _ in 0..count {
         let hash = read_u64_le(bytes, &mut pos);
         let backend_byte = *bytes.get(pos).unwrap_or(&0);
-        pos += 4; // backend(1) + padding(3)
+        // size_class lives at pos+1 — decoded implicitly by the pos += 4
+        // skip below; not currently surfaced (see doc comment above).
+        pos += 4; // backend(1) + size_class(1) + padding(2)
         let backend = match backend_byte {
             0 => "slab",
             1 => "buddy",

@@ -1,0 +1,52 @@
+# Docker image for Phase 6's native (C/C++) cross-allocator benchmark
+# harness — the only way to get real LD_PRELOAD symbol interposition, which
+# does not work on macOS (see bench/run_native.sh's module doc).
+#
+# Usage (from repo root):
+#   docker build -f docker/Dockerfile.bench -t lohalloc-bench .
+#   docker run --rm -v "$PWD/results:/lohalloc/results" lohalloc-bench
+#
+# On an Apple Silicon host, add --platform linux/amd64 or linux/arm64 to
+# target a specific architecture (both c6i.large/x86_64 and c6g.large/ARM64
+# are benchmarked in CI — see .github/workflows/bench.yml).
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
+    cmake \
+    git \
+    pkg-config \
+    valgrind \
+    libjemalloc2 \
+    libjemalloc-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# mimalloc has no Ubuntu 22.04 package — build from source. Produces
+# /usr/local/lib/libmimalloc.so, which bench/run_native.sh already looks for.
+RUN git clone --depth 1 --branch v2.1.7 https://github.com/microsoft/mimalloc.git /tmp/mimalloc \
+    && cmake -S /tmp/mimalloc -B /tmp/mimalloc/build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /tmp/mimalloc/build --parallel \
+    && cmake --install /tmp/mimalloc/build \
+    && ldconfig \
+    && rm -rf /tmp/mimalloc
+
+# Install Rust (stable) — used both to build lohalloc-cabi and to install
+# hyperfine (no Ubuntu 22.04 package; cargo install is the simplest portable
+# route since Rust is already required).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    --default-toolchain stable \
+    --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN cargo install hyperfine --locked
+
+WORKDIR /lohalloc
+COPY . .
+
+RUN cargo build -p lohalloc-cabi --release
+RUN make -C bench/native
+
+ENTRYPOINT ["bash", "bench/run_native.sh"]

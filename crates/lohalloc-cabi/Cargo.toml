@@ -1,0 +1,26 @@
+[package]
+name = "lohalloc-cabi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "C ABI (malloc family) over Lohalloc — lets a C/C++ program use Lohalloc via LD_PRELOAD (Linux)."
+
+[lib]
+# cdylib ONLY. Linking this crate's #[no_mangle] extern "C" malloc/free/...
+# into a normal Rust test binary as an rlib shadows that *entire process's*
+# allocator (Rust's own std FFI-declares malloc/free at those exact symbol
+# names) -- including the test harness's own thread/Vec/String machinery,
+# not just calls this crate's own tests make explicitly. Verified the hard
+# way: a 20-test suite linked as rlib deadlocked the whole process under
+# `cargo test`'s parallel test threads. Correctness for a malloc-replacing
+# library can only be tested by actually replacing the allocator in an
+# isolated process (LD_PRELOAD under Docker/Linux -- see the native harness
+# in bench/native/), never in-process alongside a test runner that depends
+# on the same allocator working.
+crate-type = ["cdylib"]
+name = "lohalloc_cabi"
+
+[dependencies]
+lohalloc-alloc.workspace = true
+libc = "0.2"

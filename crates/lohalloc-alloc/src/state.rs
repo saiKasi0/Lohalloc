@@ -61,6 +61,25 @@ pub fn size_class_for(size: usize) -> u8 {
     }
 }
 
+/// Combine a call-site hash with a `size_class_for` bucket into the single
+/// `u64` key the frozen `PerfectHashTable` is looked up over (v2 wire
+/// format — see `perfect_hash.rs`). Routing keys on the full
+/// `(topological_hash, size_class)` Signature the bandit actually trains
+/// on; v1 collapsed the frozen table to `caller_pc` alone, so two
+/// Signatures sharing a call site but trained at different size classes
+/// (e.g. a helper called with both a 64-byte and a 64 KiB request) silently
+/// clobbered each other into one ambiguous entry.
+///
+/// Full-avalanche mix so a size-class-only difference still lands far apart
+/// in the CHD table; not required (or intended) to be reversible back to
+/// the original `size_class`.
+#[inline]
+pub fn combine_hash_size_class(hash: u64, size_class: u8) -> u64 {
+    hash ^ (size_class as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(17)
+}
+
 /// The allocator's operating mode.
 ///
 /// `Training` learns routing via the MAB; `Inference` uses a frozen
@@ -104,9 +123,11 @@ impl AllocatorState {
     /// Route an allocation to a backend.
     ///
     /// - **Training**: consults the `BanditPolicy` (UCB1 + hysteresis).
-    /// - **Inference**: looks up the hash in the `PerfectHashTable`. If the
-    ///   hash is not in the table, falls back to a default backend determined
-    ///   by size class (Slab for small, Buddy for medium, System for large).
+    /// - **Inference**: looks up `combine_hash_size_class(hash, size_class)`
+    ///   in the `PerfectHashTable` — matching the key `freeze()` built the
+    ///   table with. If the key is not in the table, falls back to a
+    ///   default backend determined by size class (Slab for small, Buddy
+    ///   for medium, System for large).
     pub fn route(&mut self, hash: u64, size: usize) -> Backend {
         match self {
             Self::Training { bandit } => {
@@ -116,32 +137,33 @@ impl AllocatorState {
             }
             Self::Inference { routing_table } => {
                 // Hash-and-jump: O(1) minimal perfect hash lookup. Zero allocations.
-                if let Some(backend) = routing_table.lookup(hash) {
+                let key = combine_hash_size_class(hash, size_class_for(size));
+                if let Some(backend) = routing_table.lookup(key) {
                     return backend;
                 }
-                // Hash not in the frozen table → fall back to size-based default.
+                // Key not in the frozen table → fall back to size-based default.
                 default_backend_for_size(size)
             }
         }
     }
 
-    /// Record an allocation outcome (reward) for the bandit.
+    /// Record a measured latency sample (Layer 2) for the bandit, feeding
+    /// back the real cost of a routing decision instead of a static
+    /// baseline. Called from both the alloc side (`lib.rs::route_alloc_inner`
+    /// — the recommended arm's total outcome latency, including any failed
+    /// attempt + fallthrough) and the dealloc side (`lib.rs`'s
+    /// `GlobalAlloc::dealloc` — the actual serving backend's free cost, an
+    /// additional reward sample on the same arm so Arena's free-is-a-no-op
+    /// advantage becomes visible to the bandit).
     ///
-    /// - **Training**: updates the bandit's arm statistics.
+    /// - **Training**: converts `latency_ns` to a bounded reward (see
+    ///   [`latency_to_reward`]) and updates the bandit's arm statistics.
     /// - **Inference**: no-op (the routing table is immutable).
-    pub fn record(&mut self, hash: u64, backend: Backend, _size: usize) {
-        match self {
-            Self::Training { bandit } => {
-                let size_class = size_class_for(_size);
-                let sig = Signature::new(hash, size_class);
-                // Simple reward: success = backend's baseline reward,
-                // failure (not called here) would be 0.
-                let reward = backend_reward(backend);
-                bandit.update(sig, backend, reward);
-            }
-            Self::Inference { .. } => {
-                // No-op: routing table is frozen and immutable.
-            }
+    pub fn record_latency(&mut self, hash: u64, backend: Backend, size_class: u8, latency_ns: u64) {
+        if let Self::Training { bandit } = self {
+            let sig = Signature::new(hash, size_class);
+            let reward = latency_to_reward(latency_ns);
+            bandit.update(sig, backend, reward);
         }
     }
 
@@ -179,7 +201,7 @@ impl AllocatorState {
     /// already exposed via `export()`).
     pub fn routing_snapshot(&self) -> Vec<(u64, Backend)> {
         match self {
-            Self::Training { bandit } => bandit.freeze(),
+            Self::Training { bandit } => bandit.snapshot(),
             Self::Inference { .. } => Vec::new(),
         }
     }
@@ -234,14 +256,21 @@ fn default_backend_for_size(size: usize) -> Backend {
     }
 }
 
-/// Baseline reward for a backend (mirrors `bandit.rs` BASELINE_REWARDS).
-fn backend_reward(backend: Backend) -> f64 {
-    match backend {
-        Backend::Slab => 1.0,
-        Backend::Buddy => 0.8,
-        Backend::System => 0.3,
-        Backend::Arena => 0.9,
-    }
+/// Reference latency (nanoseconds) for the Layer 2 reward curve: fast paths
+/// (Slab/Arena/Buddy pops, all tens of nanoseconds) saturate near a reward of
+/// 1.0, while slow events (mmap, region refill, a failed recommendation
+/// falling through) pull the reward toward 0 — that gap is the
+/// differentiation signal the bandit needs to actually learn which backend
+/// is fast for a given call site, replacing the old static
+/// `BASELINE_REWARDS` cost model.
+const T_REF_NS: f64 = 50.0;
+
+/// Map a measured latency to a bounded `(0, 1]` reward. Monotone decreasing
+/// and scale-tolerant across machines: doubling every latency in a run
+/// shifts individual rewards but preserves their relative ordering, which is
+/// all UCB1 needs to pick the empirically-faster arm.
+fn latency_to_reward(latency_ns: u64) -> f64 {
+    T_REF_NS / (T_REF_NS + latency_ns as f64)
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +319,7 @@ mod tests {
                 ),
                 "route should return a valid backend"
             );
-            state.record(42, backend, 64);
+            state.record_latency(42, backend, size_class_for(64), 10);
         }
     }
 
@@ -300,7 +329,7 @@ mod tests {
         // Train a bit.
         for _ in 0..10 {
             let backend = state.route(100, 64);
-            state.record(100, backend, 64);
+            state.record_latency(100, backend, size_class_for(64), 10);
         }
         assert!(!state.is_inference());
         state.freeze();
@@ -314,10 +343,10 @@ mod tests {
         for _ in 0..100 {
             let backend = state.route(100, 64);
             if backend == Backend::Arena {
-                state.record(100, backend, 64);
+                state.record_latency(100, backend, size_class_for(64), 10);
             } else {
                 // Manually record Arena as winning.
-                state.record(100, Backend::Arena, 64);
+                state.record_latency(100, Backend::Arena, size_class_for(64), 10);
             }
         }
         state.freeze();
@@ -338,12 +367,12 @@ mod tests {
         let mut state = AllocatorState::new_training();
         for _ in 0..10 {
             let backend = state.route(50, 64);
-            state.record(50, backend, 64);
+            state.record_latency(50, backend, size_class_for(64), 10);
         }
         state.freeze();
 
-        // record() in Inference mode should be a no-op (not panic).
-        state.record(50, Backend::Slab, 64);
+        // record_latency() in Inference mode should be a no-op (not panic).
+        state.record_latency(50, Backend::Slab, size_class_for(64), 10);
         // If we get here, it didn't panic.
     }
 
@@ -353,7 +382,7 @@ mod tests {
         // Train only hash 100.
         for _ in 0..10 {
             let backend = state.route(100, 64);
-            state.record(100, backend, 64);
+            state.record_latency(100, backend, size_class_for(64), 10);
         }
         state.freeze();
 
@@ -378,11 +407,11 @@ mod tests {
         // Train a few signatures.
         for _ in 0..20 {
             let backend = state.route(1, 64);
-            state.record(1, backend, 64);
+            state.record_latency(1, backend, size_class_for(64), 10);
         }
         for _ in 0..20 {
             let backend = state.route(2, 256);
-            state.record(2, backend, 256);
+            state.record_latency(2, backend, size_class_for(256), 10);
         }
         state.freeze();
 
@@ -403,7 +432,7 @@ mod tests {
         let mut state = AllocatorState::new_training();
         for _ in 0..10 {
             let backend = state.route(42, 64);
-            state.record(42, backend, 64);
+            state.record_latency(42, backend, size_class_for(64), 10);
         }
         state.freeze();
         let bytes = state.export().unwrap();
@@ -446,12 +475,12 @@ mod tests {
         // Train hash 100 a few times.
         for _ in 0..5 {
             let b = state.route(100, 64);
-            state.record(100, b, 64);
+            state.record_latency(100, b, size_class_for(64), 10);
         }
         // Train hash 200 a few times.
         for _ in 0..5 {
             let b = state.route(200, 128);
-            state.record(200, b, 128);
+            state.record_latency(200, b, size_class_for(128), 10);
         }
         assert_eq!(state.signature_count(), 2);
 
@@ -467,7 +496,7 @@ mod tests {
         let mut state = AllocatorState::new_training();
         for _ in 0..10 {
             let b = state.route(42, 64);
-            state.record(42, b, 64);
+            state.record_latency(42, b, size_class_for(64), 10);
         }
         state.freeze();
         assert!(state.routing_snapshot().is_empty());
@@ -479,7 +508,7 @@ mod tests {
         let mut state = AllocatorState::new_training();
         for _ in 0..10 {
             let b = state.route(42, 64);
-            state.record(42, b, 64);
+            state.record_latency(42, b, size_class_for(64), 10);
         }
         assert!(!state.is_inference());
         assert_eq!(state.signature_count(), 1);

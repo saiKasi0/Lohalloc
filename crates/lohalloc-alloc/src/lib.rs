@@ -39,6 +39,7 @@
 pub mod arena;
 pub mod bandit;
 pub mod buddy;
+mod clock;
 #[cfg(feature = "telemetry-observer")]
 pub mod observer;
 pub mod perfect_hash;
@@ -49,11 +50,17 @@ pub mod topology;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::Cell;
+use core::sync::atomic::{AtomicBool, Ordering};
 use lohalloc_core::{align_up, BUDDY_MAX, MIN_ALIGN, SLAB_MAX};
 use std::sync::Mutex;
 
 /// Sentinel written into every [`Header`] so we can sanity-check dealloc.
 const MAGIC: u64 = 0x534d4152414c4844; // "LOHALALHD"
+
+/// `size_class_hint` value meaning "not tracked for Layer 2 reward
+/// attribution" — used for allocations that bypass `route_alloc` entirely
+/// (the re-entrancy-guard bypass, the standalone `arena_alloc` helper).
+const SIZE_CLASS_UNTRACKED: u8 = 0xFF;
 
 /// Per-allocation header prepended to the user-visible pointer. Lets
 /// `dealloc` identify the owning backend without guessing by size.
@@ -64,7 +71,22 @@ const MAGIC: u64 = 0x534d4152414c4844; // "LOHALALHD"
 struct Header {
     magic: u64,
     backend: u8,
-    _pad: [u8; 7],
+    /// The Decision Engine's `size_class_for(size)` bucket at alloc time
+    /// (`state::size_class_for`), captured here so `dealloc`'s Layer-2
+    /// reward attribution (`route_alloc`'s doc comment explains the reward
+    /// model) updates the *same* Signature the bandit routed. Recomputing
+    /// the class from `size` below (the post-header-padding total) can
+    /// straddle a different class boundary than the original request did.
+    /// [`SIZE_CLASS_UNTRACKED`] if this allocation bypassed the Decision
+    /// Engine (re-entrancy bypass, `arena_alloc`).
+    size_class_hint: u8,
+    /// `log2` of the alignment this allocation was served at (`align` is
+    /// always a power of two — see `MIN_ALIGN`). Lets `dealloc`/the C ABI
+    /// (`lohalloc-cabi`) recompute `header_pad` from the header alone,
+    /// without needing a `Layout` — required for `free(ptr)`, which only
+    /// ever receives the pointer.
+    align_log2: u8,
+    _pad: [u8; 5],
     /// Size passed to the backend's `alloc` (the *total* including this
     /// header's padding). Slab/Buddy use it to compute the free-list/ order on
     /// dealloc. System ignores it (uses `base`/`map_len`).
@@ -79,7 +101,7 @@ struct Header {
     hash: u64,
 }
 
-const HEADER_SIZE: usize = core::mem::size_of::<Header>(); // 40
+const HEADER_SIZE: usize = core::mem::size_of::<Header>(); // 48
 
 /// Bytes of padding between the backend's block start and the user pointer, so
 /// the user pointer is aligned to `align` and the header sits immediately
@@ -154,6 +176,32 @@ impl Backend {
             lohalloc_core::Backend::Arena => Backend::Arena,
         }
     }
+
+    /// Convert from the local `Backend` (the `Header`'s `u8` tag) back to
+    /// `lohalloc_core::Backend`, needed to feed `AllocatorState::record_latency`
+    /// from `dealloc`.
+    fn to_core(self) -> lohalloc_core::Backend {
+        match self {
+            Backend::Slab => lohalloc_core::Backend::Slab,
+            Backend::Buddy => lohalloc_core::Backend::Buddy,
+            Backend::System => lohalloc_core::Backend::System,
+            Backend::Arena => lohalloc_core::Backend::Arena,
+        }
+    }
+}
+
+/// Snapshot of per-backend live-region/usage counters. See
+/// [`Lohalloc::backend_counters`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BackendCounters {
+    /// Number of live backing mmap regions held by the Slab allocator.
+    pub slab_region_count: usize,
+    /// Number of live backing mmap regions held by the Buddy allocator.
+    pub buddy_region_count: usize,
+    /// Bytes allocated from the Bump Arena since its last reset.
+    pub arena_used: usize,
+    /// Total usable capacity of the Bump Arena (0 if not yet initialized).
+    pub arena_capacity: usize,
 }
 
 /// The composite allocator. Install an instance of this as
@@ -165,6 +213,12 @@ pub struct Lohalloc {
     /// The Decision Engine (Phase 3). Routes allocations via MAB in Training
     /// mode and via a frozen `PerfectHashTable` in Inference mode.
     state: Mutex<state::AllocatorState>,
+    /// Cheap, lock-free mirror of `state.is_inference()` so `dealloc` can
+    /// skip Layer 2 reward bookkeeping (`record_latency`) without taking the
+    /// state lock on the Inference hot path. Flipped exactly once inside
+    /// `freeze()`/`load()` (which already touch the state lock) — a single
+    /// relaxed atomic load costs far less than a `Mutex` lock/unlock pair.
+    frozen: AtomicBool,
 }
 
 impl Default for Lohalloc {
@@ -183,6 +237,7 @@ impl Lohalloc {
             arena: Mutex::new(None),
             // Decision Engine starts in Training mode.
             state: Mutex::new(state::AllocatorState::new_training_const()),
+            frozen: AtomicBool::new(false),
         }
     }
 }
@@ -216,6 +271,35 @@ pub(crate) fn alloc_start_ns() -> u64 {
     ALLOC_START_NS.get()
 }
 
+impl Lohalloc {
+    /// Runs `f` with the same re-entrancy guard `alloc`/`dealloc` use, so
+    /// any allocation or deallocation `f` triggers synchronously on this
+    /// thread bypasses straight to `mmap` instead of trying to re-lock
+    /// `self.state`/`self.slab`/`self.buddy`/`self.arena`.
+    ///
+    /// Needed by every Phase 3 API method that both holds `self.state`'s
+    /// lock *and* can allocate/deallocate through ordinary Rust collections
+    /// (`freeze()`'s `Vec::collect()` inside `BanditPolicy::freeze`,
+    /// `load()`'s `PerfectHashTable::deserialize`, dropping an old
+    /// `BanditPolicy`'s `BTreeMap` on `reset_to_training`/`load`, …). If
+    /// this `Lohalloc` instance is the process's actual `#[global_allocator]`
+    /// (always true once installed via `lohalloc-cabi`; also true for any
+    /// binary using `#[global_allocator]` the way `lohalloc-example`/`-demo`
+    /// do), those nested allocations would otherwise call back into
+    /// `route_alloc_inner`/`dealloc`, which try to lock the *same* mutex
+    /// the outer call already holds — a guaranteed deadlock on the
+    /// non-reentrant `std::sync::Mutex`. Routing them to raw `mmap` instead
+    /// is wasteful (a whole page per nested allocation) but these are rare,
+    /// off-hot-path calls, so it's the right trade.
+    fn with_realloc_guard<T>(f: impl FnOnce() -> T) -> T {
+        let depth = IN_ALLOC.get();
+        IN_ALLOC.set(depth + 1);
+        let result = f();
+        IN_ALLOC.set(depth);
+        result
+    }
+}
+
 // SAFETY: we uphold the `GlobalAlloc` contract:
 //  - `alloc` returns a valid, aligned, `layout.size()`-byte buffer or null.
 //  - `dealloc` releases a buffer previously returned by `alloc` with a
@@ -241,7 +325,7 @@ unsafe impl GlobalAlloc for Lohalloc {
         // thread (e.g. a backend's `Vec` growing), serve directly from mmap.
         let depth = IN_ALLOC.get();
         if depth > 0 {
-            return self.system_alloc_with_header(total, align, 0);
+            return self.system_alloc_with_header(total, align, 0, SIZE_CLASS_UNTRACKED);
         }
 
         IN_ALLOC.set(depth + 1);
@@ -278,16 +362,37 @@ unsafe impl GlobalAlloc for Lohalloc {
             observer::emit_free(header.size, header.hash, ptr as u64, frag);
         }
 
+        // Layer 2 (dealloc-side reward): only pay for timing + the state
+        // lock while Training, and only for allocations that went through
+        // `route_alloc`/`route_alloc_with_hash` (tagged with a real
+        // `size_class_hint` — re-entrancy-bypass and Strategy-preferred
+        // allocations never had a matching bandit pull to attribute this
+        // to, so they're tagged `SIZE_CLASS_UNTRACKED` and skipped here).
+        // Folding dealloc latency into the same arm as an additional reward
+        // sample (rather than a separate ledger) is what lets the bandit
+        // see Arena's free-is-a-no-op advantage.
+        let track_reward =
+            !self.frozen.load(Ordering::Relaxed) && header.size_class_hint != SIZE_CLASS_UNTRACKED;
+        let t0 = if track_reward {
+            Some(clock::now_ns())
+        } else {
+            None
+        };
+
+        // Recompute `pad` from the header's own `align_log2` rather than
+        // trusting the caller's `layout` — the two always agree for a
+        // correctly-paired alloc/dealloc, but reading it from the header
+        // means this same logic works for `lohalloc-cabi`'s `free(ptr)`,
+        // which never has a `Layout` at all.
+        let pad = header_pad(1usize << header.align_log2);
         match Backend::from_u8(header.backend) {
             Some(Backend::Slab) => {
-                let pad = header_pad(layout.align().max(MIN_ALIGN));
                 let block = ptr.sub(pad);
                 if let Ok(mut slab) = self.slab.lock() {
                     unsafe { slab.dealloc(block, header.size) };
                 }
             }
             Some(Backend::Buddy) => {
-                let pad = header_pad(layout.align().max(MIN_ALIGN));
                 let block = ptr.sub(pad);
                 if let Ok(mut buddy) = self.buddy.lock() {
                     unsafe { buddy.dealloc(block, header.size) };
@@ -308,6 +413,15 @@ unsafe impl GlobalAlloc for Lohalloc {
                 debug_assert!(false, "dealloc: unknown backend tag");
             }
         }
+
+        if let (Some(t0), Some(core_backend)) =
+            (t0, Backend::from_u8(header.backend).map(Backend::to_core))
+        {
+            let dt = clock::now_ns().saturating_sub(t0);
+            if let Ok(mut st) = self.state.lock() {
+                st.record_latency(header.hash, core_backend, header.size_class_hint, dt);
+            }
+        }
     }
 }
 
@@ -320,32 +434,67 @@ impl Lohalloc {
     /// frozen `PerfectHashTable` is looked up. If the recommended backend
     /// fails (e.g. Arena full, Slab exhausted), we fall through to size-based
     /// routing — the Phase 1 fallback chain (Slab → Buddy → System).
+    ///
+    /// Layer 2: while Training, the recommended arm's *actual* outcome
+    /// latency (including the cost of a failed attempt + fallthrough, if
+    /// any) is measured and fed back to the bandit as this allocation's
+    /// reward — this is what lets a Signature that keeps recommending a
+    /// backend which then fails (e.g. an exhausted Arena) learn to route
+    /// elsewhere. Inference mode is a pure lookup with no reward
+    /// bookkeeping, so it never pays the `now_ns()` cost.
     fn route_alloc(&self, size: usize, align: usize, pad: usize, total: usize) -> *mut u8 {
-        // Capture the topological hash of the current call stack.
         let hash = topology::fast_stack_hash();
+        self.route_alloc_inner(hash, size, align, pad, total)
+    }
 
-        // Ask the Decision Engine which backend to try.
-        let recommended: Option<lohalloc_core::Backend> = if let Ok(mut st) = self.state.lock() {
-            let backend = st.route(hash, size);
-            // Record the outcome (Training mode updates the bandit; Inference
-            // is a no-op). We optimistically record success here — if the
-            // recommended backend fails and we fall through, the bandit will
-            // learn from the overall allocation pattern.
-            st.record(hash, backend, size);
-            Some(backend)
+    /// Shared implementation for `route_alloc`/`route_alloc_with_hash` —
+    /// both differ only in how `hash` is obtained (stack walk vs.
+    /// caller-provided, for the replay engine).
+    fn route_alloc_inner(
+        &self,
+        hash: u64,
+        size: usize,
+        align: usize,
+        pad: usize,
+        total: usize,
+    ) -> *mut u8 {
+        let size_class = state::size_class_for(size);
+
+        let (recommended, is_training) = if let Ok(mut st) = self.state.lock() {
+            (Some(st.route(hash, size)), !st.is_inference())
         } else {
-            None
+            (None, false)
         };
 
-        // Try the recommended backend first.
-        if let Some(backend) = recommended {
-            if let Some(ptr) = self.try_backend(backend, total, align, pad, hash) {
-                return ptr;
+        if !is_training {
+            // Inference (or a poisoned lock): no reward bookkeeping — just
+            // the recommended backend, falling through to size-based
+            // routing on failure, as before.
+            if let Some(backend) = recommended {
+                if let Some(ptr) = self.try_backend(backend, total, align, pad, hash, size_class) {
+                    return ptr;
+                }
             }
+            return self.route_by_size(total, align, pad, hash, size_class);
         }
 
-        // Fall through to size-based routing (Phase 1 fallback chain).
-        self.route_by_size(total, align, pad, hash)
+        // Training: time the *actual* outcome (success, or failure +
+        // fallthrough) and attribute it to the recommended arm regardless
+        // of which backend ultimately served the request.
+        let t0 = clock::now_ns();
+        let ptr = match recommended {
+            Some(backend) => self
+                .try_backend(backend, total, align, pad, hash, size_class)
+                .unwrap_or_else(|| self.route_by_size(total, align, pad, hash, size_class)),
+            None => self.route_by_size(total, align, pad, hash, size_class),
+        };
+        let latency_ns = clock::now_ns().saturating_sub(t0);
+
+        if let (Some(backend), Ok(mut st)) = (recommended, self.state.lock()) {
+            st.record_latency(hash, backend, size_class, latency_ns);
+        }
+
+        ptr
     }
 
     /// Attempt an allocation via a specific backend. Returns the user pointer
@@ -357,13 +506,24 @@ impl Lohalloc {
         align: usize,
         pad: usize,
         hash: u64,
+        size_class_hint: u8,
     ) -> Option<*mut u8> {
         let local_backend = Backend::from_core(backend);
         match backend {
             lohalloc_core::Backend::Slab if total <= SLAB_MAX => {
                 if let Ok(mut slab) = self.slab.lock() {
                     slab.alloc(total).map(|block| {
-                        self.write_header(block, pad, local_backend, total, 0, 0, hash)
+                        self.write_header(
+                            block,
+                            pad,
+                            local_backend,
+                            total,
+                            0,
+                            0,
+                            hash,
+                            size_class_hint,
+                            align,
+                        )
                     })
                 } else {
                     None
@@ -372,7 +532,17 @@ impl Lohalloc {
             lohalloc_core::Backend::Buddy if total <= BUDDY_MAX => {
                 if let Ok(mut buddy) = self.buddy.lock() {
                     buddy.alloc(total).map(|block| {
-                        self.write_header(block, pad, local_backend, total, 0, 0, hash)
+                        self.write_header(
+                            block,
+                            pad,
+                            local_backend,
+                            total,
+                            0,
+                            0,
+                            hash,
+                            size_class_hint,
+                            align,
+                        )
                     })
                 } else {
                     None
@@ -386,7 +556,17 @@ impl Lohalloc {
                     }
                     if let Some(ref mut arena) = *arena_guard {
                         arena.alloc(total, align).map(|block| {
-                            self.write_header(block, pad, local_backend, total, 0, 0, hash)
+                            self.write_header(
+                                block,
+                                pad,
+                                local_backend,
+                                total,
+                                0,
+                                0,
+                                hash,
+                                size_class_hint,
+                                align,
+                            )
                         })
                     } else {
                         None
@@ -396,7 +576,7 @@ impl Lohalloc {
                 }
             }
             lohalloc_core::Backend::System => {
-                let ptr = self.system_alloc_with_header(total, align, hash);
+                let ptr = self.system_alloc_with_header(total, align, hash, size_class_hint);
                 if ptr.is_null() {
                     None
                 } else {
@@ -410,12 +590,29 @@ impl Lohalloc {
     }
 
     /// Size-based fallback routing (Phase 1): Slab → Buddy → System.
-    fn route_by_size(&self, total: usize, align: usize, pad: usize, hash: u64) -> *mut u8 {
+    fn route_by_size(
+        &self,
+        total: usize,
+        align: usize,
+        pad: usize,
+        hash: u64,
+        size_class_hint: u8,
+    ) -> *mut u8 {
         // 1. Slab: small, naturally-aligned requests.
         if total <= SLAB_MAX {
             if let Ok(mut slab) = self.slab.lock() {
                 if let Some(block) = slab.alloc(total) {
-                    return self.write_header(block, pad, Backend::Slab, total, 0, 0, hash);
+                    return self.write_header(
+                        block,
+                        pad,
+                        Backend::Slab,
+                        total,
+                        0,
+                        0,
+                        hash,
+                        size_class_hint,
+                        align,
+                    );
                 }
             }
         }
@@ -424,19 +621,35 @@ impl Lohalloc {
         if total <= BUDDY_MAX {
             if let Ok(mut buddy) = self.buddy.lock() {
                 if let Some(block) = buddy.alloc(total) {
-                    return self.write_header(block, pad, Backend::Buddy, total, 0, 0, hash);
+                    return self.write_header(
+                        block,
+                        pad,
+                        Backend::Buddy,
+                        total,
+                        0,
+                        0,
+                        hash,
+                        size_class_hint,
+                        align,
+                    );
                 }
             }
         }
 
         // 3. System Fallback: any size/alignment.
-        self.system_alloc_with_header(total, align, hash)
+        self.system_alloc_with_header(total, align, hash, size_class_hint)
     }
 
     /// Allocate `total` bytes at `align` via the System Fallback, write a
     /// `System`-tagged header, and leak the `Mapping` (dealloc will `munmap`
     /// using the base/length recorded in the header). Returns the user ptr.
-    fn system_alloc_with_header(&self, total: usize, align: usize, hash: u64) -> *mut u8 {
+    fn system_alloc_with_header(
+        &self,
+        total: usize,
+        align: usize,
+        hash: u64,
+        size_class_hint: u8,
+    ) -> *mut u8 {
         let pad = header_pad(align);
         let mapping = match system::alloc_pages(total, align) {
             Some(m) => m,
@@ -449,7 +662,17 @@ impl Lohalloc {
         let raw_base = unsafe { mapping.raw_base_for_unmap() };
         let raw_len = unsafe { mapping.raw_len_for_unmap() };
         core::mem::forget(mapping);
-        self.write_header(base, pad, Backend::System, total, raw_base, raw_len, hash)
+        self.write_header(
+            base,
+            pad,
+            Backend::System,
+            total,
+            raw_base,
+            raw_len,
+            hash,
+            size_class_hint,
+            align,
+        )
     }
 
     /// Write the ownership header at `block + pad - HEADER_SIZE` and return
@@ -465,13 +688,17 @@ impl Lohalloc {
         base: usize,
         map_len: usize,
         hash: u64,
+        size_class_hint: u8,
+        align: usize,
     ) -> *mut u8 {
         let user = unsafe { block.add(pad) };
         let backend_tag = backend as u8;
         let header = Header {
             magic: MAGIC,
             backend: backend_tag,
-            _pad: [0; 7],
+            size_class_hint,
+            align_log2: align.trailing_zeros() as u8,
+            _pad: [0; 5],
             size: total,
             base,
             map_len,
@@ -525,12 +752,22 @@ impl Lohalloc {
             if let Some(ref mut arena) = *arena_guard {
                 if let Some(block) = arena.alloc(total, align) {
                     let hash = topology::fast_stack_hash();
-                    return self.write_header(block, pad, Backend::Arena, total, 0, 0, hash);
+                    return self.write_header(
+                        block,
+                        pad,
+                        Backend::Arena,
+                        total,
+                        0,
+                        0,
+                        hash,
+                        SIZE_CLASS_UNTRACKED,
+                        align,
+                    );
                 }
             }
         }
         // Arena full or init failed → fall through to System.
-        self.system_alloc_with_header(total, align, 0)
+        self.system_alloc_with_header(total, align, 0, SIZE_CLASS_UNTRACKED)
     }
 
     // -----------------------------------------------------------------
@@ -548,9 +785,12 @@ impl Lohalloc {
     ///
     /// Panics if already in Inference mode (double-freeze is a logic error).
     pub fn freeze(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.freeze();
-        }
+        Self::with_realloc_guard(|| {
+            if let Ok(mut state) = self.state.lock() {
+                state.freeze();
+            }
+        });
+        self.frozen.store(true, Ordering::Release);
     }
 
     /// Snapshot the current "best backend per Signature" without
@@ -559,11 +799,13 @@ impl Lohalloc {
     ///
     /// Returns an empty Vec in Inference mode.
     pub fn routing_snapshot(&self) -> Vec<(u64, lohalloc_core::Backend)> {
-        if let Ok(state) = self.state.lock() {
-            state.routing_snapshot()
-        } else {
-            Vec::new()
-        }
+        Self::with_realloc_guard(|| {
+            if let Ok(state) = self.state.lock() {
+                state.routing_snapshot()
+            } else {
+                Vec::new()
+            }
+        })
     }
 
     /// Number of distinct Signatures observed so far (Training mode only).
@@ -580,9 +822,12 @@ impl Lohalloc {
     /// any frozen routing table or learned bandit weights. Used by the GUI's
     /// "back to training" button.
     pub fn reset_to_training(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.reset_to_training();
-        }
+        Self::with_realloc_guard(|| {
+            if let Ok(mut state) = self.state.lock() {
+                state.reset_to_training();
+            }
+        });
+        self.frozen.store(false, Ordering::Release);
     }
 
     /// Export the frozen routing table to `.lohalloc` binary bytes.
@@ -590,11 +835,13 @@ impl Lohalloc {
     /// Returns `None` if the allocator is still in Training mode (call
     /// `freeze()` first).
     pub fn export(&self) -> Option<Vec<u8>> {
-        if let Ok(state) = self.state.lock() {
-            state.export()
-        } else {
-            None
-        }
+        Self::with_realloc_guard(|| {
+            if let Ok(state) = self.state.lock() {
+                state.export()
+            } else {
+                None
+            }
+        })
     }
 
     /// Load a `.lohalloc` model file and transition directly to Inference mode.
@@ -602,14 +849,17 @@ impl Lohalloc {
     /// Returns `true` if the model was loaded successfully, `false` if the
     /// data is malformed or the state lock is poisoned.
     pub fn load(&self, data: &[u8]) -> bool {
-        let new_state = state::AllocatorState::load(data);
-        if let Some(s) = new_state {
-            if let Ok(mut state) = self.state.lock() {
-                *state = s;
-                return true;
+        Self::with_realloc_guard(|| {
+            let new_state = state::AllocatorState::load(data);
+            if let Some(s) = new_state {
+                if let Ok(mut state) = self.state.lock() {
+                    *state = s;
+                    self.frozen.store(true, Ordering::Release);
+                    return true;
+                }
             }
-        }
-        false
+            false
+        })
     }
 
     /// Returns `true` if the Decision Engine is in Inference (frozen) mode.
@@ -644,7 +894,7 @@ impl Lohalloc {
 
         let depth = IN_ALLOC.get();
         if depth > 0 {
-            return self.system_alloc_with_header(total, align, hash);
+            return self.system_alloc_with_header(total, align, hash, SIZE_CLASS_UNTRACKED);
         }
 
         IN_ALLOC.set(depth + 1);
@@ -664,7 +914,9 @@ impl Lohalloc {
         unsafe { self.dealloc(ptr, layout) };
     }
 
-    /// Internal: route an allocation with a caller-provided hash.
+    /// Internal: route an allocation with a caller-provided hash. Shares the
+    /// Layer 2 reward-measurement logic with `route_alloc` via
+    /// `route_alloc_inner` — see its doc comment.
     fn route_alloc_with_hash(
         &self,
         size: usize,
@@ -673,21 +925,7 @@ impl Lohalloc {
         total: usize,
         hash: u64,
     ) -> *mut u8 {
-        let recommended: Option<lohalloc_core::Backend> = if let Ok(mut st) = self.state.lock() {
-            let backend = st.route(hash, size);
-            st.record(hash, backend, size);
-            Some(backend)
-        } else {
-            None
-        };
-
-        if let Some(backend) = recommended {
-            if let Some(ptr) = self.try_backend(backend, total, align, pad, hash) {
-                return ptr;
-            }
-        }
-
-        self.route_by_size(total, align, pad, hash)
+        self.route_alloc_inner(hash, size, align, pad, total)
     }
 
     /// Allocate with a caller-provided hash **and** a strategy override
@@ -711,13 +949,18 @@ impl Lohalloc {
 
         let depth = IN_ALLOC.get();
         if depth > 0 {
-            return self.system_alloc_with_header(total, align, hash);
+            return self.system_alloc_with_header(total, align, hash, SIZE_CLASS_UNTRACKED);
         }
 
-        // If the strategy specifies a preferred backend, try it first.
+        // If the strategy specifies a preferred backend, try it first. This
+        // bypasses the bandit's `select()` entirely, so there is no matching
+        // pull to attribute a Layer 2 reward to — tag `SIZE_CLASS_UNTRACKED`
+        // so `dealloc` skips reward bookkeeping for this allocation.
         if let Some(preferred) = strategy.preferred_backend(size) {
             IN_ALLOC.set(depth + 1);
-            if let Some(ptr) = self.try_backend(preferred, total, align, pad, hash) {
+            if let Some(ptr) =
+                self.try_backend(preferred, total, align, pad, hash, SIZE_CLASS_UNTRACKED)
+            {
                 IN_ALLOC.set(depth);
                 return ptr;
             }
@@ -729,6 +972,29 @@ impl Lohalloc {
         let ptr = self.route_alloc_with_hash(size, align, pad, total, hash);
         IN_ALLOC.set(depth);
         ptr
+    }
+
+    /// Snapshot of per-backend live-region/usage counters, for benchmarks
+    /// and tests that want to observe backend state without depending on
+    /// the `telemetry-observer` feature (Phase 6).
+    pub fn backend_counters(&self) -> BackendCounters {
+        let slab_region_count = self.slab.lock().map(|s| s.region_count()).unwrap_or(0);
+        let buddy_region_count = self.buddy.lock().map(|b| b.region_count()).unwrap_or(0);
+        let (arena_used, arena_capacity) = self
+            .arena
+            .lock()
+            .map(|a| {
+                a.as_ref()
+                    .map(|arena| (arena.used(), arena.capacity()))
+                    .unwrap_or((0, 0))
+            })
+            .unwrap_or((0, 0));
+        BackendCounters {
+            slab_region_count,
+            buddy_region_count,
+            arena_used,
+            arena_capacity,
+        }
     }
 
     /// Returns which backend served an allocation by reading the Header.
@@ -748,6 +1014,69 @@ impl Lohalloc {
             Backend::System => lohalloc_core::Backend::System,
             Backend::Arena => lohalloc_core::Backend::Arena,
         })
+    }
+
+    /// Bytes usable by the caller for the allocation at `ptr` — the
+    /// backend's actual reserved capacity minus header overhead, which may
+    /// be larger than the originally requested size (e.g. Slab rounds up
+    /// to a size class). Returns 0 for a null or foreign (bad-magic)
+    /// pointer. This is what `lohalloc-cabi` exposes as C's
+    /// `malloc_usable_size` and uses internally to size `realloc` copies —
+    /// both need this without a `Layout`, which C never provides.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid pointer previously returned by this allocator,
+    /// or null.
+    pub unsafe fn usable_size(&self, ptr: *mut u8) -> usize {
+        if ptr.is_null() {
+            return 0;
+        }
+        let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
+        if header.magic != MAGIC {
+            return 0;
+        }
+        let pad = header_pad(1usize << header.align_log2);
+        header.size.saturating_sub(pad)
+    }
+
+    /// Deallocate a pointer previously returned by this allocator, without a
+    /// `Layout` — the header is authoritative for routing (`dealloc`'s
+    /// `layout` parameter is otherwise unused). This is what
+    /// `lohalloc-cabi`'s `free(ptr)` uses, since C's `free` never receives
+    /// a size/alignment. A no-op for a null pointer.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid pointer previously returned by this allocator,
+    /// or null.
+    pub unsafe fn dealloc_raw(&self, ptr: *mut u8) {
+        unsafe { <Self as GlobalAlloc>::dealloc(self, ptr, Layout::new::<u8>()) };
+    }
+
+    /// True if `ptr` was allocated by this allocator instance (valid header
+    /// with a matching magic). `false` for null.
+    ///
+    /// This is the authoritative foreign-pointer test — unlike
+    /// `backend_for_ptr` (which assumes the caller already knows `ptr` is
+    /// ours and just reads the tag byte, so a foreign pointer's incidental
+    /// byte value could coincidentally decode as a valid `Backend`), this
+    /// checks the magic. `lohalloc-cabi` uses it to decide whether
+    /// `free`/`realloc`/`malloc_usable_size` should route through this
+    /// allocator or delegate to the real libc for a pointer it didn't
+    /// allocate (e.g. one from before this library's symbols won out).
+    ///
+    /// # Safety
+    /// `ptr` must either be a pointer this allocator could plausibly have
+    /// produced, or any other pointer obtained from a `malloc`-family
+    /// allocator (reading the `HEADER_SIZE` bytes immediately before `ptr`
+    /// must not be out-of-bounds — true for any malloc'd pointer, since a
+    /// real allocator's own bookkeeping always occupies that region), or
+    /// null.
+    pub unsafe fn owns(&self, ptr: *mut u8) -> bool {
+        if ptr.is_null() {
+            return false;
+        }
+        let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
+        header.magic == MAGIC
     }
 }
 

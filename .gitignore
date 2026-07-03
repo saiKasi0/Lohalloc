@@ -8,3 +8,10 @@ dist/
 node_modules
 *.png
 test-results
+bench/native/build/
+results/
+.terraform
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log

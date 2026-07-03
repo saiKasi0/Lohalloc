@@ -1,0 +1,9 @@
+target/
+bench/native/build/
+results/
+node_modules
+gui/node_modules
+gui/dist
+.git
+.claude
+test-results

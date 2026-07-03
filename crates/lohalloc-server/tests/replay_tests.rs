@@ -3,7 +3,9 @@
 //! These tests exercise the public replay API through the crate boundary,
 //! validating:
 //! - JSON and CSV trace parsing (valid + malformed)
-//! - Replay determinism (same trace → identical `.lohalloc` model)
+//! - Replay determinism (same trace → structurally identical `.lohalloc`
+//!   model — same Signature count/op count; not byte-identical, since
+//!   rewards come from real measured latency, see `replay.rs`'s module doc)
 //! - `.lohalloc` roundtrip (replay → export → load into fresh allocator)
 //! - Telemetry emission during replay
 //! - Mixed alloc/free operations
@@ -205,9 +207,18 @@ fn replay_determinism_identical_models() {
     ]"#;
     let r1 = replay_trace_json(json, None).unwrap();
     let r2 = replay_trace_json(json, None).unwrap();
+    // Structurally identical, not byte-identical: rewards now come from
+    // real measured latency (Phase 6), so run-to-run timing jitter can
+    // occasionally flip which backend wins a near-tied Signature. See
+    // `replay.rs`'s module doc "Determinism" section.
+    let t1 = lohalloc_alloc::perfect_hash::PerfectHashTable::deserialize(&r1.lohalloc_bytes)
+        .expect("r1 model should deserialize");
+    let t2 = lohalloc_alloc::perfect_hash::PerfectHashTable::deserialize(&r2.lohalloc_bytes)
+        .expect("r2 model should deserialize");
     assert_eq!(
-        r1.lohalloc_bytes, r2.lohalloc_bytes,
-        "models must be identical"
+        t1.len(),
+        t2.len(),
+        "same trace should observe the same Signature count"
     );
     assert_eq!(r1.ops_executed, r2.ops_executed);
 }
