@@ -9,6 +9,8 @@ node_modules
 *.png
 test-results
 bench/native/build/
+bench/graphs/.venv/
+__pycache__/
 results/
 .terraform
 *.tfstate

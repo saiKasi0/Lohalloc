@@ -1,0 +1,3 @@
+# Graph rendering for Phase 6 bench reports. Deliberately minimal — matplotlib
+# only, no pandas/seaborn — so the venv builds fast and offline-ish.
+matplotlib>=3.7

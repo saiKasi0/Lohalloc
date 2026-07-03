@@ -29,9 +29,14 @@ tower-http = { version = "0.6", features = ["cors", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Fat LTO + a single codegen unit so the allocator hot path (stack walk →
+# hash → route → backend) inlines across crate/CGU boundaries — the default
+# 16 CGUs measurably limit inlining even under thin LTO, and lohalloc's
+# per-op costs are exactly the kind of small cross-crate calls that benefit.
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
+codegen-units = 1
 debug = false
 
 # Tests run under the custom global allocator; keep them panic-friendly.

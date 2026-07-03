@@ -56,7 +56,7 @@ help:
 	@echo "  make bench          — Rust criterion + latency_profile hypothesis suite (Phase 6)"
 	@echo "  make bench-native   — native C/C++ cross-allocator timing (Docker, Linux LD_PRELOAD)"
 	@echo "  make bench-cache    — native cachegrind cache-miss pass (Docker)"
-	@echo "  make bench-report   — aggregate results/*.json into bench-report.{json,md}"
+	@echo "  make bench-report   — consolidate results/raw/*.json into results/<timestamp>/ (report + graphs)"
 
 # ---- Builds ----
 shim:
@@ -116,7 +116,7 @@ RESULTS_DIR := results
 # Cross-allocator `comparison` runs once per allocator so criterion can
 # diff baselines (--save-baseline). See crates/lohalloc-bench.
 bench:
-	mkdir -p $(RESULTS_DIR)
+	mkdir -p $(RESULTS_DIR)/raw
 	cargo bench -p lohalloc-bench --bench backend_micro
 	cargo bench -p lohalloc-bench --bench hypothesis
 	cargo bench -p lohalloc-bench --bench inference_overhead
@@ -126,7 +126,7 @@ bench:
 	cargo bench -p lohalloc-bench --bench comparison --no-default-features --features alloc-mimalloc -- --save-baseline mimalloc
 	@for workload in slab arena buddy system adv-mixed; do \
 		for mode in training inference baseline forced:slab forced:buddy forced:system forced:arena; do \
-			out="$(RESULTS_DIR)/rust_$${workload}_$$(echo $$mode | tr ':' '-').json"; \
+			out="$(RESULTS_DIR)/raw/rust_$${workload}_$$(echo $$mode | tr ':' '-').json"; \
 			echo "latency_profile $$workload $$mode -> $$out"; \
 			cargo run -p lohalloc-bench --bin latency_profile --release -- \
 				--workload "$$workload" --mode "$$mode" --ops 100000 --out "$$out" || exit 1; \
@@ -139,14 +139,14 @@ bench:
 # Linux host, for a consistent, isolated environment.
 bench-native:
 	docker build -f docker/Dockerfile.bench -t lohalloc-bench .
-	mkdir -p $(RESULTS_DIR)
+	mkdir -p $(RESULTS_DIR)/raw
 	docker run --rm -v "$(CURDIR)/$(RESULTS_DIR):/lohalloc/results" lohalloc-bench
 
 # Cache-miss simulation (cachegrind) for the same native harness — much
 # slower than bench-native, so run separately and on demand.
 bench-cache:
 	docker build -f docker/Dockerfile.bench -t lohalloc-bench .
-	mkdir -p $(RESULTS_DIR)
+	mkdir -p $(RESULTS_DIR)/raw
 	docker run --rm -v "$(CURDIR)/$(RESULTS_DIR):/lohalloc/results" \
 		--entrypoint bash lohalloc-bench bench/run_native.sh --cachegrind
 
@@ -155,15 +155,18 @@ bench-cache:
 bench-native-host:
 	cargo build -p lohalloc-cabi --release
 	make -C bench/native
-	mkdir -p $(RESULTS_DIR)
+	mkdir -p $(RESULTS_DIR)/raw
 	bash bench/run_native.sh
 
 bench-cache-host:
 	cargo build -p lohalloc-cabi --release
 	make -C bench/native
-	mkdir -p $(RESULTS_DIR)
+	mkdir -p $(RESULTS_DIR)/raw
 	bash bench/run_native.sh --cachegrind
 
+# Consolidation step: moves results/raw/*.json into a fresh
+# results/<timestamp>/raw/, writes bench-report.{json,md} beside it, and
+# renders graphs into results/<timestamp>/graphs/ via a Python venv.
 bench-report:
 	cargo run -p lohalloc-bench --bin aggregate --release -- --results-dir $(RESULTS_DIR)
 

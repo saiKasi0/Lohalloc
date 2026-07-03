@@ -26,11 +26,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 NATIVE_DIR="$SCRIPT_DIR/native"
 RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/results}"
+# Raw per-invocation JSON is staged in results/raw/; `aggregate` later moves a
+# whole batch into a timestamped run dir (results/<timestamp>/raw/) alongside
+# the report and graphs. Keeping producers pointed at a fixed staging dir is
+# what lets separate make invocations (timing, cachegrind, rust latency) all
+# feed the same consolidation step.
+RAW_DIR="${RAW_DIR:-$RESULTS_DIR/raw}"
 # Cachegrind simulates every memory access in software (~20-50x slower than
 # native execution), so its pass uses a much smaller op count by default.
 OPS="${OPS:-$([ "$CACHEGRIND" = 1 ] && echo 2000 || echo 50000)}"
 
-mkdir -p "$RESULTS_DIR"
+mkdir -p "$RAW_DIR"
 
 if [ "$CACHEGRIND" = 1 ]; then
     if ! command -v valgrind >/dev/null 2>&1; then
@@ -86,7 +92,7 @@ CPP_WORKLOADS=(slab arena buddy system adv-mixed cpp-vector cpp-string)
 
 run_timing() {
     local lang="$1" binary="$2" workload="$3" allocator="$4" preload="$5" mode="$6" extra_env="$7"
-    local out="$RESULTS_DIR/native-${lang}-${allocator}-${workload}-${mode}.json"
+    local out="$RAW_DIR/native-${lang}-${allocator}-${workload}-${mode}.json"
     echo "==> [timing] $lang/$allocator/$workload ($mode)"
     # LD_PRELOAD/extra_env must be part of the *command string* hyperfine
     # runs, not hyperfine's own environment — `env VAR=x hyperfine ...`
@@ -110,7 +116,7 @@ run_timing() {
 # counters — see the Phase 6 plan's cache-metrics section.
 run_cachegrind() {
     local lang="$1" binary="$2" workload="$3" allocator="$4" preload="$5" mode="$6" extra_env="$7"
-    local out="$RESULTS_DIR/cachegrind-${lang}-${allocator}-${workload}-${mode}.json"
+    local out="$RAW_DIR/cachegrind-${lang}-${allocator}-${workload}-${mode}.json"
     local cg_out
     cg_out="$(mktemp)"
     echo "==> [cachegrind] $lang/$allocator/$workload ($mode)"
@@ -177,4 +183,4 @@ for lang_binary in "c:$NATIVE_DIR/build/bench_main_c:${C_WORKLOADS[*]}" "cpp:$NA
     done
 done
 
-echo "Results written to $RESULTS_DIR"
+echo "Raw results staged in $RAW_DIR (run 'make bench-report' to consolidate into results/<timestamp>/)"

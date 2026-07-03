@@ -36,7 +36,7 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::os::raw::{c_char, c_int};
 use std::sync::OnceLock;
 
@@ -96,6 +96,13 @@ fn libc_malloc_usable_size() -> Option<MallocUsableSizeFn> {
 
 static MALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Set once the auto-freeze (or an explicit freeze/model load) has happened.
+/// Lets `maybe_auto_freeze` skip the global `MALLOC_COUNT.fetch_add` for the
+/// rest of the run — before this flag existed, an "inference" benchmark run
+/// (`LOHALLOC_FREEZE_AFTER=1000`, 50k+ ops) kept paying a contended global
+/// RMW on every single malloc long after the freeze had fired.
+static FREEZE_FIRED: AtomicBool = AtomicBool::new(false);
+
 std::thread_local! {
     /// Re-entrancy depth for this thread's exported allocation calls. See
     /// `with_freeze_check` for why this exists.
@@ -113,14 +120,20 @@ fn freeze_after_threshold() -> Option<u64> {
 }
 
 /// Called after every successful "real" (non-delegated) allocation. Freezes
-/// exactly once when the configured threshold is crossed.
+/// exactly once when the configured threshold is crossed, then becomes a
+/// single relaxed load for the rest of the process lifetime.
 #[inline]
 fn maybe_auto_freeze() {
+    if FREEZE_FIRED.load(Ordering::Relaxed) {
+        return;
+    }
     let Some(threshold) = freeze_after_threshold() else {
         return;
     };
     let count = MALLOC_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if count == threshold {
+    // `>=` + `swap` (not `== threshold`): several threads can cross the
+    // threshold simultaneously; exactly one wins the swap and freezes.
+    if count >= threshold && !FREEZE_FIRED.swap(true, Ordering::Relaxed) {
         ALLOC.freeze();
     }
 }
@@ -362,6 +375,7 @@ fn set_errno(value: c_int) {
 /// the frozen Inference routing table.
 #[no_mangle]
 pub extern "C" fn lohalloc_freeze() {
+    FREEZE_FIRED.store(true, Ordering::Relaxed);
     ALLOC.freeze();
 }
 

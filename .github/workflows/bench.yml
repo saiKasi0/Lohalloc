@@ -103,8 +103,14 @@ jobs:
 
       - name: Merge and evaluate regression gate
         run: |
-          mkdir -p results/merged
-          cp results/x86_64/*.json results/arm64/*.json results/merged/ 2>/dev/null || true
+          # remote_bench.sh consolidates each host's raw JSON into
+          # results/<timestamp>/raw/, so gather the raw files recursively (not
+          # a flat results/*.json glob) into one staging dir the aggregator
+          # then consolidates + gates on. x86 first, arm second (same-named
+          # files collide across arches — arm wins, matching prior behavior).
+          mkdir -p results/merged/raw
+          find results/x86_64 -type f -path '*/raw/*.json' -exec cp {} results/merged/raw/ \; 2>/dev/null || true
+          find results/arm64  -type f -path '*/raw/*.json' -exec cp {} results/merged/raw/ \; 2>/dev/null || true
           cargo run -p lohalloc-bench --bin aggregate --release -- --results-dir results/merged
 
       - name: Upload results
