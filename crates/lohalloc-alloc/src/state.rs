@@ -9,7 +9,7 @@
 //!
 //! - **Inference**: `freeze()` collapses the bandit's learned weights into
 //!   a read-only `PerfectHashTable`. The hot path becomes a single
-//!   `hash → lookup → backend` — O(log n) binary search on a sorted array,
+//!   `hash → lookup → backend` — an O(1) minimal-perfect-hash lookup,
 //!   zero heap allocations. No further MAB updates; no telemetry emission.
 //!
 //! # State Transitions
@@ -70,7 +70,7 @@ pub enum AllocatorState {
     /// from outcomes.
     Training { bandit: BanditPolicy },
     /// Frozen mode: the bandit's weights have collapsed into a read-only
-    /// `PerfectHashTable`. The hot path is a single binary search.
+    /// `PerfectHashTable`. The hot path is a single O(1) MPHF lookup.
     Inference { routing_table: PerfectHashTable },
 }
 
@@ -115,7 +115,7 @@ impl AllocatorState {
                 bandit.select(sig)
             }
             Self::Inference { routing_table } => {
-                // Hash-and-jump: O(log n) binary search. Zero allocations.
+                // Hash-and-jump: O(1) minimal perfect hash lookup. Zero allocations.
                 if let Some(backend) = routing_table.lookup(hash) {
                     return backend;
                 }

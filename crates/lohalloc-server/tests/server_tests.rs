@@ -43,8 +43,7 @@ async fn health_returns_ok() {
 #[tokio::test]
 async fn upload_trace_valid_json_returns_lohalloc_bytes() {
     let addr = start_server().await;
-    let body =
-        r#"[{"timestamp":0,"op":"alloc","size":64,"stack_hash":100},{"timestamp":1500000,"op":"free","size":64,"stack_hash":100}]"#;
+    let body = r#"[{"timestamp":0,"op":"alloc","size":64,"stack_hash":100},{"timestamp":1500000,"op":"free","size":64,"stack_hash":100}]"#;
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/api/upload-trace"))
         .header(header::CONTENT_TYPE, "application/json")

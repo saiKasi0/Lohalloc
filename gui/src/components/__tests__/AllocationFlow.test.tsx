@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, act, fireEvent } from '@testing-library/react';
-import type { TelemetryRecord } from '../../types/telemetry';
+import type { BackendAllocCounts } from '../../hooks/useTelemetry';
 
 vi.mock('mermaid', () => ({
   default: {
@@ -9,38 +9,36 @@ vi.mock('mermaid', () => ({
   },
 }));
 
-function makeRecord(
-  overrides: Partial<TelemetryRecord> = {},
-): TelemetryRecord {
+function makeCounts(
+  overrides: Partial<BackendAllocCounts> = {},
+): BackendAllocCounts {
   return {
-    timestamp: 0,
-    op: 'alloc',
-    size: 64,
-    stack_hash: 100,
-    thread_id: 0,
-    result_ptr: '0x1000',
-    latency_ns: 100,
-    fragmentation_pct: 5,
-    backend: 'slab',
+    slab: 0,
+    buddy: 0,
+    system: 0,
+    arena: 0,
     ...overrides,
   };
 }
 
 describe('AllocationFlowModal', () => {
-  it('shows the awaiting-telemetry state when records is empty', async () => {
+  it('shows the awaiting-telemetry state when there are no allocations', async () => {
     const { AllocationFlowModal } = await import('../AllocationFlow');
-    render(<AllocationFlowModal records={[]} onClose={() => {}} />);
+    render(
+      <AllocationFlowModal
+        backendAllocCounts={makeCounts()}
+        onClose={() => {}}
+      />,
+    );
     expect(screen.getByText('AWAITING TELEMETRY...')).toBeDefined();
   });
 
   it('renders the distribution diagram once mermaid resolves', async () => {
     const { AllocationFlowModal } = await import('../AllocationFlow');
-    const records = [
-      makeRecord({ backend: 'slab' }),
-      makeRecord({ backend: 'buddy' }),
-      makeRecord({ backend: 'system' }),
-    ];
-    render(<AllocationFlowModal records={records} onClose={() => {}} />);
+    const counts = makeCounts({ slab: 1, buddy: 1, system: 1 });
+    render(
+      <AllocationFlowModal backendAllocCounts={counts} onClose={() => {}} />,
+    );
 
     await act(async () => {
       await Promise.resolve();
@@ -50,25 +48,25 @@ describe('AllocationFlowModal', () => {
     expect(screen.getByText(/TOTAL ALLOCATIONS ANALYZED: 3/)).toBeDefined();
   });
 
-  it('reflects the full run, not just the last 500 allocs', async () => {
-    // Regression test: distribution used to be computed from
-    // records.slice(-500), so the diagram only ever reflected the most
-    // recent 500 allocations and its percentages visibly reset/jumped as
-    // older records fell out of that window. It should reflect the whole
-    // (MAX_RECORDS-bounded) run instead.
+  it('reflects the run-cumulative total, not a trimmed records window', async () => {
+    // Regression test: the diagram used to derive its total by scanning the
+    // `records` prop, which useTelemetry trims to MAX_RECORDS (5000). Once a
+    // run exceeded that, the diagram's total silently fell behind and
+    // diverged from the header's cumulative ALLOC counter. It should read
+    // from useTelemetry's run-cumulative `backendAllocCounts` instead, which
+    // is never trimmed and can exceed MAX_RECORDS.
     const { AllocationFlowModal } = await import('../AllocationFlow');
-    const records: TelemetryRecord[] = [];
-    for (let i = 0; i < 700; i++) {
-      records.push(makeRecord({ backend: 'slab', result_ptr: `0x${i}` }));
-    }
-    render(<AllocationFlowModal records={records} onClose={() => {}} />);
+    const counts = makeCounts({ slab: 7000 });
+    render(
+      <AllocationFlowModal backendAllocCounts={counts} onClose={() => {}} />,
+    );
 
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
     });
 
-    expect(screen.getByText(/TOTAL ALLOCATIONS ANALYZED: 700/)).toBeDefined();
+    expect(screen.getByText(/TOTAL ALLOCATIONS ANALYZED: 7000/)).toBeDefined();
   });
 
   it('uses a stable mermaid render id across re-renders (not Date.now())', async () => {
@@ -85,7 +83,7 @@ describe('AllocationFlowModal', () => {
       const { AllocationFlowModal } = await import('../AllocationFlow');
       const { rerender } = render(
         <AllocationFlowModal
-          records={[makeRecord({ backend: 'slab' })]}
+          backendAllocCounts={makeCounts({ slab: 1 })}
           onClose={() => {}}
         />,
       );
@@ -98,7 +96,7 @@ describe('AllocationFlowModal', () => {
 
       rerender(
         <AllocationFlowModal
-          records={[makeRecord({ backend: 'slab' }), makeRecord({ backend: 'buddy' })]}
+          backendAllocCounts={makeCounts({ slab: 1, buddy: 1 })}
           onClose={() => {}}
         />,
       );
@@ -119,7 +117,9 @@ describe('AllocationFlowModal', () => {
   it('calls onClose when the backdrop is clicked', async () => {
     const { AllocationFlowModal } = await import('../AllocationFlow');
     const onClose = vi.fn();
-    render(<AllocationFlowModal records={[]} onClose={onClose} />);
+    render(
+      <AllocationFlowModal backendAllocCounts={makeCounts()} onClose={onClose} />,
+    );
     fireEvent.click(screen.getByTestId('allocation-flow-modal'));
     expect(onClose).toHaveBeenCalled();
   });
@@ -127,7 +127,9 @@ describe('AllocationFlowModal', () => {
   it('does not close when clicking inside the modal content', async () => {
     const { AllocationFlowModal } = await import('../AllocationFlow');
     const onClose = vi.fn();
-    render(<AllocationFlowModal records={[]} onClose={onClose} />);
+    render(
+      <AllocationFlowModal backendAllocCounts={makeCounts()} onClose={onClose} />,
+    );
     fireEvent.click(screen.getByText('ALLOCATION FLOW // MAB DISTRIBUTION'));
     expect(onClose).not.toHaveBeenCalled();
   });

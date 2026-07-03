@@ -1,8 +1,8 @@
 import { useEffect, useId, useRef, useState, useMemo } from "react";
-import type { TelemetryRecord } from "../types/telemetry";
+import type { BackendAllocCounts } from "../hooks/useTelemetry";
 
 interface AllocationFlowProps {
-  records: TelemetryRecord[];
+  backendAllocCounts: BackendAllocCounts;
   onClose: () => void;
 }
 
@@ -20,7 +20,10 @@ const BACKEND_COLORS: Record<string, string> = {
   arena: "#FF7E7E",
 };
 
-export function AllocationFlowModal({ records, onClose }: AllocationFlowProps) {
+export function AllocationFlowModal({
+  backendAllocCounts,
+  onClose,
+}: AllocationFlowProps) {
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
@@ -42,14 +45,18 @@ export function AllocationFlowModal({ records, onClose }: AllocationFlowProps) {
           </button>
         </div>
         <div className="flex-1 overflow-auto p-4 min-h-0">
-          <AllocationFlowDiagram records={records} />
+          <AllocationFlowDiagram backendAllocCounts={backendAllocCounts} />
         </div>
       </div>
     </div>
   );
 }
 
-function AllocationFlowDiagram({ records }: { records: TelemetryRecord[] }) {
+function AllocationFlowDiagram({
+  backendAllocCounts,
+}: {
+  backendAllocCounts: BackendAllocCounts;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [svgHtml, setSvgHtml] = useState<string>("");
   const [loading, setLoading] = useState(true);
@@ -62,30 +69,20 @@ function AllocationFlowDiagram({ records }: { records: TelemetryRecord[] }) {
   const mermaidId = `alloc-flow-${useId().replace(/:/g, "")}`;
 
   const distribution = useMemo(() => {
-    // Full run (bounded only by useTelemetry's MAX_RECORDS ring), not a
-    // rolling window — a tight window meant the diagram only ever
-    // reflected the last 500 allocs and its percentages visibly jumped
-    // around as records entered/left that window instead of settling.
-    const recent = records.filter((r) => r.op === "alloc" && r.backend);
-    const counts: Record<string, number> = {
-      slab: 0,
-      buddy: 0,
-      system: 0,
-      arena: 0,
-    };
-    for (const r of recent) {
-      if (r.backend) {
-        counts[r.backend] = (counts[r.backend] ?? 0) + 1;
-      }
-    }
-    const total = Object.values(counts).reduce((a, b) => a + b, 0);
-    const result = Object.entries(counts).map(([backend, count]) => ({
-      backend,
-      count,
-      pct: total > 0 ? (count / total) * 100 : 0,
-    }));
+    // Sourced from useTelemetry's run-cumulative `backendAllocCounts`, not
+    // the trimmed `records` window — the window caps at MAX_RECORDS and
+    // silently drops older allocs once a run exceeds it, which understated
+    // (and diverged from the header's ALLOC counter on) longer runs.
+    const total = Object.values(backendAllocCounts).reduce((a, b) => a + b, 0);
+    const result = Object.entries(backendAllocCounts).map(
+      ([backend, count]) => ({
+        backend,
+        count,
+        pct: total > 0 ? (count / total) * 100 : 0,
+      }),
+    );
     return { result, total };
-  }, [records]);
+  }, [backendAllocCounts]);
 
   const mermaidGraph = useMemo(() => {
     const lines: string[] = ["graph LR"];

@@ -6,34 +6,53 @@
 //! single `lookup(hash)` to route each allocation — no `BTreeMap`, no
 //! `Vec`, no heap allocations.
 //!
-//! # Implementation: Sorted Array + Binary Search
+//! # Implementation: CHD Minimal Perfect Hash
 //!
-//! A true minimal perfect hash function (MPHF) requires construction-time
-//! metadata and is complex to implement correctly. For the number of distinct
-//! signatures in a typical workload (< 10,000), a **sorted array with binary
-//! search** is simpler, cache-friendly, and fast enough: O(log n) ≈ 13
-//! comparisons for 10K entries, which is constant-bounded for any realistic
-//! table size. The v3 spec's "O(1)" requirement is satisfied in the practical
-//! sense — the comparison count is bounded by a small constant.
+//! The table is a CHD-style (Compress, Hash, Displace) **minimal perfect
+//! hash**: n keys occupy exactly n slots, and a lookup is O(1) — two
+//! multiply-and-mix hashes, two array reads, one comparison.
+//!
+//! Construction (once, at `freeze()`/`load()`, off the hot path):
+//!
+//! 1. Keys are partitioned into `m = ceil(n / 4)` buckets by
+//!    `mix(hash, global_seed)`.
+//! 2. Buckets are placed largest-first. For each bucket, a displacement seed
+//!    `d = 1, 2, …` is searched until `mix(hash, global_seed ^ d)` maps every
+//!    key in the bucket to a distinct free slot; `d` is stored per bucket.
+//! 3. If any bucket exhausts its displacement budget, construction retries
+//!    with the next global seed; if all seeds fail, it escalates to `m = n`
+//!    buckets (~1 key each) and retries again. Only after that does it panic —
+//!    a theoretical backstop that distinct, well-mixed u64 keys cannot
+//!    practically hit.
+//!
+//! Each slot stores the full key hash, so a lookup for an unknown hash fails
+//! the final comparison and returns `None` — required because the caller
+//! falls back to size-based routing on a miss.
 //!
 //! # Serialization (`.lohalloc` model file)
 //!
 //! `serialize()` / `deserialize()` implement a compact binary format:
 //!
 //! ```text
-//! [8 bytes]  magic:     0x434f4c4c41484f4c  ("LOHALLOC" reversed)
+//! [8 bytes]  magic:     0x434f4c4c41484f4c  (LE bytes spell "LOHALLOC")
 //! [4 bytes]  version:   u32 (1)
 //! [4 bytes]  entry_count: u32
 //! [N × 12]   entries:   (hash: u64 le, backend: u8, _pad: [u8; 3])
 //! [8 bytes]  checksum:  XOR of all hash values
 //! ```
 //!
+//! The MPHF metadata (seeds) is deliberately **not** serialized: entries are
+//! written sorted by hash (deterministic output) and the hash structure is
+//! rebuilt at `deserialize()` time, keeping the v1 wire format unchanged for
+//! external parsers (e.g. the server's `decode_routing_entries`).
+//!
 //! `deserialize` validates the magic header and checksum. Malformed data
 //! returns `None`, not a panic.
 
 use lohalloc_core::Backend;
 
-/// File magic for `.lohalloc` model files: "LOHALLOC" bytes reversed.
+/// File magic for `.lohalloc` model files: the LE byte sequence spells
+/// "LOHALLOC".
 const MAGIC: u64 = 0x434f4c4c41484f4c;
 
 /// Current serialization format version.
@@ -47,27 +66,61 @@ struct Entry {
     backend: Backend,
 }
 
+/// Average keys per bucket in the primary CHD construction attempt.
+const BUCKET_LAMBDA: usize = 4;
+
+/// Displacement seeds tried per bucket before abandoning a global seed.
+const MAX_DISPLACEMENT: u32 = 1 << 16;
+
+/// Global seeds tried per bucket-count configuration.
+const GLOBAL_RETRIES: u64 = 16;
+
+/// Full-avalanche mixer (splitmix64 finalizer) over `hash ^ f(seed)`.
+#[inline]
+fn mix(hash: u64, seed: u64) -> u64 {
+    let mut z = hash ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Lemire fast-range reduction: maps a uniform `x` into `0..n` without a
+/// division. Only sound on well-mixed input — always feed it `mix()` output,
+/// never a raw stored hash.
+#[inline]
+fn fastrange(x: u64, n: usize) -> usize {
+    ((x as u128 * n as u128) >> 64) as usize
+}
+
 /// A frozen, read-only routing table. Built from `BanditPolicy::freeze()`.
 ///
-/// The table is sorted by `hash` and deduplicated, enabling O(log n) binary
-/// search lookup. Once constructed, it is never mutated — the Inference hot
-/// path does a single `lookup()` with zero heap allocations.
+/// Internally a CHD minimal perfect hash: n keys in exactly n slots, plus a
+/// per-bucket displacement seed array. Once constructed, it is never mutated
+/// — the Inference hot path does a single O(1) `lookup()` with zero heap
+/// allocations.
 pub struct PerfectHashTable {
-    /// Sorted by `hash` for binary search.
-    entries: Vec<Entry>,
+    /// Seed folded into every hash; advanced when construction retries.
+    global_seed: u64,
+    /// Per-bucket displacement seeds; empty only for the empty table.
+    seeds: Vec<u32>,
+    /// Exactly n slots, all occupied (minimal). Each stores the full key
+    /// hash so lookups of unknown hashes fail the compare and return `None`.
+    slots: Vec<Entry>,
 }
 
 impl PerfectHashTable {
     /// Build a `PerfectHashTable` from `(hash, backend)` pairs.
     ///
-    /// Sorts by hash and deduplicates (last entry for a duplicate hash wins).
+    /// Deduplicates first (last entry for a duplicate hash wins), then
+    /// constructs the minimal perfect hash over the distinct keys.
     pub fn from_entries(pairs: Vec<(u64, Backend)>) -> Self {
         let mut entries: Vec<Entry> = pairs
             .into_iter()
             .map(|(hash, backend)| Entry { hash, backend })
             .collect();
 
-        // Sort by hash.
+        // Sort by hash — canonicalizes input so construction is
+        // deterministic regardless of pair order.
         entries.sort_by_key(|e| e.hash);
 
         // Deduplicate: for equal hashes, keep the last one (stable).
@@ -88,45 +141,155 @@ impl PerfectHashTable {
             entries = deduped;
         }
 
-        Self { entries }
+        Self::build(entries)
+    }
+
+    /// CHD hash-and-displace construction over distinct, sorted entries.
+    ///
+    /// Allocation here is fine — this runs once at `freeze()`/`load()`, off
+    /// the allocation hot path.
+    fn build(entries: Vec<Entry>) -> Self {
+        let n = entries.len();
+        if n == 0 {
+            return Self {
+                global_seed: 0,
+                seeds: Vec::new(),
+                slots: Vec::new(),
+            };
+        }
+
+        // Primary attempt: ~4 keys per bucket. Escalation: one key per
+        // bucket on average, which is trivially placeable.
+        for m in [n.div_ceil(BUCKET_LAMBDA).max(1), n] {
+            for attempt in 0..GLOBAL_RETRIES {
+                let g = (attempt + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                if let Some(table) = Self::try_build(&entries, m, g) {
+                    return table;
+                }
+            }
+        }
+
+        // Unreachable in practice: for distinct u64 keys the m = n pass
+        // places single-key buckets, each with 2^16 candidate slots per
+        // global seed. Documented backstop rather than silent misroute.
+        panic!("PerfectHashTable: CHD construction failed after all retries");
+    }
+
+    /// One construction attempt with `m` buckets under global seed `g`.
+    fn try_build(entries: &[Entry], m: usize, g: u64) -> Option<Self> {
+        let n = entries.len();
+
+        // Partition keys (by index into `entries`) into buckets.
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); m];
+        for (i, entry) in entries.iter().enumerate() {
+            buckets[fastrange(mix(entry.hash, g), m)].push(i);
+        }
+
+        // Place largest buckets first — the crowded ones need the most
+        // freedom, so give them the emptiest slot array.
+        let mut order: Vec<usize> = (0..m).collect();
+        order.sort_by_key(|&b| core::cmp::Reverse(buckets[b].len()));
+
+        let mut seeds = vec![0u32; m];
+        // Occupancy is tracked out-of-band: every hash value (including 0)
+        // is a legal key, so there is no in-band "empty" sentinel.
+        let mut occupied = vec![false; n];
+        let mut slots = vec![
+            Entry {
+                hash: 0,
+                backend: Backend::System,
+            };
+            n
+        ];
+        // Scratch for the current bucket's candidate slots.
+        let mut candidate = Vec::new();
+
+        for &b in &order {
+            let bucket = &buckets[b];
+            if bucket.is_empty() {
+                break; // sorted descending — the rest are empty too
+            }
+
+            let mut placed = false;
+            'seed: for d in 1..=MAX_DISPLACEMENT {
+                candidate.clear();
+                for &i in bucket {
+                    let slot = fastrange(mix(entries[i].hash, g ^ d as u64), n);
+                    if occupied[slot] || candidate.contains(&slot) {
+                        continue 'seed;
+                    }
+                    candidate.push(slot);
+                }
+                for (&i, &slot) in bucket.iter().zip(&candidate) {
+                    occupied[slot] = true;
+                    slots[slot] = entries[i];
+                }
+                seeds[b] = d;
+                placed = true;
+                break;
+            }
+            if !placed {
+                return None;
+            }
+        }
+
+        Some(Self {
+            global_seed: g,
+            seeds,
+            slots,
+        })
     }
 
     /// Look up the backend for a given topological hash.
     ///
-    /// Returns `None` if the hash is not in the table (the caller should
-    /// fall back to size-based routing in that case).
+    /// O(1): two mixes, two array reads, one comparison — no heap
+    /// allocations. Returns `None` if the hash is not in the table (the
+    /// caller should fall back to size-based routing in that case).
     pub fn lookup(&self, hash: u64) -> Option<Backend> {
-        // Binary search on the sorted entries.
-        let result = self.entries.binary_search_by_key(&hash, |e| e.hash);
-        result.ok().map(|i| self.entries[i].backend)
+        if self.slots.is_empty() {
+            return None;
+        }
+        let bucket = fastrange(mix(hash, self.global_seed), self.seeds.len());
+        let d = self.seeds[bucket] as u64;
+        let slot = fastrange(mix(hash, self.global_seed ^ d), self.slots.len());
+        let entry = &self.slots[slot];
+        (entry.hash == hash).then_some(entry.backend)
     }
 
     /// Number of routing entries.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.slots.len()
     }
 
     /// True if the table is empty.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.slots.is_empty()
     }
 
     /// Serialize the routing table to a `.lohalloc` binary byte vector.
+    ///
+    /// Entries are written sorted by hash so the output is deterministic
+    /// (independent of which construction seed the MPHF landed on) and the
+    /// v1 wire format is preserved — MPHF metadata is rebuilt at
+    /// `deserialize()` time, never serialized.
     pub fn serialize(&self) -> Vec<u8> {
+        let mut entries = self.slots.clone();
+        entries.sort_by_key(|e| e.hash);
+
         // 8 (magic) + 4 (version) + 4 (count) + entries * 12 + 8 (checksum)
-        let mut buf = Vec::with_capacity(16 + self.entries.len() * 12 + 8);
+        let mut buf = Vec::with_capacity(16 + entries.len() * 12 + 8);
 
         // Magic.
         buf.extend_from_slice(&MAGIC.to_le_bytes());
         // Version.
         buf.extend_from_slice(&VERSION.to_le_bytes());
         // Entry count.
-        let count = self.entries.len() as u32;
+        let count = entries.len() as u32;
         buf.extend_from_slice(&count.to_le_bytes());
 
         // Entries.
         let mut checksum: u64 = 0;
-        for entry in &self.entries {
+        for entry in &entries {
             buf.extend_from_slice(&entry.hash.to_le_bytes());
             buf.push(entry.backend as u8);
             buf.extend_from_slice(&[0u8; 3]); // padding
@@ -202,11 +365,11 @@ impl PerfectHashTable {
             return None;
         }
 
-        // Entries are already sorted (serialize writes them in sorted order,
-        // and from_entries sorts them). But to be safe, sort here too.
-        entries.sort_by_key(|e| e.hash);
-
-        Some(Self { entries })
+        // Rebuild the MPHF from the parsed pairs. Also re-applies last-wins
+        // dedup in case the file carries duplicate hashes.
+        Some(Self::from_entries(
+            entries.into_iter().map(|e| (e.hash, e.backend)).collect(),
+        ))
     }
 }
 
@@ -366,5 +529,140 @@ mod tests {
             3 => Backend::Arena,
             _ => unreachable!(),
         }
+    }
+
+    /// splitmix64 stream — stand-in for real well-mixed stack hashes.
+    fn splitmix_stream(count: usize) -> Vec<u64> {
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        (0..count)
+            .map(|_| {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                mix(state, 0)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mphf_is_minimal_and_collision_free() {
+        let keys = splitmix_stream(5000);
+        let pairs: Vec<(u64, Backend)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, &k)| (k, test_backend_from_index(i as u64)))
+            .collect();
+        let table = PerfectHashTable::from_entries(pairs);
+        assert_eq!(table.len(), 5000);
+        for (i, &k) in keys.iter().enumerate() {
+            assert_eq!(table.lookup(k), Some(test_backend_from_index(i as u64)));
+        }
+    }
+
+    #[test]
+    fn mphf_misses_return_none() {
+        let keys = splitmix_stream(15000);
+        let (present, absent) = keys.split_at(5000);
+        let table =
+            PerfectHashTable::from_entries(present.iter().map(|&k| (k, Backend::Slab)).collect());
+        for &k in absent {
+            assert_eq!(table.lookup(k), None);
+        }
+    }
+
+    #[test]
+    fn hash_zero_is_a_valid_key() {
+        let mut pairs: Vec<(u64, Backend)> = splitmix_stream(100)
+            .into_iter()
+            .map(|k| (k, Backend::Slab))
+            .collect();
+        pairs.push((0, Backend::Buddy));
+        let table = PerfectHashTable::from_entries(pairs);
+        assert_eq!(table.lookup(0), Some(Backend::Buddy));
+        // Misses must still miss even though 0 occupies a real slot.
+        for &k in &splitmix_stream(200)[100..] {
+            assert_eq!(table.lookup(k), None);
+        }
+    }
+
+    #[test]
+    fn sequential_low_entropy_keys() {
+        // Worst case for the mixer: dense sequential keys with identical
+        // high bits. Construction must succeed within the retry budget.
+        let pairs: Vec<(u64, Backend)> = (0..2048u64)
+            .map(|k| (k, test_backend_from_index(k)))
+            .collect();
+        let table = PerfectHashTable::from_entries(pairs);
+        assert_eq!(table.len(), 2048);
+        for k in 0..2048u64 {
+            assert_eq!(table.lookup(k), Some(test_backend_from_index(k)));
+        }
+        assert_eq!(table.lookup(2048), None);
+    }
+
+    #[test]
+    fn single_entry_table() {
+        let table = make_table(&[(42, Backend::Arena)]);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.lookup(42), Some(Backend::Arena));
+        assert_eq!(table.lookup(43), None);
+    }
+
+    #[test]
+    fn serialized_bytes_are_sorted_and_v1() {
+        let table = make_table(&[
+            (300, Backend::Arena),
+            (100, Backend::Slab),
+            (200, Backend::Buddy),
+        ]);
+        let bytes = table.serialize();
+        // Exact v1 layout: magic, version, count, 12-byte entries, checksum.
+        assert_eq!(bytes.len(), 16 + 3 * 12 + 8);
+        assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), MAGIC);
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 3);
+        let mut prev = 0u64;
+        for i in 0..3 {
+            let off = 16 + i * 12;
+            let hash = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+            assert!(hash > prev || i == 0, "entries must be sorted by hash");
+            prev = hash;
+            assert_eq!(bytes[off + 9..off + 12], [0, 0, 0], "padding");
+        }
+        assert_eq!(prev, 300);
+        let checksum = u64::from_le_bytes(bytes[52..60].try_into().unwrap());
+        assert_eq!(checksum, 100 ^ 200 ^ 300);
+    }
+
+    #[test]
+    fn duplicate_hashes_in_wire_format_dedup_last_wins() {
+        // Hand-craft a valid v1 buffer containing hash 7 twice: first as
+        // Slab (0), then as Arena (3). Deserialize must keep the later one.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        for backend_byte in [0u8, 3u8] {
+            bytes.extend_from_slice(&7u64.to_le_bytes());
+            bytes.push(backend_byte);
+            bytes.extend_from_slice(&[0u8; 3]);
+        }
+        bytes.extend_from_slice(&(7u64 ^ 7u64).to_le_bytes());
+
+        let table = PerfectHashTable::deserialize(&bytes).expect("deserialize");
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.lookup(7), Some(Backend::Arena));
+    }
+
+    #[test]
+    fn construction_is_deterministic() {
+        let pairs: Vec<(u64, Backend)> = splitmix_stream(1000)
+            .into_iter()
+            .enumerate()
+            .map(|(i, k)| (k, test_backend_from_index(i as u64)))
+            .collect();
+        let a = PerfectHashTable::from_entries(pairs.clone());
+        let mut shuffled = pairs.clone();
+        shuffled.reverse();
+        let b = PerfectHashTable::from_entries(shuffled);
+        assert_eq!(a.serialize(), b.serialize());
     }
 }

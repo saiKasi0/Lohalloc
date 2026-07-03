@@ -24,6 +24,20 @@ const ZERO_CUMULATIVE: CumulativeCounts = {
   bytesAlloc: 0,
 };
 
+/** Run-cumulative alloc count per backend, accumulated from EVERY alloc
+ * record as it arrives — not derived from the trimmed `records` window.
+ * Feeds AllocationFlow's routing-distribution diagram; sourcing it from
+ * `records` instead undercounted once a run exceeded MAX_RECORDS, since the
+ * window silently drops older records while this total keeps climbing. */
+export type BackendAllocCounts = Record<Backend, number>;
+
+const ZERO_BACKEND_COUNTS: BackendAllocCounts = {
+  slab: 0,
+  buddy: 0,
+  system: 0,
+  arena: 0,
+};
+
 /** Run-cumulative aggregate for one call-site stack hash. Accumulated from
  * every record for that hash across the WHOLE run — never derived from the
  * trimmed `records` window — so a hash discovered early never "disappears"
@@ -50,6 +64,9 @@ export function useTelemetry(): {
    * window (which would cap all three at ~MAX_RECORDS and freeze the header
    * counters mid-run). Reset by `resetState`. */
   cumulative: CumulativeCounts;
+  /** Run-cumulative alloc count per backend, covering the ENTIRE run — see
+   * the `BackendAllocCounts` doc comment. Reset by `resetState`. */
+  backendAllocCounts: BackendAllocCounts;
   /** Monotonic per-stack-hash aggregate covering the ENTIRE run, keyed by
    * `stack_hash`. Grows as new call sites are discovered and never drops a
    * hash — topology consumers (Constellations nodes, useConvergence's
@@ -67,6 +84,8 @@ export function useTelemetry(): {
   const [records, setRecords] = useState<TelemetryRecord[]>([]);
   const [totalReceived, setTotalReceived] = useState(0);
   const [cumulative, setCumulative] = useState<CumulativeCounts>(ZERO_CUMULATIVE);
+  const [backendAllocCounts, setBackendAllocCounts] =
+    useState<BackendAllocCounts>(ZERO_BACKEND_COUNTS);
   const [topology, setTopology] = useState<Map<number, HashAggregate>>(
     () => new Map(),
   );
@@ -120,11 +139,18 @@ export function useTelemetry(): {
       let batchAlloc = 0;
       let batchFree = 0;
       let batchBytes = 0;
+      const batchBackendCounts: BackendAllocCounts = {
+        slab: 0,
+        buddy: 0,
+        system: 0,
+        arena: 0,
+      };
       const topo = topologyRef.current;
       for (const r of buffered) {
         if (r.op === "alloc") {
           batchAlloc += 1;
           batchBytes += r.size;
+          if (r.backend) batchBackendCounts[r.backend] += 1;
         } else {
           batchFree += 1;
         }
@@ -146,6 +172,12 @@ export function useTelemetry(): {
         allocCount: c.allocCount + batchAlloc,
         freeCount: c.freeCount + batchFree,
         bytesAlloc: c.bytesAlloc + batchBytes,
+      }));
+      setBackendAllocCounts((c) => ({
+        slab: c.slab + batchBackendCounts.slab,
+        buddy: c.buddy + batchBackendCounts.buddy,
+        system: c.system + batchBackendCounts.system,
+        arena: c.arena + batchBackendCounts.arena,
       }));
       // Publish a fresh snapshot so consumers re-render. The map is bounded by
       // the number of unique call sites (small), so copying every flush is
@@ -289,6 +321,7 @@ export function useTelemetry(): {
     setRecords([]);
     setTotalReceived(0);
     setCumulative(ZERO_CUMULATIVE);
+    setBackendAllocCounts(ZERO_BACKEND_COUNTS);
     topologyRef.current = new Map();
     setTopology(new Map());
     bufferRef.current = [];
@@ -300,6 +333,7 @@ export function useTelemetry(): {
     records,
     totalReceived,
     cumulative,
+    backendAllocCounts,
     topology,
     isConnected,
     paused,

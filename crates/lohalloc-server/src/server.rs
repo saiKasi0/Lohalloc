@@ -1401,7 +1401,7 @@ async fn kill_all_simulations_handler(State(state): State<AppState>) -> Response
 /// The format is owned by `lohalloc_alloc::perfect_hash::PerfectHashTable`:
 ///
 /// ```text
-/// [8]    magic    "loha11oc" (LE u64)
+/// [8]    magic    0x434f4c4c41484f4c — LE bytes spell "LOHALLOC"
 /// [4]    version  (LE u32)
 /// [4]    count    (LE u32)
 /// [N×12] entries: (hash: u64 LE, backend: u8, _pad: [u8; 3])
@@ -1421,7 +1421,8 @@ fn decode_routing_entries(bytes: &[u8]) -> Vec<(u64, String)> {
     let mut pos = 0;
 
     let magic = read_u64_le(bytes, &mut pos);
-    // Magic: "COLLAHOL" = 0x434f4c4c41484f4c (matches `lohalloc_alloc::perfect_hash::MAGIC`).
+    // Magic: 0x434f4c4c41484f4c, LE bytes spell "LOHALLOC" (matches
+    // `lohalloc_alloc::perfect_hash::MAGIC`).
     if magic != 0x434f_4c4c_4148_4f4c {
         return Vec::new();
     }
@@ -1573,7 +1574,9 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/upload-trace")
-                    .body(Body::from(r#"[{"timestamp":0,"op":"alloc","size":64,"stack_hash":100}]"#))
+                    .body(Body::from(
+                        r#"[{"timestamp":0,"op":"alloc","size":64,"stack_hash":100}]"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -2101,7 +2104,10 @@ mod tests {
             "timestamps not strictly increasing: {second} <= {first}"
         );
         // Precision-safe: must round-trip through a JS `number` losslessly.
-        assert!(second < (1u64 << 53), "timestamp exceeds JS-safe range: {second}");
+        assert!(
+            second < (1u64 << 53),
+            "timestamp exceeds JS-safe range: {second}"
+        );
     }
 
     #[tokio::test]

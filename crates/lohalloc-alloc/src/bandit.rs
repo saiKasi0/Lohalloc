@@ -39,8 +39,8 @@
 //! **Training mode** uses `BTreeMap<Signature, ArmStats>` which requires
 //! `alloc`. Training mode is *not* the zero-allocation hot path — it's the
 //! learning phase. Once `freeze()` collapses the bandit into a
-//! `PerfectHashTable`, the hot path touches only the read-only table (binary
-//! search on a slice), which is zero-allocation.
+//! `PerfectHashTable`, the hot path touches only the read-only table (an
+//! O(1) minimal perfect hash lookup), which is zero-allocation.
 
 use std::collections::BTreeMap;
 

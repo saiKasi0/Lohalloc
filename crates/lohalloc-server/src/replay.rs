@@ -259,11 +259,9 @@ fn timestamps_are_degenerate(ops: &[TraceOp]) -> bool {
     if ops.len() < 2 {
         return false;
     }
-    let (min_ts, max_ts) = ops
-        .iter()
-        .fold((u64::MAX, 0u64), |(mn, mx), o| {
-            (mn.min(o.timestamp), mx.max(o.timestamp))
-        });
+    let (min_ts, max_ts) = ops.iter().fold((u64::MAX, 0u64), |(mn, mx), o| {
+        (mn.min(o.timestamp), mx.max(o.timestamp))
+    });
     max_ts.saturating_sub(min_ts) < ops.len() as u64
 }
 
@@ -618,7 +616,11 @@ mod tests {
         assert!(timestamps_are_degenerate(&[mk(0), mk(1), mk(2)]));
         assert!(timestamps_are_degenerate(&[mk(7), mk(7), mk(7)]));
         // Real ns spread: not degenerate.
-        assert!(!timestamps_are_degenerate(&[mk(0), mk(1_000_000), mk(2_000_000)]));
+        assert!(!timestamps_are_degenerate(&[
+            mk(0),
+            mk(1_000_000),
+            mk(2_000_000)
+        ]));
         // 0 or 1 op: never degenerate (nothing to collapse) — honored as-is.
         assert!(!timestamps_are_degenerate(&[]));
         assert!(!timestamps_are_degenerate(&[mk(98765)]));

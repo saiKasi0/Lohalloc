@@ -25,7 +25,8 @@ Plane** owns physical memory through four backends -- Bump Arena, Slab,
 Buddy, and System Fallback (`mmap`/`munmap`). The **Decision Engine**
 maps a `(topological_hash, size_class)` Signature to a backend, first
 using a UCB1 Multi-Armed Bandit during training and then collapsing
-into a read-only Perfect Hash Table for O(1) inference. The
+into a read-only Perfect Hash Table (a CHD minimal perfect hash) for
+O(1) inference. The
 **Observer** captures per-allocation metadata off the hot path via a
 lock-free `crossbeam-channel` ring buffer so telemetry never feeds back
 into allocator latency.
@@ -259,7 +260,8 @@ target/debug/deps/lohalloc_alloc-<hash> <test_name> --nocapture
 - **[`crates/lohalloc-alloc/src/bandit.rs`](./crates/lohalloc-alloc/src/bandit.rs)**
   -- UCB1 Multi-Armed Bandit policy with hysteresis.
 - **[`crates/lohalloc-alloc/src/perfect_hash.rs`](./crates/lohalloc-alloc/src/perfect_hash.rs)**
-  -- Frozen routing table + `.lohalloc` serialization format.
+  -- CHD minimal-perfect-hash routing table + `.lohalloc` serialization
+  format.
 
 ---
 

@@ -64,7 +64,9 @@ fn json_parse_missing_timestamp_is_rejected() {
 
 #[test]
 fn json_parse_malformed_bad_op() {
-    assert!(parse_json_trace(r#"[{"timestamp":0,"op":"bogus","size":64,"stack_hash":1}]"#).is_err());
+    assert!(
+        parse_json_trace(r#"[{"timestamp":0,"op":"bogus","size":64,"stack_hash":1}]"#).is_err()
+    );
 }
 
 #[test]

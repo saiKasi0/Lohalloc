@@ -70,6 +70,7 @@ function App() {
     records,
     totalReceived,
     topology,
+    backendAllocCounts,
     isConnected,
     resetState,
     serverError,
@@ -565,7 +566,7 @@ function App() {
 
       {flowModalOpen && (
         <AllocationFlowModal
-          records={records}
+          backendAllocCounts={backendAllocCounts}
           onClose={() => setFlowModalOpen(false)}
         />
       )}
