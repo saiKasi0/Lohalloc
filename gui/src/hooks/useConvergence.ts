@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import type { TelemetryRecord } from '../types/telemetry';
+import type { HashAggregate } from './useTelemetry';
 
 export interface ConvergenceState {
   /** 0–1: how much of the topology has been mapped (new-hash rate plateau) */
@@ -20,7 +21,10 @@ const STABILITY_VARIANCE_THRESHOLD = 0.02;
 const TOP_K_HASHES = 20; // only check stability for top-K by count
 const CONVERGENCE_THRESHOLD = 0.9;
 
-export function useConvergence(records: TelemetryRecord[]): ConvergenceState {
+export function useConvergence(
+  records: TelemetryRecord[],
+  topology?: Map<number, HashAggregate>,
+): ConvergenceState {
   return useMemo(() => {
     if (records.length === 0) {
       return {
@@ -33,43 +37,70 @@ export function useConvergence(records: TelemetryRecord[]): ConvergenceState {
     }
 
     // --- Topology progress: track unique hashes and new-hash rate ---
-    const seenHashes = new Set<number>();
-    const recentHashes = new Set<number>();
+    // Prefer the run-cumulative `topology` aggregate for the unique-hash count
+    // so it's monotonic (never drops as records age out of the window, which
+    // made the count — and the progress bar — oscillate). Fall back to the
+    // window when no aggregate is supplied (e.g. unit tests).
     const recentWindow = records.slice(-100);
 
-    for (const r of records) {
-      seenHashes.add(r.stack_hash);
-    }
+    // Per-hash occurrence counts within the recent window, used to detect
+    // hashes that are *newly discovered* (all their occurrences fall inside
+    // the recent window).
+    const recentCounts = new Map<number, number>();
     for (const r of recentWindow) {
-      recentHashes.add(r.stack_hash);
+      recentCounts.set(r.stack_hash, (recentCounts.get(r.stack_hash) ?? 0) + 1);
     }
 
-    // Count how many hashes in the recent window are NEW (not seen before that window)
-    const beforeRecent = new Set<number>();
-    const cutoff = records.length - recentWindow.length;
-    for (let i = 0; i < cutoff; i++) {
-      beforeRecent.add(records[i].stack_hash);
-    }
+    let uniqueHashCount: number;
     let newInRecent = 0;
-    for (const h of recentHashes) {
-      if (!beforeRecent.has(h)) newInRecent++;
+    if (topology && topology.size > 0) {
+      uniqueHashCount = topology.size;
+      for (const [h, recent] of recentCounts) {
+        const agg = topology.get(h);
+        const total = agg ? agg.allocCount + agg.freeCount : recent;
+        // A hash whose entire run-total is inside the recent window has only
+        // just been discovered — count it toward the new-hash rate.
+        if (total <= recent) newInRecent++;
+      }
+    } else {
+      const seenHashes = new Set<number>();
+      for (const r of records) seenHashes.add(r.stack_hash);
+      uniqueHashCount = seenHashes.size;
+      const beforeRecent = new Set<number>();
+      const cutoff = records.length - recentWindow.length;
+      for (let i = 0; i < cutoff; i++) beforeRecent.add(records[i].stack_hash);
+      for (const h of recentCounts.keys()) {
+        if (!beforeRecent.has(h)) newInRecent++;
+      }
     }
     const newHashRate = recentWindow.length > 0 ? newInRecent / recentWindow.length : 0;
 
     // Topology progress: based on unique hash count, capped at PLATEAU_THRESHOLD
     // AND new-hash rate must be low. Use a combination: progress from count,
     // reduced if new-hash rate is still high.
-    const countProgress = Math.min(1, seenHashes.size / PLATEAU_THRESHOLD);
+    const countProgress = Math.min(1, uniqueHashCount / PLATEAU_THRESHOLD);
     const rateProgress = Math.max(0, 1 - newHashRate * 10); // 0 new hashes = 1.0, 0.1 rate = 0.0
     const topologyProgress = Math.min(countProgress, rateProgress);
 
     // --- Stability progress: per-hash backend distribution variance ---
-    // For top-K hashes by alloc count, check if backend distribution is stable.
+    // For top-K hashes by alloc count, check if backend distribution is
+    // stable. Group ALL records by stack_hash in a single pass (instead of
+    // re-filtering the full `records` array once per top-K hash — an
+    // O(n·k) scan that ran on every render) so the per-hash record lists
+    // are ready before we even know which hashes are "top".
+    const byHash = new Map<number, TelemetryRecord[]>();
     const hashCounts = new Map<number, number>();
 
     for (const r of records) {
-      if (r.op !== 'alloc') continue;
-      hashCounts.set(r.stack_hash, (hashCounts.get(r.stack_hash) ?? 0) + 1);
+      let bucket = byHash.get(r.stack_hash);
+      if (!bucket) {
+        bucket = [];
+        byHash.set(r.stack_hash, bucket);
+      }
+      bucket.push(r);
+      if (r.op === 'alloc') {
+        hashCounts.set(r.stack_hash, (hashCounts.get(r.stack_hash) ?? 0) + 1);
+      }
     }
 
     // Sort by count, take top K
@@ -83,7 +114,7 @@ export function useConvergence(records: TelemetryRecord[]): ConvergenceState {
         topologyProgress,
         stabilityProgress: 0,
         isConverged: false,
-        uniqueHashes: seenHashes.size,
+        uniqueHashes: uniqueHashCount,
         newHashRate,
       };
     }
@@ -92,7 +123,7 @@ export function useConvergence(records: TelemetryRecord[]): ConvergenceState {
     // Compare first half vs second half of the window.
     let stableCount = 0;
     for (const hash of topHashes) {
-      const hashRecords = records.filter((r) => r.stack_hash === hash).slice(-STABILITY_WINDOW);
+      const hashRecords = (byHash.get(hash) ?? []).slice(-STABILITY_WINDOW);
       if (hashRecords.length < 20) {
         // Not enough data — consider unstable
         continue;
@@ -121,10 +152,10 @@ export function useConvergence(records: TelemetryRecord[]): ConvergenceState {
       topologyProgress,
       stabilityProgress,
       isConverged,
-      uniqueHashes: seenHashes.size,
+      uniqueHashes: uniqueHashCount,
       newHashRate,
     };
-  }, [records]);
+  }, [records, topology]);
 }
 
 function computeBackendDist(records: TelemetryRecord[]): Map<string, number> {

@@ -46,10 +46,10 @@ export default function TelemetrySidebar({
 
   return (
     <div
-      className="flex flex-col h-full bg-canvas text-ink font-mono border border-ink-faint"
+      className="flex flex-col h-full bg-canvas text-ink font-mono"
       data-testid="telemetry-sidebar"
     >
-      <div className="flex items-center justify-between px-3 py-2 border-b border-ink-faint text-[10px] tracking-widest text-ink-muted">
+      <div className="flex items-center justify-between px-3 min-h-[48px] border-b border-ink-faint text-[10px] tracking-widest text-ink-muted">
         <span>TELEMETRY</span>
         <span className="text-ink">
           {records.length.toString().padStart(6, '0')} REC

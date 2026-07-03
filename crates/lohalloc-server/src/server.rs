@@ -36,11 +36,13 @@
 //!   not interfere with the live WS stream.
 //! - `POST /api/run-simulation` — Spawns a real Lohalloc workload with the
 //!   `liblohalloc_obs` shim preloaded. Body:
-//!   `{"kind": "lohalloc-example|http-server|long-running", "args": {...}}`.
+//!   `{"kind": "lohalloc-example|long-running|stress-test|...", "args": {...}}`.
 //!   Streams lifecycle events over `/ws/telemetry` as
 //!   `{"type":"simulation","event":{...}}` messages. Returns `202 Accepted`
 //!   with the spawned `pid`. Refuses requests from non-loopback IPs unless
 //!   `LOHALLOC_ALLOW_REMOTE_SPAWN=1` is set in the env.
+//! - `POST /api/kill-all-simulations` — Emergency stop. Sends SIGKILL to
+//!   all running simulation subprocesses. Returns `{"killed": N}`.
 //! - `GET /health` — Liveness check.
 //!
 //! # Static File Serving
@@ -71,6 +73,7 @@ use serde::Deserialize;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
+use tracing::Instrument;
 
 use crate::replay::{replay_trace_json_with_strategy, ReplayError};
 use crate::simulation::{self, SimulationArgs, SimulationEvent, SimulationKind};
@@ -79,6 +82,16 @@ use crate::telemetry::{telemetry_channel, RawWsMessage, TelemetryReceiver, Telem
 /// Maximum number of telemetry records retained for `GET /api/export-trace`.
 /// At ~200 bytes per record this caps the ring at ~13 MB.
 pub const TRACE_RING_CAPACITY: usize = 65_536;
+
+/// Minimum spacing (ns) between consecutive live telemetry timestamps.
+///
+/// Live records arrive from the shim in bursts — a single `POST /api/telemetry`
+/// can carry thousands of records captured within the same clock tick. Stamping
+/// them all with the same instant would collapse the GUI's seconds axis back to
+/// a flat line, so we enforce a strictly-increasing floor of `MIN_LIVE_TS_STEP_NS`
+/// per record: a burst spreads across at least `n * 1µs` while a genuinely idle
+/// gap lets the real clock jump ahead. See [`AppState::next_live_timestamp`].
+pub const MIN_LIVE_TS_STEP_NS: u64 = 1_000;
 
 /// Shared application state.
 #[derive(Clone)]
@@ -138,6 +151,19 @@ pub struct AppState {
     /// Pointers are stored as `usize` so this field stays `Send` —
     /// `(*mut u8, usize)` is not. Cleared on reset to training.
     live_allocations: Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
+    /// Last nanosecond timestamp assigned to a live telemetry record by
+    /// [`AppState::next_live_timestamp`]. Guarantees a strictly-increasing
+    /// time axis for the live stream regardless of what the shim/observer
+    /// (or a stale binary) actually reported in the record.
+    live_ts_last: Arc<std::sync::atomic::AtomicU64>,
+    /// Single server-wide monotonic epoch. Live timestamps are nanoseconds
+    /// **since this instant**, not since the Unix epoch: relative ns stays
+    /// small (< 2^53 for ~100 days of uptime) so it round-trips through a
+    /// JavaScript `number` (an IEEE-754 double) losslessly. Absolute wall-
+    /// clock ns (~1.7e18) would exceed 2^53 and snap to ~1µs granularity in
+    /// the browser, collapsing the GUI/CSV time axis. `Instant` is `Copy`, so
+    /// every `AppState` clone shares the value captured once in `new`.
+    live_epoch: std::time::Instant,
 }
 
 /// Cap on the simulation history shown in the GUI.
@@ -163,8 +189,8 @@ impl AppState {
 
     /// Create an `AppState` from an existing channel pair (for testing).
     pub fn new_with_channel((mut tx, rx): (TelemetrySender, TelemetryReceiver)) -> Self {
-        let (ws_tx, _) = tokio::sync::broadcast::channel(1024);
-        let (ws_raw_tx, _) = tokio::sync::broadcast::channel(256);
+        let (ws_tx, _) = tokio::sync::broadcast::channel(4096);
+        let (ws_raw_tx, _) = tokio::sync::broadcast::channel(512);
         tx.attach_broadcast(ws_tx.clone(), ws_raw_tx.clone());
         Self {
             telemetry_tx: tx,
@@ -183,6 +209,40 @@ impl AppState {
             simulation_history: Arc::new(std::sync::Mutex::new(Vec::new())),
             live_alloc: Arc::new(Lohalloc::new()),
             live_allocations: Arc::new(std::sync::Mutex::new(Vec::<(usize, usize)>::new())),
+            live_ts_last: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            live_epoch: std::time::Instant::now(),
+        }
+    }
+
+    /// Assign the next strictly-increasing nanosecond timestamp for a live
+    /// telemetry record, measured against the server's monotonic epoch.
+    ///
+    /// The shim/observer's own `timestamp` field is ignored on the live path:
+    /// it is process-relative (each spawned subprocess re-anchors its own
+    /// monotonic epoch at ~0) and has been observed to degenerate to tiny,
+    /// repeating values (the "0 / 41" symptom). Instead we stamp against one
+    /// server-wide epoch (`live_epoch`) — a single authoritative monotonic
+    /// clock — flooring each reading to at least [`MIN_LIVE_TS_STEP_NS`] past
+    /// the previous one so a burst of records arriving within one clock tick
+    /// still gets a monotonically increasing, non-collapsing axis. Relative ns
+    /// stays under 2^53, so the value survives the browser's `number` type
+    /// without the precision loss that made the exported CSV time axis idle.
+    pub fn next_live_timestamp(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        let elapsed = self.live_epoch.elapsed().as_nanos() as u64;
+        // CAS loop: candidate = max(elapsed, prev + step); publish it.
+        let mut prev = self.live_ts_last.load(Ordering::Relaxed);
+        loop {
+            let candidate = elapsed.max(prev.saturating_add(MIN_LIVE_TS_STEP_NS));
+            match self.live_ts_last.compare_exchange_weak(
+                prev,
+                candidate,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return candidate,
+                Err(actual) => prev = actual,
+            }
         }
     }
 
@@ -250,17 +310,73 @@ impl AppState {
             .and_then(|mut g| g.remove(&pid).map(|h| h.kind))
     }
 
-    /// Kill a running simulation by pid. Sends `kill` (SIGKILL) to the child
-    /// process. Returns the kind if the simulation was found and killed.
+    /// Kill a running simulation by pid. Sends `SIGKILL` to the child's
+    /// entire process group (so grandchildren are also killed) and returns
+    /// the simulation kind if found.
     pub async fn kill_simulation(&self, pid: u32) -> Option<crate::simulation::SimulationKind> {
         let (child_arc, killed_flag) = self.get_simulation(pid)?;
         // Set the operator-kill flag so the watcher doesn't emit a duplicate.
         killed_flag.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut guard = child_arc.lock().await;
+        let child_pid = guard.id();
+        tracing::info!(pid, "kill_simulation");
+
+        // Kill the entire process group so grandchildren are cleaned up too.
+        #[cfg(unix)]
+        {
+            let pgid = child_pid as i32;
+            let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
         let _ = guard.kill();
         let kind = self.get_simulation_kind(pid);
         self.unregister_simulation(pid);
+        tracing::info!(pid, ?kind, "simulation killed");
         kind
+    }
+
+    /// Kill ALL running simulations. Returns the number of simulations killed.
+    /// Used by the "Kill All" emergency-stop button.
+    pub async fn kill_all_simulations(&self) -> usize {
+        let pids: Vec<u32> = if let Ok(g) = self.simulations.lock() {
+            g.keys().copied().collect()
+        } else {
+            return 0;
+        };
+        let mut killed = 0;
+        for pid in pids {
+            if self.kill_simulation(pid).await.is_some() {
+                killed += 1;
+            }
+        }
+        killed
+    }
+
+    /// Best-effort **synchronous** kill of every running simulation's
+    /// process group. Unlike [`kill_all_simulations`] this needs no async
+    /// runtime and never `.await`s a child lock, so it is safe to call from
+    /// a panic hook or a signal-handling context where the async executor
+    /// may be gone or unusable.
+    ///
+    /// Children are spawned as process-group leaders (`process_group(0)` in
+    /// `simulation.rs`), so the group id equals the child pid — which is the
+    /// map key. That lets us `SIGKILL` the whole group (child + any
+    /// grandchildren) directly from the key without locking the child. The
+    /// registry lock is taken with `try_lock` so a poisoned/held lock during
+    /// a panic can't deadlock; we just skip cleanup in that rare case.
+    /// Returns the number of process groups signalled.
+    pub fn kill_all_simulations_blocking(&self) -> usize {
+        let mut killed = 0;
+        if let Ok(g) = self.simulations.try_lock() {
+            for pid in g.keys() {
+                #[cfg(unix)]
+                {
+                    // Negative pid targets the whole process group.
+                    let _ = unsafe { libc::kill(-(*pid as i32), libc::SIGKILL) };
+                }
+                killed += 1;
+            }
+        }
+        killed
     }
 
     /// Append a finished lifecycle event to the bounded history.
@@ -501,6 +617,35 @@ impl Default for AppState {
     }
 }
 
+impl Drop for AppState {
+    fn drop(&mut self) {
+        // Only kill simulation processes when the *last* AppState clone
+        // is being dropped (i.e. server shutdown).  Axum clones AppState
+        // for every request via `State<AppState>`; those clones share
+        // the same Arcs, so we must not kill children when a per-request
+        // clone drops — that would kill every simulation immediately
+        // after the handler returns.
+        if Arc::strong_count(&self.simulations) > 1 {
+            return;
+        }
+        if let Ok(mut g) = self.simulations.lock() {
+            for (pid, handle) in g.iter() {
+                if let Ok(mut child) = handle.child.try_lock() {
+                    let child_pid = child.id();
+                    tracing::info!(pid, "AppState drop: killing simulation");
+                    #[cfg(unix)]
+                    {
+                        let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            g.clear();
+        }
+    }
+}
+
 /// Build the Axum router for the Lohalloc control-plane server.
 pub fn build_app(state: AppState) -> Router {
     build_app_with_options(state, false)
@@ -524,6 +669,10 @@ pub fn build_app_with_options(state: AppState, serve_static: bool) -> Router {
         .route("/api/telemetry", post(post_telemetry_handler))
         .route("/api/run-simulation", post(run_simulation_handler))
         .route("/api/stop-simulation/{pid}", post(stop_simulation_handler))
+        .route(
+            "/api/kill-all-simulations",
+            post(kill_all_simulations_handler),
+        )
         .route(
             "/api/simulation-history",
             get(get_simulation_history_handler),
@@ -840,6 +989,7 @@ async fn get_routing_table_handler(State(state): State<AppState>) -> Response {
 ///   `TelemetryRecord` schema.
 /// - `415 Unsupported Media Type` if the `Content-Type` header is not
 ///   `application/json` (Axum's `Json` extractor enforces this).
+#[tracing::instrument(level = "debug", skip_all)]
 async fn post_telemetry_handler(
     State(state): State<AppState>,
     body: axum::body::Bytes,
@@ -867,22 +1017,30 @@ async fn post_telemetry_handler(
     };
 
     let count = records.len();
-    for record in records {
+    for mut record in records {
+        // Stamp a real, server-side wall-clock timestamp (ns). The shim's
+        // own `timestamp` is process-relative and has been observed to
+        // collapse to tiny repeating values ("0 / 41"), so we override it
+        // here with a single authoritative, strictly-increasing clock —
+        // this is what gives the GUI a real seconds axis for live streams.
+        record.timestamp = state.next_live_timestamp();
         // TensorBoard-style: feed each record into the live training
         // allocator in real time. The MAB learns from this stream, and
         // `/api/freeze` collapses it directly without a replay.
         state.feed_live_record(&record);
         state.telemetry_tx.send(record);
     }
+    tracing::debug!(count, "ingested telemetry records");
     Json(serde_json::json!({ "accepted": count })).into_response()
 }
 
 /// Request body for `POST /api/run-simulation`.
 #[derive(Debug, Deserialize)]
 struct RunSimulationRequest {
-    /// One of `"lohalloc-example"`, `"http-server"`, `"long-running"`.
+    /// One of `SimulationKind::ALL` (see `simulation.rs`), e.g.
+    /// `"lohalloc-example"`, `"long-running"`.
     kind: String,
-    /// Optional per-kind args (port for http-server, duration_secs for long-running).
+    /// Optional per-kind args (duration_secs for timed kinds).
     #[serde(default)]
     args: Option<SimulationArgs>,
 }
@@ -904,6 +1062,7 @@ struct RunSimulationRequest {
 ///
 /// Lifecycle events are streamed over `/ws/telemetry` as
 /// `{"type":"simulation","event":{...}}` messages.
+#[tracing::instrument(skip(state), fields(kind = %body.kind))]
 async fn run_simulation_handler(
     State(state): State<AppState>,
     Json(body): Json<RunSimulationRequest>,
@@ -922,8 +1081,9 @@ async fn run_simulation_handler(
             return (
                 StatusCode::BAD_REQUEST,
                 format!(
-                    "unknown kind '{}', expected lohalloc-example|http-server|long-running",
-                    body.kind
+                    "unknown kind '{}', expected {}",
+                    body.kind,
+                    SimulationKind::accepted_names()
                 ),
             )
                 .into_response();
@@ -956,11 +1116,13 @@ async fn run_simulation_handler(
     let child = match simulation::spawn_simulation(kind, &shim, server_port, &args) {
         Ok(c) => c,
         Err(e) => {
+            tracing::warn!(error = %e.message, "simulation spawn error");
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(e)).into_response();
         }
     };
 
     let pid = child.id();
+    tracing::info!(pid, "simulation registered");
     state.register_simulation(pid, kind, child);
 
     // Emit the "started" event. WS clients receive it immediately.
@@ -991,8 +1153,8 @@ async fn run_simulation_handler(
 }
 
 /// Hard ceiling for any simulation, regardless of kind. Prevents zombie
-/// processes from hanging indefinitely (e.g., a deadlocked `http-server`
-/// or a `lohalloc-example` stuck in an infinite loop).
+/// processes from hanging indefinitely (e.g. a `lohalloc-example` variant
+/// stuck in an infinite loop).
 const MAX_SIM_DURATION_SECS: u64 = 300;
 
 /// Background task: poll a spawned simulation's exit status and emit
@@ -1005,7 +1167,9 @@ fn spawn_simulation_watcher(
     kind: SimulationKind,
     max_duration_secs: Option<u64>,
 ) {
-    tokio::spawn(async move {
+    let span = tracing::info_span!("sim_watcher", pid, kind = kind.as_str());
+    tokio::spawn(
+        async move {
         // Tiny initial delay so the "started" event arrives first.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let started_at = std::time::Instant::now();
@@ -1026,9 +1190,15 @@ fn spawn_simulation_watcher(
 
             // Check hard timeout ceiling (applies to ALL sim kinds).
             if started_at.elapsed() >= effective_deadline {
+                tracing::warn!(elapsed = ?started_at.elapsed(), "simulation duration limit reached");
                 // Set the operator-kill flag so we don't emit a duplicate.
                 killed_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 let mut guard = child_arc.lock().await;
+                let child_pid = guard.id();
+                #[cfg(unix)]
+                {
+                    let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
+                }
                 let _ = guard.kill();
                 drop(guard);
 
@@ -1058,10 +1228,12 @@ fn spawn_simulation_watcher(
             };
 
             if let Some(status) = exit_status {
+                tracing::info!(success = status.success(), "simulation process exited");
                 // If the operator already killed this sim (via
                 // `/api/stop-simulation`), the kill handler already emitted
                 // a "failed" event. Don't emit a duplicate.
                 if killed_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::debug!("killed by operator, skipping duplicate event");
                     return;
                 }
 
@@ -1115,7 +1287,9 @@ fn spawn_simulation_watcher(
                 state.telemetry_tx.send_raw(s);
             }
         }
-    });
+        }
+        .instrument(span),
+    );
 }
 
 /// Read up to 4 KiB of the child's stdout tail. Best-effort: returns
@@ -1184,6 +1358,37 @@ async fn stop_simulation_handler(State(state): State<AppState>, Path(pid): Path<
         )
             .into_response(),
     }
+}
+
+/// `POST /api/kill-all-simulations` — Kill ALL running simulations.
+/// Emergency-stop button. Sends SIGKILL to every active child process.
+/// Returns `{ "killed": N }` where N is the number of simulations killed.
+async fn kill_all_simulations_handler(State(state): State<AppState>) -> Response {
+    let killed = state.kill_all_simulations().await;
+
+    // Emit a "failed" lifecycle event for each killed sim.
+    // Since kill_all_simulations already unregistered them, we can't
+    // retrieve their kinds — but the individual kill_simulation calls
+    // would have emitted events if we tracked them. Instead, we emit
+    // a single summary event with pid=0.
+    if killed > 0 {
+        let ev = SimulationEvent {
+            pid: 0,
+            kind: "all".to_string(),
+            status: "failed".to_string(),
+            duration_ms: 0,
+            exit_code: Some(-1),
+            stdout_tail: None,
+            error: Some(format!("kill-all: terminated {} simulation(s)", killed)),
+        };
+        let envelope = ev.clone().into_ws_message();
+        if let Ok(s) = serde_json::to_string(&envelope) {
+            state.telemetry_tx.send_raw(s);
+        }
+        state.push_simulation_history(ev);
+    }
+
+    Json(serde_json::json!({ "killed": killed })).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,7 +1525,7 @@ mod tests {
     #[tokio::test]
     async fn upload_trace_returns_lohalloc_bytes() {
         let app = build_app(AppState::new());
-        let body = r#"[{"op":"alloc","size":64,"stack_hash":100},{"op":"free","size":64,"stack_hash":100}]"#;
+        let body = r#"[{"timestamp":0,"op":"alloc","size":64,"stack_hash":100},{"timestamp":1500000,"op":"free","size":64,"stack_hash":100}]"#;
         let response = app
             .oneshot(
                 Request::builder()
@@ -1368,7 +1573,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/upload-trace")
-                    .body(Body::from(r#"[{"op":"alloc","size":64,"stack_hash":100}]"#))
+                    .body(Body::from(r#"[{"timestamp":0,"op":"alloc","size":64,"stack_hash":100}]"#))
                     .unwrap(),
             )
             .await
@@ -1400,7 +1605,7 @@ mod tests {
         let response = client
             .post(format!("http://{addr}/api/upload-trace"))
             .header(header::CONTENT_TYPE, "application/json")
-            .body(r#"[{"op":"alloc","size":64,"stack_hash":100},{"op":"free","size":64,"stack_hash":100}]"#)
+            .body(r#"[{"timestamp":0,"op":"alloc","size":64,"stack_hash":100},{"timestamp":1500000,"op":"free","size":64,"stack_hash":100}]"#)
             .send()
             .await
             .unwrap();
@@ -1535,7 +1740,7 @@ mod tests {
         let app = build_app(state.clone());
 
         // First upload a trace
-        let body = r#"[{"op":"alloc","size":64,"stack_hash":100},{"op":"free","size":64,"stack_hash":100}]"#;
+        let body = r#"[{"timestamp":0,"op":"alloc","size":64,"stack_hash":100},{"timestamp":1500000,"op":"free","size":64,"stack_hash":100}]"#;
         let _ = app
             .clone()
             .oneshot(
@@ -1590,7 +1795,7 @@ mod tests {
             .unwrap();
 
         // Now upload a trace — the replay should use the latency_priority strategy
-        let body = r#"[{"op":"alloc","size":64,"stack_hash":100}]"#;
+        let body = r#"[{"timestamp":0,"op":"alloc","size":64,"stack_hash":100}]"#;
         let response = app
             .oneshot(
                 Request::builder()
@@ -1611,7 +1816,7 @@ mod tests {
         let state = AppState::new_with_channel((tx, rx));
         let app = build_app(state.clone());
 
-        let body = r#"[{"op":"alloc","size":64,"stack_hash":100},{"op":"free","size":64,"stack_hash":100}]"#;
+        let body = r#"[{"timestamp":0,"op":"alloc","size":64,"stack_hash":100},{"timestamp":1500000,"op":"free","size":64,"stack_hash":100}]"#;
         let response = app
             .oneshot(
                 Request::builder()
@@ -1810,6 +2015,93 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
         assert_eq!(v["accepted"], 3);
+    }
+
+    #[test]
+    fn kill_all_simulations_blocking_is_safe_when_empty() {
+        // The panic-hook / signal path must never panic or block on an empty
+        // registry — it just reports zero groups signalled.
+        let state = AppState::new();
+        assert_eq!(state.kill_all_simulations_blocking(), 0);
+    }
+
+    #[test]
+    fn next_live_timestamp_is_strictly_increasing_and_precision_safe() {
+        // A burst of assignments (same clock tick) must be strictly
+        // increasing so the GUI axis never collapses, and the values must
+        // stay under 2^53 so they round-trip through a JS `number` losslessly
+        // (the fix for the idling CSV time axis). Epoch-relative ns keeps them
+        // small; 2^53 ns is ~104 days of uptime.
+        let state = AppState::new();
+        let mut prev = 0u64;
+        for i in 0..10_000 {
+            let ts = state.next_live_timestamp();
+            assert!(
+                ts > prev,
+                "timestamp #{i} not strictly increasing: {ts} <= {prev}"
+            );
+            assert!(
+                ts < (1u64 << 53),
+                "timestamp #{i} exceeds JS-safe integer range: {ts}"
+            );
+            prev = ts;
+        }
+    }
+
+    #[tokio::test]
+    async fn post_telemetry_overrides_degenerate_timestamp_on_ws() {
+        // End-to-end: a record POSTed with a degenerate "0 / 41"-style
+        // timestamp must arrive on the WS with a real, rebased ns value.
+        let state = AppState::new();
+        let app = build_app(state.clone());
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, app).into_future());
+
+        let (mut socket, _response) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/ws/telemetry"))
+                .await
+                .unwrap();
+
+        let client = reqwest::Client::new();
+        // Both records carry timestamp 41 — exactly the degenerate,
+        // non-advancing value the shim reported. The server must replace them
+        // with its own strictly-increasing, JS-precision-safe clock, so the
+        // two WS records must NOT both be 41 and must advance.
+        for _ in 0..2 {
+            let body = r#"{"timestamp":41,"op":"alloc","size":64,"stack_hash":1,"thread_id":0,"result_ptr":"0x10","latency_ns":0,"fragmentation_pct":0.0,"backend":"slab"}"#;
+            let response = client
+                .post(format!("http://{addr}/api/telemetry"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+        }
+
+        let mut timestamps = Vec::new();
+        while timestamps.len() < 2 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+                .await
+                .expect("timed out waiting for WS message")
+                .expect("stream ended")
+                .expect("WS error");
+            let v: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+            timestamps.push(v["timestamp"].as_u64().expect("timestamp is u64"));
+        }
+        let (first, second) = (timestamps[0], timestamps[1]);
+
+        assert_ne!(first, 41, "server echoed the degenerate timestamp");
+        assert!(
+            second > first,
+            "timestamps not strictly increasing: {second} <= {first}"
+        );
+        // Precision-safe: must round-trip through a JS `number` losslessly.
+        assert!(second < (1u64 << 53), "timestamp exceeds JS-safe range: {second}");
     }
 
     #[tokio::test]
@@ -2249,5 +2541,33 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["mode"], "training");
+    }
+
+    #[tokio::test]
+    async fn kill_all_simulations_returns_zero_when_empty() {
+        let state = AppState::new();
+        let killed = state.kill_all_simulations().await;
+        assert_eq!(killed, 0);
+    }
+
+    #[tokio::test]
+    async fn kill_all_simulations_endpoint_returns_killed_count() {
+        let app = build_app(AppState::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/kill-all-simulations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["killed"], 0);
     }
 }

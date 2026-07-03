@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import type { SimulationEvent } from "../types/ws";
-import { stopSimulation } from "../hooks/useApi";
+import { stopSimulation, killAllSimulations } from "../hooks/useApi";
 
 /**
  * Floating panel showing currently-running simulations (top) and the
@@ -14,6 +14,19 @@ export function SimulationPanel(props: {
   mode?: "training" | "inference";
   onValidate?: (kind: string, durationSecs: number) => void;
 }) {
+  const [killing, setKilling] = useState(false);
+
+  const handleKillAll = async () => {
+    setKilling(true);
+    try {
+      await killAllSimulations();
+    } catch {
+      // ignore — WS events will update the UI
+    } finally {
+      setKilling(false);
+    }
+  };
+
   return (
     <div className="fixed right-4 top-20 z-40 w-[420px] max-h-[70vh] flex flex-col bg-canvas border border-ink-faint font-mono text-[11px]">
       <div className="flex items-center justify-between px-3 py-2 border-b border-ink-faint">
@@ -25,13 +38,26 @@ export function SimulationPanel(props: {
             </span>
           ) : null}
         </div>
-        <button
-          onClick={props.onClose}
-          className="text-ink-muted hover:text-heat px-2"
-          aria-label="Close simulation panel"
-        >
-          [X]
-        </button>
+        <div className="flex items-center gap-2">
+          {props.active.length > 0 && (
+            <button
+              onClick={handleKillAll}
+              disabled={killing}
+              className="text-canvas bg-heat px-3 py-1.5 min-h-[28px] hover:bg-[#cc0000] disabled:opacity-50 transition-colors tracking-widest font-bold flex items-center justify-center"
+              data-testid="kill-all-sims"
+              title="Emergency stop — kill ALL running simulations"
+            >
+              {killing ? "KILLING..." : "KILL ALL"}
+            </button>
+          )}
+          <button
+            onClick={props.onClose}
+            className="text-ink-muted hover:text-heat px-2.5 py-1.5 min-h-[28px] min-w-[28px] flex items-center justify-center"
+            aria-label="Close simulation panel"
+          >
+            [X]
+          </button>
+        </div>
       </div>
 
       {props.active.length > 0 ? (
@@ -111,7 +137,7 @@ function SimulationRow({
   };
 
   return (
-    <div className="flex items-center justify-between px-3 py-1 border-b border-ink-faint">
+    <div className="flex items-center justify-between px-3 py-1.5 border-b border-ink-faint">
       <div className="flex items-center gap-2 min-w-0">
         <span className={statusColor}>[{ev.status.toUpperCase()}]</span>
         <span className="text-ink truncate">{ev.kind}</span>
@@ -127,7 +153,7 @@ function SimulationRow({
         {isRunning && (
           <button
             onClick={handleKill}
-            className="text-heat hover:text-canvas hover:bg-heat px-1 border border-heat transition-colors"
+            className="text-heat hover:text-canvas hover:bg-heat px-2 py-1 min-h-[24px] border border-heat transition-colors flex items-center justify-center"
             data-testid={`kill-sim-${ev.pid}`}
           >
             KILL
@@ -143,7 +169,7 @@ function SimulationRow({
                 : "Freeze the allocator first, then validate."
             }
             className={[
-              "px-1 border transition-colors",
+              "px-2 py-1 min-h-[24px] border transition-colors flex items-center justify-center",
               mode === "inference"
                 ? "text-ink border-ink hover:bg-ink hover:text-canvas"
                 : "text-ink-faint border-ink-faint cursor-not-allowed opacity-50",
@@ -195,7 +221,10 @@ export function Toast(props: {
       <div className="flex items-center gap-3">
         <span>[{level.toUpperCase()}]</span>
         <span className="truncate">{message}</span>
-        <button onClick={onDismiss} className="opacity-60 hover:opacity-100">
+        <button
+          onClick={onDismiss}
+          className="opacity-60 hover:opacity-100 px-2 py-1.5 min-h-[24px] min-w-[24px] flex items-center justify-center"
+        >
           [X]
         </button>
       </div>
@@ -204,8 +233,8 @@ export function Toast(props: {
 }
 
 /**
- * SIMULATE v dropdown. Three preset kinds. Calls `onSpawn(kind)` which
- * performs the actual POST and surfaces errors via the toasts.
+ * SIMULATE v dropdown. Calls `onSpawn(kind)` which performs the actual
+ * POST and surfaces errors via the toasts.
  */
 export function SimulateDropdown(props: {
   onSpawn: (kind: string) => Promise<void>;
@@ -248,7 +277,7 @@ export function SimulateDropdown(props: {
           e.stopPropagation();
           setOpen((v) => !v);
         }}
-        className="px-3 py-1 border border-ink-faint text-ink-muted hover:border-ink hover:text-ink disabled:opacity-40 disabled:cursor-not-allowed font-mono text-[11px] tracking-wider"
+        className="h-8 px-4 border border-ink-faint text-ink-muted hover:border-ink hover:text-ink disabled:opacity-40 disabled:cursor-not-allowed font-mono text-[11px] tracking-widest flex items-center justify-center"
         aria-haspopup="menu"
         aria-expanded={open}
       >
@@ -268,7 +297,7 @@ export function SimulateDropdown(props: {
               step={5}
               value={props.durationSecs}
               onChange={(e) => props.onDurationChange(Number(e.target.value))}
-              className="w-full accent-heat cursor-pointer"
+              className="w-full accent-heat cursor-pointer h-6 py-2"
               data-testid="duration-slider"
             />
           </div>
@@ -283,22 +312,52 @@ export function SimulateDropdown(props: {
           </button>
           <div className="border-t border-ink-faint" />
           <button
-            onClick={() => handleSelect("http-server")}
-            className="block w-full text-left px-3 py-2 text-ink hover:bg-heat/10 hover:text-heat"
-          >
-            <div className="font-bold">HTTP SERVER (PORT 4000</div>
-            <div className="text-[10px] text-ink-muted">
-              A second lohalloc-server under the shim
-            </div>
-          </button>
-          <div className="border-t border-ink-faint" />
-          <button
             onClick={() => handleSelect("long-running")}
             className="block w-full text-left px-3 py-2 text-ink hover:bg-heat/10 hover:text-heat"
           >
             <div className="font-bold">LONG RUNNING</div>
             <div className="text-[10px] text-ink-muted">
               lohalloc-example under the shim for {props.durationSecs}s
+            </div>
+          </button>
+          <div className="border-t border-ink-faint" />
+          <button
+            onClick={() => handleSelect("stress-test")}
+            className="block w-full text-left px-3 py-2 text-ink hover:bg-heat/10 hover:text-heat"
+          >
+            <div className="font-bold">STRESS TEST</div>
+            <div className="text-[10px] text-ink-muted">
+              Deep recursive stacks, high churn, mixed sizes (8B–1MiB)
+            </div>
+          </button>
+          <div className="border-t border-ink-faint" />
+          <button
+            onClick={() => handleSelect("high-churn")}
+            className="block w-full text-left px-3 py-2 text-ink hover:bg-heat/10 hover:text-heat"
+          >
+            <div className="font-bold">HIGH-FREQUENCY CHURN</div>
+            <div className="text-[10px] text-ink-muted">
+              Rapid alloc/dealloc cycles across all size classes (8B–1MiB)
+            </div>
+          </button>
+          <div className="border-t border-ink-faint" />
+          <button
+            onClick={() => handleSelect("checkerboard")}
+            className="block w-full text-left px-3 py-2 text-ink hover:bg-heat/10 hover:text-heat"
+          >
+            <div className="font-bold">CHECKERBOARD FRAGMENTATION</div>
+            <div className="text-[10px] text-ink-muted">
+              Alternating alloc/free pattern for max external fragmentation
+            </div>
+          </button>
+          <div className="border-t border-ink-faint" />
+          <button
+            onClick={() => handleSelect("mixed-workload")}
+            className="block w-full text-left px-3 py-2 text-ink hover:bg-heat/10 hover:text-heat"
+          >
+            <div className="font-bold">MIXED WORKLOADS</div>
+            <div className="text-[10px] text-ink-muted">
+              Interleaved large blocks with thousands of tiny allocations
             </div>
           </button>
         </div>

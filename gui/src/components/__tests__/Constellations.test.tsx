@@ -1,62 +1,83 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
+import type { HashAggregate } from "../../hooks/useTelemetry";
+
+// Build the cumulative per-hash topology aggregate the component now consumes
+// for its node set (mirrors useTelemetry's fold). Tests pass this alongside
+// `records` so node identity/counts don't depend on the trimmed window.
+function topoFrom(recs: any[]): Map<number, HashAggregate> {
+  const m = new Map<number, HashAggregate>();
+  for (const r of recs) {
+    let a = m.get(r.stack_hash);
+    if (!a) {
+      a = { allocCount: 0, freeCount: 0 };
+      m.set(r.stack_hash, a);
+    }
+    if (r.op === "alloc") a.allocCount += 1;
+    else a.freeCount += 1;
+    if (r.backend !== undefined) a.lastBackend = r.backend;
+  }
+  return m;
+}
+
+// Shared FakeVector3 — used in both the three mock and the OrbitControls mock.
+class FakeVector3 {
+  x: number;
+  y: number;
+  z: number;
+  constructor(x = 0, y = 0, z = 0) {
+    this.x = x;
+    this.y = y;
+    this.z = z;
+  }
+  set(x: number, y: number, z: number) {
+    this.x = x;
+    this.y = y;
+    this.z = z;
+    return this;
+  }
+  copy(v: any) {
+    if (v) {
+      this.x = v.x ?? 0;
+      this.y = v.y ?? 0;
+      this.z = v.z ?? 0;
+    }
+    return this;
+  }
+  clone() {
+    return new FakeVector3(this.x, this.y, this.z);
+  }
+  add(v: any) {
+    this.x += v.x ?? 0;
+    this.y += v.y ?? 0;
+    this.z += v.z ?? 0;
+    return this;
+  }
+  sub(v: any) {
+    this.x -= v.x ?? 0;
+    this.y -= v.y ?? 0;
+    this.z -= v.z ?? 0;
+    return this;
+  }
+  multiplyScalar(s: number) {
+    this.x *= s;
+    this.y *= s;
+    this.z *= s;
+    return this;
+  }
+  normalize() {
+    return this;
+  }
+  lerp(v: any, t: number) {
+    this.x += (v.x - this.x) * t;
+    this.y += (v.y - this.y) * t;
+    this.z += (v.z - this.z) * t;
+    return this;
+  }
+}
 
 // Mock three.js because jsdom has no WebGL/canvas
 vi.mock("three", () => {
-  class FakeVector3 {
-    x: number;
-    y: number;
-    z: number;
-    constructor(x = 0, y = 0, z = 0) {
-      this.x = x;
-      this.y = y;
-      this.z = z;
-    }
-    set(x: number, y: number, z: number) {
-      this.x = x;
-      this.y = y;
-      this.z = z;
-      return this;
-    }
-    copy(v: any) {
-      if (v) {
-        this.x = v.x ?? 0;
-        this.y = v.y ?? 0;
-        this.z = v.z ?? 0;
-      }
-      return this;
-    }
-    clone() {
-      return new FakeVector3(this.x, this.y, this.z);
-    }
-    add(v: any) {
-      this.x += v.x ?? 0;
-      this.y += v.y ?? 0;
-      this.z += v.z ?? 0;
-      return this;
-    }
-    sub(v: any) {
-      this.x -= v.x ?? 0;
-      this.y -= v.y ?? 0;
-      this.z -= v.z ?? 0;
-      return this;
-    }
-    multiplyScalar(s: number) {
-      this.x *= s;
-      this.y *= s;
-      this.z *= s;
-      return this;
-    }
-    normalize() {
-      return this;
-    }
-    lerp(v: any, t: number) {
-      this.x += (v.x - this.x) * t;
-      this.y += (v.y - this.y) * t;
-      this.z += (v.z - this.z) * t;
-      return this;
-    }
-  }
   class FakeBox3 {
     setFromObject() {
       return this;
@@ -162,6 +183,11 @@ vi.mock("three", () => {
     Group: vi.fn(() => new FakeObject3D()),
     EdgesGeometry: vi.fn(() => ({ dispose: vi.fn() })),
     LineSegments: vi.fn(() => new FakeObject3D()),
+    Raycaster: vi.fn(() => ({
+      setFromCamera: vi.fn(),
+      intersectObjects: vi.fn(() => []),
+    })),
+    Vector2: vi.fn(() => ({ x: 0, y: 0 })),
   };
 });
 
@@ -170,15 +196,15 @@ vi.mock("three/examples/jsm/controls/OrbitControls.js", () => ({
   OrbitControls: vi.fn(() => ({
     update: vi.fn(),
     dispose: vi.fn(),
-    target: { copy: vi.fn() },
+    target: new FakeVector3(),
     minDistance: 0,
     maxDistance: 0,
   })),
 }));
 
-describe("FloatingWeb", () => {
-  it("renders the floating-web container with telemetry data", async () => {
-    const FloatingWeb = (await import("../FloatingWeb")).default;
+describe("Constellations", () => {
+  it("renders the constellations container with telemetry data", async () => {
+    const Constellations = (await import("../Constellations")).default;
     const records = [
       {
         timestamp: 0,
@@ -203,23 +229,23 @@ describe("FloatingWeb", () => {
         backend: "buddy" as const,
       },
     ];
-    render(<FloatingWeb records={records} />);
+    render(<Constellations records={records} topology={topoFrom(records)} />);
     // Wait for async setup (Three.js scene construction happens after mount)
     await waitFor(() => {
-      expect(screen.getByText(/FLOATING WEB/i)).toBeDefined();
+      expect(screen.getByText(/CONSTELLATIONS/i)).toBeDefined();
     });
   });
 
   it("renders empty-state label when no records", async () => {
-    const FloatingWeb = (await import("../FloatingWeb")).default;
-    render(<FloatingWeb records={[]} />);
+    const Constellations = (await import("../Constellations")).default;
+    render(<Constellations records={[]} topology={new Map()} />);
     await waitFor(() => {
-      expect(screen.getByText(/FLOATING WEB/i)).toBeDefined();
+      expect(screen.getByText(/CONSTELLATIONS/i)).toBeDefined();
     });
   });
 
   it("handles dense data with 15+ unique stack hashes", async () => {
-    const FloatingWeb = (await import("../FloatingWeb")).default;
+    const Constellations = (await import("../Constellations")).default;
     const records = Array.from({ length: 150 }, (_, i) => ({
       timestamp: i,
       op: "alloc" as const,
@@ -231,14 +257,14 @@ describe("FloatingWeb", () => {
       fragmentation_pct: (i % 5) * 5.0,
       backend: (["slab", "buddy", "arena", "system"] as const)[i % 4],
     }));
-    render(<FloatingWeb records={records} />);
+    render(<Constellations records={records} topology={topoFrom(records)} />);
     await waitFor(() => {
-      expect(screen.getByText(/FLOATING WEB/i)).toBeDefined();
+      expect(screen.getByText(/CONSTELLATIONS/i)).toBeDefined();
     });
   });
 
   it("handles mixed alloc and free operations", async () => {
-    const FloatingWeb = (await import("../FloatingWeb")).default;
+    const Constellations = (await import("../Constellations")).default;
     const records = [
       {
         timestamp: 0,
@@ -296,14 +322,14 @@ describe("FloatingWeb", () => {
         backend: "buddy" as const,
       },
     ];
-    render(<FloatingWeb records={records} />);
+    render(<Constellations records={records} topology={topoFrom(records)} />);
     await waitFor(() => {
-      expect(screen.getByText(/FLOATING WEB/i)).toBeDefined();
+      expect(screen.getByText(/CONSTELLATIONS/i)).toBeDefined();
     });
   });
 
   it("persists nodes across records updates (morphing)", async () => {
-    const FloatingWeb = (await import("../FloatingWeb")).default;
+    const Constellations = (await import("../Constellations")).default;
     const initial = [
       {
         timestamp: 0,
@@ -317,9 +343,9 @@ describe("FloatingWeb", () => {
         backend: "slab" as const,
       },
     ];
-    const { rerender } = render(<FloatingWeb records={initial} />);
+    const { rerender } = render(<Constellations records={initial} topology={topoFrom(initial)} />);
     await waitFor(() => {
-      expect(screen.getByText(/FLOATING WEB/i)).toBeDefined();
+      expect(screen.getByText(/CONSTELLATIONS/i)).toBeDefined();
     });
     // Update records — same hash + new hash. Should not crash.
     const updated = [
@@ -346,12 +372,12 @@ describe("FloatingWeb", () => {
         backend: "buddy" as const,
       },
     ];
-    rerender(<FloatingWeb records={updated} />);
-    expect(screen.getByText(/FLOATING WEB/i)).toBeDefined();
+    rerender(<Constellations records={updated} topology={topoFrom(updated)} />);
+    expect(screen.getByText(/CONSTELLATIONS/i)).toBeDefined();
   });
 
   it("removes stale nodes when records shrink", async () => {
-    const FloatingWeb = (await import("../FloatingWeb")).default;
+    const Constellations = (await import("../Constellations")).default;
     const dense = [
       {
         timestamp: 0,
@@ -387,9 +413,9 @@ describe("FloatingWeb", () => {
         backend: "arena" as const,
       },
     ];
-    const { rerender } = render(<FloatingWeb records={dense} />);
+    const { rerender } = render(<Constellations records={dense} topology={topoFrom(dense)} />);
     await waitFor(() => {
-      expect(screen.getByText(/FLOATING WEB/i)).toBeDefined();
+      expect(screen.getByText(/CONSTELLATIONS/i)).toBeDefined();
     });
     // Shrink to a single hash — stale nodes should be removed without error.
     const sparse = [
@@ -405,7 +431,43 @@ describe("FloatingWeb", () => {
         backend: "slab" as const,
       },
     ];
-    rerender(<FloatingWeb records={sparse} />);
-    expect(screen.getByText(/FLOATING WEB/i)).toBeDefined();
+    rerender(<Constellations records={sparse} topology={topoFrom(sparse)} />);
+    expect(screen.getByText(/CONSTELLATIONS/i)).toBeDefined();
+  });
+
+  it("creates nodes for free-only stack hashes", async () => {
+    const Constellations = (await import("../Constellations")).default;
+    // A stack_hash that appears only via free operations (no matching alloc in the window).
+    // This simulates the case where an alloc record has scrolled out of the ring buffer,
+    // but its corresponding free record is still present.
+    const records = [
+      {
+        timestamp: 0,
+        op: "free" as const,
+        size: 64,
+        stack_hash: 500,
+        thread_id: 0,
+        result_ptr: "0x5000",
+        latency_ns: 50,
+        fragmentation_pct: 3,
+        backend: "slab" as const,
+      },
+      {
+        timestamp: 1,
+        op: "alloc" as const,
+        size: 128,
+        stack_hash: 600,
+        thread_id: 0,
+        result_ptr: "0x6000",
+        latency_ns: 100,
+        fragmentation_pct: 5,
+        backend: "buddy" as const,
+      },
+    ];
+    render(<Constellations records={records} topology={topoFrom(records)} />);
+    // Should render without crashing despite hash 500 appearing only in free ops.
+    await waitFor(() => {
+      expect(screen.getByText(/CONSTELLATIONS/i)).toBeDefined();
+    });
   });
 });

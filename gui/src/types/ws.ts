@@ -14,7 +14,7 @@ export type SimulationStatus = 'started' | 'running' | 'exited' | 'failed';
 
 export interface SimulationEvent {
   pid: number;
-  kind: 'lohalloc-example' | 'http-server' | 'long-running' | string;
+  kind: 'lohalloc-example' | 'long-running' | string;
   status: SimulationStatus;
   duration_ms: number;
   exit_code?: number;

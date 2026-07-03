@@ -1,12 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { Strategy } from '../types/telemetry';
-import {
-  getStrategy,
-  setStrategy,
-  freezeLive,
-  freezeExport,
-  downloadLohalloc,
-} from '../hooks/useApi';
+import { getStrategy, setStrategy, freezeExport, downloadLohalloc } from '../hooks/useApi';
 
 const STRATEGIES: { value: Strategy; label: string; short: string }[] = [
   { value: 'default', label: 'DEFAULT (MAB)', short: 'MAB' },
@@ -15,13 +9,15 @@ const STRATEGIES: { value: Strategy; label: string; short: string }[] = [
 ];
 
 /**
- * Compact strategy buttons for embedding in the topology pane header bar.
- * Renders 3 small strategy toggle buttons + a FREEZE & EXPORT button.
+ * Compact strategy toggle buttons for embedding in the topology pane
+ * header bar. Freeze/Export live in App.tsx's dedicated header controls
+ * (state-freeze only, no auto-download) — this used to also render its
+ * own "FREEZE" button that called freezeLive()+freezeExport() together,
+ * which both duplicated and contradicted that no-download freeze design.
  */
 export function StrategyButtons(): JSX.Element {
   const [current, setCurrent] = useState<Strategy>('default');
   const [loading, setLoading] = useState(false);
-  const [exporting, setExporting] = useState(false);
 
   useEffect(() => {
     getStrategy()
@@ -41,20 +37,6 @@ export function StrategyButtons(): JSX.Element {
     }
   }, []);
 
-  const handleFreezeExport = useCallback(async () => {
-    setExporting(true);
-    try {
-      // First freeze the live allocator, then export the .lohalloc model.
-      await freezeLive();
-      const bytes = await freezeExport();
-      downloadLohalloc(bytes, 'model.lohalloc');
-    } catch {
-      // ignore in compact mode
-    } finally {
-      setExporting(false);
-    }
-  }, []);
-
   return (
     <div className="flex items-center gap-1" data-testid="strategy-buttons">
       {STRATEGIES.map((s) => {
@@ -65,7 +47,7 @@ export function StrategyButtons(): JSX.Element {
             onClick={() => handleSetStrategy(s.value)}
             disabled={loading}
             className={[
-              'px-1.5 py-0.5 text-[9px] tracking-widest uppercase border',
+              'h-8 px-2 text-[9px] tracking-widest uppercase border flex items-center justify-center',
               active
                 ? 'bg-heat text-canvas border-heat'
                 : 'bg-canvas text-ink-muted border-ink-faint hover:border-ink-muted hover:text-ink',
@@ -78,19 +60,6 @@ export function StrategyButtons(): JSX.Element {
           </button>
         );
       })}
-      <button
-        onClick={handleFreezeExport}
-        disabled={exporting}
-        className={[
-          'px-1.5 py-0.5 text-[9px] tracking-widest uppercase border font-bold',
-          'bg-canvas text-ink border-ink hover:bg-ink hover:text-canvas',
-          'disabled:opacity-50 disabled:cursor-not-allowed',
-          'transition-colors duration-75',
-        ].join(' ')}
-        data-testid="freeze-export-btn"
-      >
-        {exporting ? '...' : 'FREEZE'}
-      </button>
     </div>
   );
 }

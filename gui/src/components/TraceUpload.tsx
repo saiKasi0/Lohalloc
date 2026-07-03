@@ -20,10 +20,15 @@ export function TraceUpload(): JSX.Element {
       if (file.name.endsWith('.json') || text.trim().startsWith('[')) {
         trace = JSON.parse(text) as TraceOp[];
       } else {
+        // CSV schema: timestamp,op,size,stack_hash (header row skipped). The
+        // timestamp (ns) is required — the server enforces it on replay.
         const lines = text.trim().split('\n');
         trace = lines.slice(1).map((line) => {
-          const [op, size, stackHash] = line.split(',').map((s) => s.trim());
+          const [timestamp, op, size, stackHash] = line
+            .split(',')
+            .map((s) => s.trim());
           return {
+            timestamp: Number(timestamp),
             op: op as TraceOp['op'],
             size: Number(size),
             stack_hash: Number(stackHash),

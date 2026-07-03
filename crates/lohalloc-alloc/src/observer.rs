@@ -61,6 +61,7 @@ pub struct TelemetryCRecord {
 
 impl TelemetryCRecord {
     /// Construct a record for a successful allocation.
+    #[allow(clippy::too_many_arguments)]
     pub fn alloc(
         timestamp: u64,
         size: usize,
@@ -69,6 +70,7 @@ impl TelemetryCRecord {
         result_ptr: u64,
         latency_ns: u64,
         backend: u8,
+        fragmentation_pct: f32,
     ) -> Self {
         Self {
             timestamp,
@@ -80,13 +82,14 @@ impl TelemetryCRecord {
             _pad1: [0; 4],
             result_ptr,
             latency_ns,
-            fragmentation_pct: 0.0,
+            fragmentation_pct,
             backend,
             _pad2: [0; 7],
         }
     }
 
     /// Construct a record for a free operation.
+    #[allow(clippy::too_many_arguments)]
     pub fn free(
         timestamp: u64,
         size: usize,
@@ -94,6 +97,7 @@ impl TelemetryCRecord {
         thread_id: u32,
         result_ptr: u64,
         latency_ns: u64,
+        fragmentation_pct: f32,
     ) -> Self {
         Self {
             timestamp,
@@ -105,7 +109,7 @@ impl TelemetryCRecord {
             _pad1: [0; 4],
             result_ptr,
             latency_ns,
-            fragmentation_pct: 0.0,
+            fragmentation_pct,
             backend: 0xFF,
             _pad2: [0; 7],
         }
@@ -162,13 +166,19 @@ pub fn emit(record: TelemetryCRecord) {
     }
 }
 
-/// Monotonic nanosecond timestamp. Uses `Instant::elapsed` from the process
-/// epoch so we never observe wall-clock jumps. Cheap (vDSO on Linux,
-/// `mach_absolute_time` on macOS), zero allocations.
+/// Process-wide monotonic epoch, lazily anchored on first use. Every
+/// `now_ns()` call measures elapsed time against this single fixed instant
+/// — never against a fresh `Instant::now()` (which would just measure the
+/// gap between two back-to-back calls, i.e. ~0).
+static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Monotonic nanosecond timestamp relative to the shared `EPOCH`, so
+/// readings are meaningfully comparable across calls (and across threads).
+/// Cheap (vDSO on Linux, `mach_absolute_time` on macOS), zero allocations.
 #[inline]
-fn now_ns() -> u64 {
-    use std::time::Instant;
-    Instant::now().elapsed().as_nanos() as u64
+pub(crate) fn now_ns() -> u64 {
+    let epoch = EPOCH.get_or_init(std::time::Instant::now);
+    epoch.elapsed().as_nanos() as u64
 }
 
 /// Current OS thread identifier, truncated to `u32`. Used purely as a
@@ -184,26 +194,36 @@ fn thread_id_u32() -> u32 {
 
 /// Convenience: emit a successful allocation record. Called from
 /// `write_header` after the ownership header has been written. Latency is
-/// reported as 0 in this Phase — true latency instrumentation is a Phase 5+++
-/// item (would require threading an `_alloc_start_ns` through `route_alloc`
-/// and friends, a moderate refactor).
+/// computed as the elapsed time since the allocation started (captured in
+/// `alloc_start_ns()` getter from lib.rs).
 #[inline(always)]
-pub fn emit_alloc(size: usize, stack_hash: u64, result_ptr: u64, backend: u8) {
+pub fn emit_alloc(
+    size: usize,
+    stack_hash: u64,
+    result_ptr: u64,
+    backend: u8,
+    fragmentation_pct: f32,
+) {
+    let now = now_ns();
+    let start_ns = super::alloc_start_ns();
+    let latency_ns = now.saturating_sub(start_ns);
+
     emit(TelemetryCRecord::alloc(
-        now_ns(),
+        now,
         size,
         stack_hash,
         thread_id_u32(),
         result_ptr,
-        0, // latency_ns — see doc above
+        latency_ns,
         backend,
+        fragmentation_pct,
     ));
 }
 
 /// Convenience: emit a free record. Called from `dealloc` after the header's
 /// magic check has passed. Same latency caveat as `emit_alloc`.
 #[inline(always)]
-pub fn emit_free(size: usize, stack_hash: u64, result_ptr: u64) {
+pub fn emit_free(size: usize, stack_hash: u64, result_ptr: u64, fragmentation_pct: f32) {
     emit(TelemetryCRecord::free(
         now_ns(),
         size,
@@ -211,6 +231,7 @@ pub fn emit_free(size: usize, stack_hash: u64, result_ptr: u64) {
         thread_id_u32(),
         result_ptr,
         0,
+        fragmentation_pct,
     ));
 }
 
@@ -230,7 +251,7 @@ mod tests {
         // Ensure no sink is installed for this test.
         clear_sink();
         let before = COUNTER.load(StdOrdering::Relaxed);
-        emit(TelemetryCRecord::alloc(0, 64, 0, 0, 0, 0, 0));
+        emit(TelemetryCRecord::alloc(0, 64, 0, 0, 0, 0, 0, 0.0));
         let after = COUNTER.load(StdOrdering::Relaxed);
         assert_eq!(before, after, "emit should be no-op when sink is null");
     }
@@ -239,8 +260,10 @@ mod tests {
     fn emit_routes_to_installed_sink() {
         install_sink(Some(test_sink));
         let before = COUNTER.load(StdOrdering::Relaxed);
-        emit(TelemetryCRecord::alloc(0, 64, 0xdead, 0, 0x1000, 100, 0));
-        emit(TelemetryCRecord::free(0, 64, 0xdead, 0, 0x1000, 50));
+        emit(TelemetryCRecord::alloc(
+            0, 64, 0xdead, 0, 0x1000, 100, 0, 12.5,
+        ));
+        emit(TelemetryCRecord::free(0, 64, 0xdead, 0, 0x1000, 50, 0.0));
         let after = COUNTER.load(StdOrdering::Relaxed);
         assert_eq!(after - before, 2, "two emit calls should reach the sink");
         // Leave the sink cleared so other tests see a clean slate.
@@ -283,5 +306,21 @@ mod tests {
         assert_eq!(offset_of!(TelemetryCRecord, latency_ns), 48);
         assert_eq!(offset_of!(TelemetryCRecord, fragmentation_pct), 56);
         assert_eq!(offset_of!(TelemetryCRecord, backend), 60);
+    }
+
+    #[test]
+    fn now_ns_is_monotonic() {
+        use std::thread;
+        use std::time::Duration;
+        let t1 = now_ns();
+        thread::sleep(Duration::from_millis(5));
+        let t2 = now_ns();
+        assert!(t2 > t1, "now_ns() must be strictly increasing");
+        let delta = t2 - t1;
+        assert!(
+            delta >= 4_000_000,
+            "delta should be at least 5ms (5_000_000ns), got {}ns",
+            delta
+        );
     }
 }

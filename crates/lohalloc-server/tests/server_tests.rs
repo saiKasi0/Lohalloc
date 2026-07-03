@@ -44,7 +44,7 @@ async fn health_returns_ok() {
 async fn upload_trace_valid_json_returns_lohalloc_bytes() {
     let addr = start_server().await;
     let body =
-        r#"[{"op":"alloc","size":64,"stack_hash":100},{"op":"free","size":64,"stack_hash":100}]"#;
+        r#"[{"timestamp":0,"op":"alloc","size":64,"stack_hash":100},{"timestamp":1500000,"op":"free","size":64,"stack_hash":100}]"#;
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/api/upload-trace"))
         .header(header::CONTENT_TYPE, "application/json")
@@ -84,7 +84,7 @@ async fn upload_trace_missing_content_type_rejected() {
     let addr = start_server().await;
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/api/upload-trace"))
-        .body(r#"[{"op":"alloc","size":64,"stack_hash":100}]"#)
+        .body(r#"[{"timestamp":0,"op":"alloc","size":64,"stack_hash":100}]"#)
         .send()
         .await
         .unwrap();
@@ -120,7 +120,7 @@ async fn upload_trace_bad_op_value_rejected() {
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/api/upload-trace"))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(r#"[{"op":"bogus","size":64,"stack_hash":100}]"#)
+        .body(r#"[{"timestamp":0,"op":"bogus","size":64,"stack_hash":100}]"#)
         .send()
         .await
         .unwrap();
@@ -137,12 +137,14 @@ async fn upload_trace_large_works() {
     let mut ops = Vec::new();
     for i in 0..200 {
         ops.push(format!(
-            r#"{{"op":"alloc","size":{},"stack_hash":{}}}"#,
+            r#"{{"timestamp":{},"op":"alloc","size":{},"stack_hash":{}}}"#,
+            i * 2,
             64 + (i % 4) * 64,
             1000 + i
         ));
         ops.push(format!(
-            r#"{{"op":"free","size":{},"stack_hash":{}}}"#,
+            r#"{{"timestamp":{},"op":"free","size":{},"stack_hash":{}}}"#,
+            i * 2 + 1,
             64 + (i % 4) * 64,
             1000 + i
         ));
@@ -200,7 +202,7 @@ async fn websocket_streams_telemetry_after_upload() {
     let response = client
         .post(format!("http://{addr}/api/upload-trace"))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(r#"[{"op":"alloc","size":64,"stack_hash":100},{"op":"free","size":64,"stack_hash":100}]"#)
+        .body(r#"[{"timestamp":0,"op":"alloc","size":64,"stack_hash":100},{"timestamp":1500000,"op":"free","size":64,"stack_hash":100}]"#)
         .send()
         .await
         .unwrap();
@@ -253,10 +255,10 @@ async fn websocket_multiple_records_streamed() {
 
     // Upload a trace with 4 ops.
     let body = r#"[
-        {"op":"alloc","size":64,"stack_hash":1},
-        {"op":"alloc","size":128,"stack_hash":2},
-        {"op":"free","size":64,"stack_hash":1},
-        {"op":"free","size":128,"stack_hash":2}
+        {"timestamp":0,"op":"alloc","size":64,"stack_hash":1},
+        {"timestamp":1,"op":"alloc","size":128,"stack_hash":2},
+        {"timestamp":2,"op":"free","size":64,"stack_hash":1},
+        {"timestamp":3,"op":"free","size":128,"stack_hash":2}
     ]"#;
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/api/upload-trace"))
@@ -364,4 +366,106 @@ async fn run_simulation_long_running_via_inline_shell() {
         status == 202 || status == 503 || status == 501,
         "expected 202/503/501, got {status}"
     );
+}
+
+/// Write a minimal, portable "binary" stub — a `#!/bin/sh` script that
+/// exits immediately — to a fresh temp file and mark it executable. This
+/// deterministically satisfies `find_simulation_binary`/`find_shim_path`'s
+/// `is_file()` check via the `LOHALLOC_BIN_*`/`LOHALLOC_SHIM_PATH` env
+/// overrides, without depending on `target/debug/*` having been built or
+/// on any particular system binary existing at a fixed path.
+fn write_stub_executable(label: &str) -> std::path::PathBuf {
+    use std::io::Write;
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "lohalloc_test_stub_{}_{}_{}",
+        label,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = f.metadata().unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+    path
+}
+
+/// Table-driven coverage of `POST /api/run-simulation` over every
+/// `SimulationKind`, using stub binary/shim files via env overrides so
+/// binary discovery is deterministic regardless of what's been built in
+/// `target/`. For each kind we assert a `202` response and that the
+/// handler's synchronous `push_simulation_history(started)` call produced
+/// a matching `started` entry — that part happens before the response is
+/// even sent, so it doesn't depend on the stub subprocess's actual
+/// execution/exit behavior (which, unlike discovery, does vary by
+/// OS/security config for a non-`.so`/`.dylib` shim stub).
+///
+/// Env vars are process-global, so this — like the codebase's existing
+/// `run_simulation_missing_shim_returns_503` — accepts a theoretical race
+/// against other tests mutating the same `LOHALLOC_*` vars concurrently;
+/// that risk already exists in this file and is out of scope here.
+#[tokio::test]
+async fn run_simulation_accepts_every_kind_via_stub_overrides() {
+    let binary_stub = write_stub_executable("binary");
+    let shim_stub = write_stub_executable("shim");
+
+    // Every SimulationKind is a lohalloc-example variant now (the
+    // http-server kind was removed), so one binary override covers all.
+    std::env::set_var("LOHALLOC_BIN_LOHALLOC_EXAMPLE", &binary_stub);
+    std::env::set_var("LOHALLOC_SHIM_PATH", &shim_stub);
+
+    let addr = start_server().await;
+    let client = reqwest::Client::new();
+
+    for kind in lohalloc_server::simulation::SimulationKind::ALL {
+        let body = serde_json::json!({ "kind": kind.as_str(), "args": {} });
+        let response = client
+            .post(format!("http://{addr}/api/run-simulation"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            202,
+            "kind={} should discover the stub binary+shim and spawn",
+            kind.as_str()
+        );
+        let json: serde_json::Value = response.json().await.unwrap();
+        let pid = json["pid"].as_u64().expect("response has pid");
+
+        let history: serde_json::Value = client
+            .get(format!("http://{addr}/api/simulation-history"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let events = history["events"].as_array().unwrap();
+        let found = events.iter().any(|e| {
+            e["pid"].as_u64() == Some(pid)
+                && e["kind"].as_str() == Some(kind.as_str())
+                && e["status"].as_str() == Some("started")
+        });
+        assert!(
+            found,
+            "kind={} missing 'started' history event; events={events:?}",
+            kind.as_str()
+        );
+    }
+
+    std::env::remove_var("LOHALLOC_BIN_LOHALLOC_EXAMPLE");
+    std::env::remove_var("LOHALLOC_SHIM_PATH");
+    let _ = std::fs::remove_file(&binary_stub);
+    let _ = std::fs::remove_file(&shim_stub);
 }

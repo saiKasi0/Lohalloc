@@ -1,22 +1,19 @@
+import { useEffect, useState, type ComponentType } from "react";
+import { useTelemetryStore } from "./hooks/useTelemetryStore";
 import {
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ComponentType,
-} from "react";
-import { useTelemetry } from "./hooks/useTelemetry";
-import { useLiveStream } from "./hooks/useLiveStream";
-import { useSimulationEvents } from "./hooks/useSimulationEvents";
-import { useConvergence } from "./hooks/useConvergence";
-import { runSimulation } from "./hooks/useApi";
-import { PerfTraceView } from "./components/PerfTraceView";
+  runSimulation,
+  getMode,
+  freezeLive,
+  freezeExport,
+  downloadLohalloc,
+  resetTraining,
+} from "./hooks/useApi";
 import { StrategyButtons } from "./components/StrategyToggle";
-import { HeapMap } from "./components/HeapMap";
-import ModeToggle from "./components/ModeToggle";
 import CollapsedTopology from "./components/CollapsedTopology";
 import TelemetrySidebar from "./components/TelemetrySidebar";
 import TraceUploadModal from "./components/TraceUploadModal";
+import { AllocationFlowModal } from "./components/AllocationFlow";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import {
   SimulationPanel,
   SimulateDropdown,
@@ -24,6 +21,9 @@ import {
 } from "./components/SimulationPanel";
 import type { Mode } from "./hooks/useApi";
 import type { TelemetryRecord } from "./types/telemetry";
+import type { HashAggregate } from "./hooks/useTelemetry";
+import { debug } from "./utils/debug";
+import { generatePerformanceCSV, downloadCSV } from "./utils/csv-export";
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n}B`;
@@ -31,13 +31,20 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)}MB`;
 }
 
-const FloatingWebLazy = ({ records }: { records: TelemetryRecord[] }) => {
+const ConstellationsLazy = ({
+  records,
+  topology,
+}: {
+  records: TelemetryRecord[];
+  topology: Map<number, HashAggregate>;
+}) => {
   const [Cmp, setCmp] = useState<ComponentType<{
     records: TelemetryRecord[];
+    topology: Map<number, HashAggregate>;
   }> | null>(null);
   useEffect(() => {
     let cancelled = false;
-    import("./components/FloatingWeb")
+    import("./components/Constellations")
       .then((m) => {
         if (!cancelled) setCmp(() => m.default);
       })
@@ -51,46 +58,180 @@ const FloatingWebLazy = ({ records }: { records: TelemetryRecord[] }) => {
   if (!Cmp) {
     return (
       <div className="flex items-center justify-center h-full text-ink-muted text-xs tracking-widest">
-        LOADING WEB...
+        LOADING CONSTELLATIONS...
       </div>
     );
   }
-  return <Cmp records={records} />;
+  return <Cmp records={records} topology={topology} />;
 };
 
 function App() {
-  const { records, isConnected, subscribeSimEvents, resetState } =
-    useTelemetry();
+  const {
+    records,
+    totalReceived,
+    topology,
+    isConnected,
+    resetState,
+    serverError,
+    isLive,
+    convergence,
+    activeSims,
+    simEvents,
+    clearSimEvents,
+    metrics,
+  } = useTelemetryStore();
   const [mode, setMode] = useState<Mode>("training");
+  const [modeBusy, setModeBusy] = useState<"freeze" | "export" | "unfreeze" | null>(
+    null,
+  );
   const [traceModalOpen, setTraceModalOpen] = useState(false);
   const [simPanelOpen, setSimPanelOpen] = useState(false);
+  const [flowModalOpen, setFlowModalOpen] = useState(false);
   const [durationSecs, setDurationSecs] = useState(30);
   const [toast, setToast] = useState<{
     message: string;
     level?: "info" | "error" | "success";
     key: number;
   } | null>(null);
-  const isLive = useLiveStream(records.length);
-  const convergence = useConvergence(records);
 
-  // Simulation events from the WS stream
-  const {
-    active: activeSims,
-    events: simEvents,
-    clear: clearSimEvents,
-  } = useSimulationEvents({
-    subscribeSimEvents,
-  });
+  // One-time fetch of the allocator's current mode on mount (was previously
+  // owned by ModeToggle's own effect).
+  useEffect(() => {
+    let cancelled = false;
+    getMode()
+      .then((m) => {
+        if (!cancelled) {
+          debug.log("mode", "initial mode fetched", m);
+          setMode(m);
+        }
+      })
+      .catch(() => {
+        // Backend unavailable — keep default 'training'.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
-  const allocCount = records.filter((r) => r.op === "alloc").length;
-  const freeCount = records.filter((r) => r.op === "free").length;
+  // TRAINING → INFERENCE: a strict state-freeze, no download side effect.
+  // Collapses the live MAB into a frozen routing table server-side; the
+  // topology pane switches to CollapsedTopology (the frozen routing
+  // matrix) as a result of `mode` flipping.
+  const handleFreeze = async () => {
+    if (mode === "inference" || modeBusy) return;
+    setModeBusy("freeze");
+    debug.log("mode", "freeze: requesting");
+    try {
+      await freezeLive();
+      setMode("inference");
+      debug.log("mode", "freeze: training -> inference");
+      setToast({ message: "Frozen — now in inference mode", level: "success", key: Date.now() });
+    } catch (err) {
+      debug.error("mode", "freeze: failed", err);
+      setToast({
+        message: err instanceof Error ? err.message : "freeze failed",
+        level: "error",
+        key: Date.now(),
+      });
+    } finally {
+      setModeBusy(null);
+    }
+  };
+
+  // Download the frozen `.lohalloc` model. Available in both modes so the
+  // model stays reachable after freezing without needing a separate
+  // reveal step.
+  const handleExport = async () => {
+    if (modeBusy) return;
+    setModeBusy("export");
+    debug.log("mode", "export: requesting");
+    try {
+      const bytes = await freezeExport();
+      const stamp = new Date()
+        .toISOString()
+        .replace(/[:.]/g, "-")
+        .replace(/T/, "_")
+        .slice(0, 19);
+      downloadLohalloc(bytes, `lohalloc_${stamp}.lohalloc`);
+      debug.log("mode", "export: downloaded");
+    } catch (err) {
+      debug.error("mode", "export: failed", err);
+      setToast({
+        message: err instanceof Error ? err.message : "export failed",
+        level: "error",
+        key: Date.now(),
+      });
+    } finally {
+      setModeBusy(null);
+    }
+  };
+
+  // INFERENCE → TRAINING: discard the frozen model server-side and return
+  // to a fresh live-training allocator, without a page reload.
+  const handleUnfreeze = async () => {
+    if (mode !== "inference" || modeBusy) return;
+    setModeBusy("unfreeze");
+    debug.log("mode", "unfreeze: requesting");
+    try {
+      await resetTraining();
+      setMode("training");
+      debug.log("mode", "unfreeze: inference -> training");
+      setToast({ message: "Unfrozen — back in training mode", level: "success", key: Date.now() });
+    } catch (err) {
+      debug.error("mode", "unfreeze: failed", err);
+      setToast({
+        message: err instanceof Error ? err.message : "unfreeze failed",
+        level: "error",
+        key: Date.now(),
+      });
+    } finally {
+      setModeBusy(null);
+    }
+  };
+
+  // Wipe every GUI-side visual + telemetry record without spawning a new
+  // simulation — every pane renders from `records`, so this alone resets
+  // Constellations/TelemetrySidebar/AllocationFlow.
+  const handleClear = () => {
+    debug.log("mode", "clear: wiping records + sim history");
+    resetState();
+    clearSimEvents();
+  };
+
+  // Export telemetry records as CSV (time vs latency/throughput/fragmentation).
+  const handleExportCSV = () => {
+    if (records.length === 0) {
+      setToast({
+        message: "No telemetry records to export",
+        level: "info",
+        key: Date.now(),
+      });
+      return;
+    }
+    const csv = generatePerformanceCSV(records);
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[:.]/g, "-")
+      .replace(/T/, "_")
+      .slice(0, 19);
+    downloadCSV(csv, `lohalloc_perf_${stamp}.csv`);
+    debug.log("csv", "exported", { recordCount: records.length });
+    setToast({
+      message: `Exported ${records.length} records to CSV`,
+      level: "success",
+      key: Date.now(),
+    });
+  };
 
   const handleSpawn = async (kind: string) => {
+    const end = debug.group("sim", `handleSpawn ${kind}`);
+    debug.log("sim", "handleSpawn: reset + clear", { kind, durationSecs });
     // Purge old telemetry + sim history so the new run starts clean.
     resetState();
     clearSimEvents();
     try {
       const result = await runSimulation(kind, { duration_secs: durationSecs });
+      debug.log("sim", "handleSpawn: spawned", result);
       setToast({
         message: `Spawned ${result.kind} (pid=${result.pid})`,
         level: "success",
@@ -98,11 +239,14 @@ function App() {
       });
       setSimPanelOpen(true);
     } catch (err) {
+      debug.error("sim", "handleSpawn: spawn failed", err);
       setToast({
         message: err instanceof Error ? err.message : "spawn failed",
         level: "error",
         key: Date.now(),
       });
+    } finally {
+      end();
     }
   };
 
@@ -117,12 +261,14 @@ function App() {
       });
       return;
     }
+    const end = debug.group("sim", `handleValidate ${kind}`);
     resetState();
     clearSimEvents();
     try {
       const result = await runSimulation(kind, {
         duration_secs: validateDurationSecs,
       });
+      debug.log("sim", "handleValidate: spawned", result);
       setToast({
         message: `Validating ${result.kind} with frozen model (pid=${result.pid})`,
         level: "success",
@@ -130,67 +276,16 @@ function App() {
       });
       setSimPanelOpen(true);
     } catch (err) {
+      debug.error("sim", "handleValidate: spawn failed", err);
       setToast({
         message: err instanceof Error ? err.message : "validation spawn failed",
         level: "error",
         key: Date.now(),
       });
+    } finally {
+      end();
     }
   };
-
-  // Track timestamps of records arriving for OPS/SEC computation.
-  const opTimestampsRef = useRef<number[]>([]);
-  const lastSeenLenRef = useRef<number>(0);
-  const [tick, setTick] = useState(0);
-
-  // Push timestamp when new records arrive (in useEffect, not render body).
-  useEffect(() => {
-    if (records.length !== lastSeenLenRef.current) {
-      const now = performance.now();
-      const buf = opTimestampsRef.current;
-      buf.push(now);
-      while (buf.length > 0 && now - buf[0] > 1000) buf.shift();
-      lastSeenLenRef.current = records.length;
-    }
-  }, [records.length]);
-
-  // 1-second interval to force re-render so OPS/sec decays to 0 when stream stops.
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const buf = opTimestampsRef.current;
-      const now = performance.now();
-      while (buf.length > 0 && now - buf[0] > 1000) buf.shift();
-      setTick((t) => t + 1);
-    }, 1000);
-    return () => clearInterval(interval);
-  }, []);
-
-  const metrics = useMemo(() => {
-    const now = performance.now();
-    const buf = opTimestampsRef.current;
-    while (buf.length > 0 && now - buf[0] > 1000) buf.shift();
-
-    const recent = records.slice(-5000);
-    const bytesAlloc = recent.reduce(
-      (sum, r) => (r.op === "alloc" ? sum + r.size : sum),
-      0,
-    );
-
-    const fragWindow = records.slice(-500);
-    let fragSum = 0;
-    let fragCount = 0;
-    for (const r of fragWindow) {
-      fragSum += r.fragmentation_pct;
-      fragCount++;
-    }
-    const fragAvg = fragCount > 0 ? fragSum / fragCount : 0;
-
-    return {
-      bytesAlloc,
-      opsPerSec: buf.length,
-      fragAvg,
-    };
-  }, [records, tick]);
 
   return (
     <div
@@ -205,21 +300,23 @@ function App() {
             <span className="text-heat">//</span>
             <span className="text-ink">ALLOC</span>
           </h1>
-          <div className="w-64">
-            <ModeToggle
-              onModeChange={setMode}
-              freezeRecommended={convergence.isConverged}
-            />
-          </div>
         </div>
         <div className="flex items-center gap-3 text-[11px] tracking-widest">
           <button
             type="button"
             onClick={() => setTraceModalOpen(true)}
             data-testid="open-trace-modal"
-            className="border border-ink-faint px-3 py-1 text-ink-muted hover:text-ink hover:border-ink uppercase tracking-widest"
+            className="h-8 px-4 border border-ink-faint text-ink-muted hover:text-ink hover:border-ink uppercase tracking-widest flex items-center justify-center"
           >
             UPLOAD TRACE
+          </button>
+          <button
+            type="button"
+            onClick={() => setFlowModalOpen(true)}
+            data-testid="open-flow-modal"
+            className="h-8 px-4 border border-ink-faint text-ink-muted hover:text-ink hover:border-ink uppercase tracking-widest flex items-center justify-center"
+          >
+            FLOW
           </button>
           <SimulateDropdown
             onSpawn={handleSpawn}
@@ -278,34 +375,47 @@ function App() {
           )}
           <span className="text-ink-faint">|</span>
           <span className="text-ink">
-            {records.length.toString().padStart(6, "0")} REC
+            {totalReceived.toString().padStart(6, "0")} REC
           </span>
           <span className="text-ink-faint">|</span>
           <span className="text-ink-muted">
-            ALLOC {allocCount.toString().padStart(5, "0")} / FREE{" "}
-            {freeCount.toString().padStart(5, "0")}
+            ALLOC {metrics.allocCount.toString().padStart(5, "0")} / FREE{" "}
+            {metrics.freeCount.toString().padStart(5, "0")}
           </span>
         </div>
       </header>
+
+      {/* Connection error / reconnecting banner */}
+      {serverError && !isConnected && (
+        <div
+          className="px-4 py-2 bg-heat/10 border-b border-heat/30 text-heat font-mono text-[11px] flex items-center justify-between"
+          data-testid="server-error-banner"
+        >
+          <span>
+            <span className="font-bold">[ERROR]</span> {serverError}
+          </span>
+          <span className="text-ink-muted animate-pulse">RECONNECTING...</span>
+        </div>
+      )}
 
       {/* MAIN GRID */}
       <main
         className="grid grid-cols-12 gap-2 p-2 flex-1 overflow-hidden"
         style={{
-          gridTemplateRows: "3fr 2fr", // Top row slightly larger
+          gridTemplateRows: "1fr",
           height: "calc(100vh - 64px)",
         }}
       >
-        {/* TOP LEFT: Topology */}
+        {/* LEFT: Topology (Expanded) */}
         <section
-          className="col-span-8 border border-ink-faint bg-canvas flex flex-col overflow-hidden min-h-0"
+          className="col-span-9 border border-ink-faint bg-canvas flex flex-col overflow-hidden min-h-0"
           data-testid="topology-pane"
         >
-          <div className="px-3 py-2 border-b border-ink-faint text-[10px] tracking-widest text-ink-muted flex items-center justify-between flex-wrap gap-y-1 shrink-0">
+          <div className="px-3 min-h-[48px] border-b border-ink-faint text-[10px] tracking-widest text-ink-muted flex items-center justify-between flex-wrap gap-y-1 shrink-0">
             <span>
               {mode === "inference"
                 ? "COLLAPSED TOPOLOGY // INFERENCE"
-                : "FLOATING WEB // TRAINING"}
+                : "CONSTELLATIONS // TRAINING"}
             </span>
             <div className="flex items-center gap-2 flex-wrap">
               {mode === "training" && convergence.uniqueHashes > 0 && (
@@ -349,44 +459,115 @@ function App() {
               <span className="text-ink">
                 MODE: <span className="text-heat">{mode.toUpperCase()}</span>
               </span>
+              <div className="flex items-center gap-1.5">
+                {mode === "training" && (
+                  <button
+                    type="button"
+                    disabled={modeBusy !== null}
+                    onClick={handleFreeze}
+                    data-testid="freeze-btn"
+                    className={[
+                      "h-8 px-3 border transition-colors duration-75",
+                      "disabled:opacity-50 disabled:cursor-not-allowed",
+                      "flex items-center justify-center uppercase tracking-widest",
+                      convergence.isConverged
+                        ? "bg-heat text-canvas border-heat shadow-heat-glow-sm ring-2 ring-heat ring-offset-1 ring-offset-canvas"
+                        : "bg-canvas text-ink border-ink-faint hover:text-ink hover:border-ink-muted",
+                    ].join(" ")}
+                    title={
+                      convergence.isConverged
+                        ? "Convergence suggests freezing — commit the live MAB weights to a frozen routing table."
+                        : "Freeze the live training allocator (state only, no download)."
+                    }
+                  >
+                    {modeBusy === "freeze" ? "FREEZING…" : "FREEZE →"}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  disabled={modeBusy !== null || mode === "training"}
+                  onClick={handleExport}
+                  data-testid="export-btn"
+                  className="h-8 px-3 border border-ink-faint bg-canvas text-ink hover:text-ink hover:border-ink-muted disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center uppercase tracking-widest transition-colors duration-75"
+                  title={
+                    mode === "training"
+                      ? "Freeze first — there is no model to export yet."
+                      : "Download the frozen .lohalloc model"
+                  }
+                >
+                  {modeBusy === "export" ? "EXPORTING…" : "EXPORT .LOHALLOC"}
+                </button>
+                {mode === "inference" && (
+                  <button
+                    type="button"
+                    disabled={modeBusy !== null}
+                    onClick={handleUnfreeze}
+                    data-testid="unfreeze-btn"
+                    className="h-8 px-3 border border-ink-faint bg-canvas text-ink hover:text-ink hover:border-ink-muted disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center uppercase tracking-widest transition-colors duration-75"
+                    title="Discard the frozen model and return to live training."
+                  >
+                    {modeBusy === "unfreeze" ? "UNFREEZING…" : "↺ UNFREEZE"}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={handleClear}
+                  data-testid="clear-btn"
+                  className="h-8 px-3 border border-ink-faint bg-canvas text-ink-muted hover:text-heat hover:border-heat flex items-center justify-center uppercase tracking-widest transition-colors duration-75"
+                  title="Wipe all telemetry records and simulation history from the GUI (does not affect the running allocator)."
+                >
+                  CLEAR
+                </button>
+                <button
+                  type="button"
+                  onClick={handleExportCSV}
+                  data-testid="export-csv-btn"
+                  disabled={records.length === 0}
+                  className="h-8 px-3 border border-ink-faint bg-canvas text-ink-muted hover:text-ink hover:border-ink-muted disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center uppercase tracking-widest transition-colors duration-75"
+                  title="Export telemetry as CSV (time vs latency/throughput/fragmentation) for external analysis."
+                >
+                  EXPORT CSV
+                </button>
+              </div>
             </div>
           </div>
           <div className="flex-1 relative overflow-hidden min-h-0">
-            {mode === "inference" ? (
-              <CollapsedTopology refreshKey={records.length} />
-            ) : (
-              <FloatingWebLazy records={records} />
-            )}
+            <ErrorBoundary label="topology">
+              {mode === "inference" ? (
+                <CollapsedTopology refreshKey={records.length} />
+              ) : (
+                <ConstellationsLazy records={records} topology={topology} />
+              )}
+            </ErrorBoundary>
           </div>
         </section>
 
-        {/* TOP RIGHT: Telemetry Sidebar */}
+        {/* RIGHT: Telemetry */}
         <section
-          className="col-span-4 border border-ink-faint bg-canvas flex flex-col overflow-hidden min-h-0"
-          data-testid="telemetry-pane"
+          className="col-span-3 flex flex-col gap-2 overflow-hidden min-h-0"
+          data-testid="right-sidebar"
         >
-          <TelemetrySidebar records={records} />
-        </section>
-
-        {/* BOTTOM LEFT: HeapMap */}
-        <section
-          className="col-span-4 border border-ink-faint bg-canvas overflow-hidden min-h-0"
-          data-testid="heapmap-pane"
-        >
-          <HeapMap records={records} />
-        </section>
-
-        {/* BOTTOM RIGHT: PerfTraceView (Latency & Throughput) */}
-        <section
-          className="col-span-8 border border-ink-faint bg-canvas overflow-hidden min-h-0"
-          data-testid="perf-pane"
-        >
-          <PerfTraceView records={records} />
+          {/* Telemetry Sidebar */}
+          <div
+            className="flex-1 border border-ink-faint bg-canvas flex flex-col overflow-hidden min-h-0"
+            data-testid="telemetry-pane"
+          >
+            <ErrorBoundary label="telemetry">
+              <TelemetrySidebar records={records} />
+            </ErrorBoundary>
+          </div>
         </section>
       </main>
 
       {traceModalOpen && (
         <TraceUploadModal onClose={() => setTraceModalOpen(false)} />
+      )}
+
+      {flowModalOpen && (
+        <AllocationFlowModal
+          records={records}
+          onClose={() => setFlowModalOpen(false)}
+        />
       )}
 
       {simPanelOpen && (

@@ -76,12 +76,15 @@ describe('StrategyButtons', () => {
     });
   });
 
-  it('renders FREEZE & EXPORT button', async () => {
+  it('does not render its own FREEZE button (that lives in App.tsx now)', async () => {
+    // StrategyButtons used to render its own "FREEZE" button that called
+    // freezeLive()+freezeExport() together — that duplicated and
+    // contradicted App.tsx's dedicated state-only-freeze/export controls
+    // in the same header row. Only the strategy toggles should remain.
     const { StrategyButtons } = await import('../StrategyToggle');
     render(<StrategyButtons />);
-    await waitFor(() => {
-      expect(screen.getByTestId('freeze-export-btn')).toBeDefined();
-    });
+    await waitFor(() => screen.getByTestId('strategy-btn-default'));
+    expect(screen.queryByTestId('freeze-export-btn')).toBeNull();
   });
 
   it('calls setStrategy when clicking a strategy button', async () => {
@@ -92,18 +95,6 @@ describe('StrategyButtons', () => {
     fireEvent.click(screen.getByTestId('strategy-btn-latency_priority'));
     await waitFor(() => {
       expect(setStrategy).toHaveBeenCalledWith('latency_priority');
-    });
-  });
-
-  it('calls freezeLive then freezeExport when clicking FREEZE', async () => {
-    const { StrategyButtons } = await import('../StrategyToggle');
-    const { freezeLive, freezeExport } = await import('../../hooks/useApi');
-    render(<StrategyButtons />);
-    await waitFor(() => screen.getByTestId('freeze-export-btn'));
-    fireEvent.click(screen.getByTestId('freeze-export-btn'));
-    await waitFor(() => {
-      expect(freezeLive).toHaveBeenCalled();
-      expect(freezeExport).toHaveBeenCalled();
     });
   });
 

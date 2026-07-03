@@ -1,34 +1,45 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { TelemetryRecord } from "../types/telemetry";
+import type { HashAggregate } from "../hooks/useTelemetry";
+import { toSafeBigInt } from "../utils/hash";
+import {
+  createSceneRenderer,
+  disposeSceneRenderer,
+  disposeObject3D,
+} from "../utils/three";
 
-interface FloatingWebProps {
+interface ConstellationsProps {
   records: TelemetryRecord[];
+  /** Run-cumulative per-hash aggregate (from `useTelemetry`). Drives the node
+   * set + alloc counts so they never oscillate as records age out of the
+   * `records` window; `records` itself is used only for edge (adjacency)
+   * geometry, which is legitimately windowed. */
+  topology: Map<number, HashAggregate>;
 }
 
 const TAN = 0xe5e0d8;
 const CRIMSON = 0xff2e2e;
 const MAX_EDGES = 500;
 const HOT_TOP_K = 5;
-const LERP_FACTOR = 0.08;
-
-function disposeObject(obj: THREE.Object3D) {
-  const materials = new Set<THREE.Material>();
-  obj.traverse((o) => {
-    const m = o as THREE.Mesh;
-    if (m.geometry) m.geometry.dispose();
-    const mat = m.material;
-    if (Array.isArray(mat)) mat.forEach((x) => materials.add(x));
-    else if (mat) materials.add(mat);
-  });
-  materials.forEach((m) => m.dispose());
-}
+const LERP_FACTOR = 0.12;
+const CAMERA_LERP_FACTOR = 0.05;
+const EDGE_FADE_MS = 300;
+const EDGE_TARGET_OPACITY = 0.6;
+const NODE_FADE_OUT_MS = 200;
+// Node sphere radii double as the raycast hit-test geometry (Three.js has
+// no separate hover-tolerance param for Mesh the way it does for
+// Points/Line), so these are deliberately larger than the minimum needed
+// for legibility — small nodes were finicky to hover precisely.
+const HOT_NODE_RADIUS = 0.19;
+const COLD_NODE_RADIUS = 0.09;
+const HALO_RADIUS_FACTOR = 1.6;
 
 // Deterministic pseudo-random position derived from a hash so layout is
 // stable across renders. Spread nodes on a 3D grid roughly sized to ∛n.
 function hashPosition(hash: number, i: number, n: number): THREE.Vector3 {
-  let z = BigInt(hash) ^ ((BigInt(i) + 1n) * 0x9e3779b97f4a7c15n);
+  let z = toSafeBigInt(hash) ^ ((BigInt(i) + 1n) * 0x9e3779b97f4a7c15n);
   z = (z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n;
   z = (z ^ (z >> 27n)) * 0x94d049bb133111ebn;
   z = z ^ (z >> 31n);
@@ -54,6 +65,11 @@ interface NodeEntry {
   mesh: THREE.Mesh;
   targetPos: THREE.Vector3;
   spawnTime: number;
+  stackHash: number;
+  allocCount: number;
+  backend: string;
+  removing: boolean;
+  removeStartTime: number;
 }
 
 interface EdgeEntry {
@@ -62,9 +78,20 @@ interface EdgeEntry {
   hashB: number;
 }
 
-export default function FloatingWeb({ records }: FloatingWebProps) {
+export default function Constellations({ records, topology }: ConstellationsProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const [tooltip, setTooltip] = useState<{
+    hash: number;
+    allocCount: number;
+    backend: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const pointerRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const hoveredHashRef = useRef<number | null>(null);
   const recordsRef = useRef<TelemetryRecord[]>(records);
+  const targetCameraPosRef = useRef<THREE.Vector3>(new THREE.Vector3(0, 0, 10));
+  const targetControlsTargetRef = useRef<THREE.Vector3>(new THREE.Vector3(0, 0, 0));
   const stateRef = useRef<{
     scene: THREE.Scene;
     camera: THREE.PerspectiveCamera;
@@ -78,6 +105,7 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
     edges: EdgeEntry[];
     edgeHashKey: string;
     prevNodeCount: number;
+    edgeSpawnTimes: Map<string, number>;
     sharedMats: {
       tan: THREE.Material;
       crimson: THREE.Material;
@@ -102,14 +130,14 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
     const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 1000);
     camera.position.set(0, 0, 10);
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.setSize(container.clientWidth, container.clientHeight);
-    container.appendChild(renderer.domElement);
+    const renderer = createSceneRenderer(THREE, container);
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
+
+    const raycaster = new THREE.Raycaster();
+    const pointerNDC = new THREE.Vector2();
 
     const nodeGroup = new THREE.Group();
     const edgeGroup = new THREE.Group();
@@ -141,27 +169,100 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
     });
     resizeObs.observe(container);
 
+    const handlePointerMove = (event: PointerEvent) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointerRef.current.x = event.clientX - rect.left;
+      pointerRef.current.y = event.clientY - rect.top;
+      pointerNDC.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointerNDC.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    };
+    renderer.domElement.addEventListener('pointermove', handlePointerMove);
+
+    const handlePointerLeave = () => {
+      hoveredHashRef.current = null;
+      setTooltip(null);
+    };
+    renderer.domElement.addEventListener('pointerleave', handlePointerLeave);
+
     let raf = 0;
     const tick = () => {
       controls.update();
 
-      // Lerp all node positions toward their targets.
+      // Raycast for hover detection
       const state = stateRef.current;
       if (state) {
+        raycaster.setFromCamera(pointerNDC, camera);
+        const intersects = raycaster.intersectObjects(
+          Array.from(state.nodes.values()).filter(n => !n.removing).map(n => n.mesh),
+          false
+        );
+        if (intersects.length > 0) {
+          const intersectedMesh = intersects[0].object as THREE.Mesh;
+          let hoveredEntry: NodeEntry | null = null;
+          for (const entry of state.nodes.values()) {
+            if (entry.mesh === intersectedMesh) {
+              hoveredEntry = entry;
+              break;
+            }
+          }
+          if (hoveredEntry) {
+            if (hoveredHashRef.current !== hoveredEntry.stackHash) {
+              hoveredHashRef.current = hoveredEntry.stackHash;
+              setTooltip({
+                hash: hoveredEntry.stackHash,
+                allocCount: hoveredEntry.allocCount,
+                backend: hoveredEntry.backend,
+                x: pointerRef.current.x,
+                y: pointerRef.current.y,
+              });
+            } else {
+              setTooltip(prev => prev ? { ...prev, x: pointerRef.current.x, y: pointerRef.current.y } : null);
+            }
+          }
+        } else if (hoveredHashRef.current !== null) {
+          hoveredHashRef.current = null;
+          setTooltip(null);
+        }
+      }
+
+      // Lerp all node positions toward their targets.
+      if (state) {
         const now = performance.now();
+
+        // Smooth camera transitions.
+        camera.position.lerp(targetCameraPosRef.current, CAMERA_LERP_FACTOR);
+        controls.target.lerp(targetControlsTargetRef.current, CAMERA_LERP_FACTOR);
+
         for (const entry of state.nodes.values()) {
           entry.mesh.position.lerp(entry.targetPos, LERP_FACTOR);
-          // Fade in: scale up from 0 in the first 300ms after spawn.
-          const age = now - entry.spawnTime;
-          if (age < 300) {
-            const s = Math.min(1, age / 300);
-            entry.mesh.scale.setScalar(s);
-          } else if (entry.mesh.scale.x !== 1) {
-            entry.mesh.scale.setScalar(1);
+
+          if (entry.removing) {
+            // Fade out: scale down toward 0.
+            const age = (now - entry.removeStartTime) / NODE_FADE_OUT_MS;
+            const scale = Math.max(0, 1 - age);
+            entry.mesh.scale.setScalar(scale);
+          } else {
+            // Fade in: scale up from 0 in the first 300ms after spawn.
+            const age = now - entry.spawnTime;
+            if (age < 300) {
+              const s = Math.min(1, age / 300);
+              entry.mesh.scale.setScalar(s);
+            } else if (entry.mesh.scale.x !== 1) {
+              entry.mesh.scale.setScalar(1);
+            }
           }
         }
 
-        // Update edge line positions to follow lerping nodes.
+        // Remove fully-faded-out nodes.
+        for (const [hash, entry] of state.nodes) {
+          if (entry.removing && now - entry.removeStartTime >= NODE_FADE_OUT_MS) {
+            nodeGroup.remove(entry.mesh);
+            disposeObject3D(entry.mesh);
+            state.nodes.delete(hash);
+          }
+        }
+
+        // Update edge line positions to follow lerping nodes + fade in.
         for (const edge of state.edges) {
           const ma = state.nodes.get(edge.hashA);
           const mb = state.nodes.get(edge.hashB);
@@ -180,6 +281,16 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
               mb.mesh.position.z,
             );
             positions.needsUpdate = true;
+          }
+
+          // Edge fade-in.
+          const edgeKey = `${edge.hashA}_${edge.hashB}`;
+          const spawnTime = state.edgeSpawnTimes.get(edgeKey);
+          if (spawnTime !== undefined) {
+            const mat = edge.line.material as THREE.LineBasicMaterial;
+            const age = (now - spawnTime) / EDGE_FADE_MS;
+            const t = Math.min(age, 1);
+            mat.opacity = t * EDGE_TARGET_OPACITY;
           }
         }
       }
@@ -202,6 +313,7 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
       edges: [],
       edgeHashKey: "",
       prevNodeCount: 0,
+      edgeSpawnTimes: new Map(),
       sharedMats,
     };
 
@@ -209,50 +321,56 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
       cancelAnimationFrame(raf);
       resizeObs.disconnect();
       controls.dispose();
-      disposeObject(nodeGroup);
-      disposeObject(edgeGroup);
+      disposeObject3D(nodeGroup);
+      disposeObject3D(edgeGroup);
       sharedMats.tan.dispose();
       sharedMats.crimson.dispose();
       sharedMats.wire.dispose();
       sharedMats.edge.dispose();
-      renderer.dispose();
-      if (renderer.domElement.parentNode === container) {
-        container.removeChild(renderer.domElement);
-      }
+      renderer.domElement.removeEventListener('pointermove', handlePointerMove);
+      renderer.domElement.removeEventListener('pointerleave', handlePointerLeave);
+      disposeSceneRenderer(renderer, container);
       stateRef.current = null;
     };
   }, []);
 
-  // Update nodes + edges when records change (no full rebuild — morph instead).
+  // Update nodes + edges when the topology (or record window) changes. Node
+  // identity/counts come from the monotonic `topology` aggregate; edges come
+  // from the recent `records` window. No full rebuild — morph instead.
   useEffect(() => {
     const state = stateRef.current;
     if (!state) return;
     const { nodeGroup, edgeGroup, nodes, sharedMats, camera, controls } = state;
 
-    if (records.length === 0) {
-      // Clear all nodes and edges.
+    if (topology.size === 0) {
+      // Mark all nodes for removal (fade-out handled in RAF loop).
       for (const entry of nodes.values()) {
-        nodeGroup.remove(entry.mesh);
-        entry.mesh.geometry.dispose();
+        if (!entry.removing) {
+          entry.removing = true;
+          entry.removeStartTime = performance.now();
+        }
       }
-      nodes.clear();
       for (const edge of state.edges) {
         edgeGroup.remove(edge.line);
         edge.line.geometry.dispose();
+        (edge.line.material as THREE.Material).dispose();
       }
       state.edges = [];
       state.edgeHashKey = "";
-      state.prevNodeCount = 0;
+      state.edgeSpawnTimes.clear();
       return;
     }
 
-    // Aggregate alloc counts per stack_hash.
+    // Node set + alloc counts come from the run-cumulative topology aggregate,
+    // NOT the trimmed `records` window — so a call site discovered early keeps
+    // its node (and its total alloc count) instead of blinking in and out as
+    // its records age out of the ring.
     const counts = new Map<number, number>();
-    for (const r of records) {
-      if (r.op !== "alloc") continue;
-      counts.set(r.stack_hash, (counts.get(r.stack_hash) ?? 0) + 1);
+    const uniqueHashes: number[] = [];
+    for (const [hash, agg] of topology) {
+      counts.set(hash, agg.allocCount);
+      uniqueHashes.push(hash);
     }
-    const uniqueHashes = Array.from(counts.keys());
     if (uniqueHashes.length === 0) return;
 
     // Top-K hot nodes by alloc count.
@@ -272,8 +390,16 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
 
       const existing = nodes.get(hash);
       if (existing) {
+        // If this node was being removed, cancel the removal.
+        if (existing.removing) {
+          existing.removing = false;
+          existing.removeStartTime = 0;
+        }
         // Update target position — the RAF loop will lerp toward it.
         existing.targetPos.copy(targetPos);
+        existing.allocCount = counts.get(hash) ?? 0;
+        // Refresh backend if the aggregate has since learned one.
+        existing.backend = topology.get(hash)?.lastBackend ?? existing.backend;
         // Update hot status (may have changed).
         const isHot = hotSet.has(hash);
         const wasHot = existing.mesh.material === sharedMats.crimson;
@@ -282,7 +408,7 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
           if (isHot) {
             existing.mesh.material = sharedMats.crimson;
             const wireGeom = new THREE.WireframeGeometry(
-              new THREE.SphereGeometry(0.15 * 1.6, 12, 12),
+              new THREE.SphereGeometry(HOT_NODE_RADIUS * HALO_RADIUS_FACTOR, 12, 12),
             );
             const wire = new THREE.LineSegments(wireGeom, sharedMats.wire);
             wire.name = "halo";
@@ -299,7 +425,7 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
       } else {
         // New node — create at center, will lerp to target.
         const isHot = hotSet.has(hash);
-        const radius = isHot ? 0.15 : 0.05;
+        const radius = isHot ? HOT_NODE_RADIUS : COLD_NODE_RADIUS;
         const segs = isHot ? 24 : 12;
         const geom = new THREE.SphereGeometry(radius, segs, segs);
         const mesh = new THREE.Mesh(
@@ -313,7 +439,7 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
 
         if (isHot) {
           const wireGeom = new THREE.WireframeGeometry(
-            new THREE.SphereGeometry(radius * 1.6, 12, 12),
+            new THREE.SphereGeometry(radius * HALO_RADIUS_FACTOR, 12, 12),
           );
           const wire = new THREE.LineSegments(wireGeom, sharedMats.wire);
           wire.name = "halo";
@@ -324,16 +450,20 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
           mesh,
           targetPos: targetPos.clone(),
           spawnTime: now,
+          stackHash: hash,
+          allocCount: counts.get(hash) ?? 0,
+          removing: false,
+          removeStartTime: 0,
+          backend: topology.get(hash)?.lastBackend ?? 'unknown',
         });
       }
     }
 
-    // Remove nodes that are no longer in the active set.
+    // Mark nodes for removal (fade-out handled in RAF loop).
     for (const [hash, entry] of nodes) {
-      if (!activeHashes.has(hash)) {
-        nodeGroup.remove(entry.mesh);
-        disposeObject(entry.mesh);
-        nodes.delete(hash);
+      if (!activeHashes.has(hash) && !entry.removing) {
+        entry.removing = true;
+        entry.removeStartTime = performance.now();
       }
     }
 
@@ -343,15 +473,19 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
       .slice()
       .sort((a, b) => a - b)
       .join(",");
-    if (edgeKey !== state.edgeHashKey) {
+    const hashSetChanged = edgeKey !== state.edgeHashKey;
+
+    if (hashSetChanged) {
       state.edgeHashKey = edgeKey;
 
       // Clear old edges.
       for (const edge of state.edges) {
         edgeGroup.remove(edge.line);
         edge.line.geometry.dispose();
+        (edge.line.material as THREE.Material).dispose();
       }
       state.edges = [];
+      state.edgeSpawnTimes.clear();
 
       // Compute edge pairs.
       const sorted = [...records].sort((a, b) => a.timestamp - b.timestamp);
@@ -385,19 +519,23 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
           ma.mesh.position.clone(),
           mb.mesh.position.clone(),
         ]);
-        const line = new THREE.Line(geom, sharedMats.edge);
+        const edgeMat = new THREE.LineBasicMaterial({
+          color: TAN,
+          transparent: true,
+          opacity: 0,
+        });
+        const line = new THREE.Line(geom, edgeMat);
         edgeGroup.add(line);
         state.edges.push({ line, hashA: ha, hashB: hb });
+        state.edgeSpawnTimes.set(`${ha}_${hb}`, now);
       }
     }
 
-    // Auto-fit camera when node count changes.
-    const nodeCount = uniqueHashes.length;
-    if (nodeCount !== state.prevNodeCount) {
-      state.prevNodeCount = nodeCount;
-
+    // Auto-fit camera when the set of active hashes changes.
+    if (hashSetChanged) {
       const box = new THREE.Box3();
       for (const entry of nodes.values()) {
+        if (entry.removing) continue;
         box.expandByPoint(entry.targetPos);
       }
       const center = box.getCenter(new THREE.Vector3());
@@ -411,18 +549,27 @@ export default function FloatingWeb({ records }: FloatingWebProps) {
       controls.minDistance = fitDistance;
       controls.maxDistance = fitDistance * 4;
 
-      const dir = camera.position.clone().sub(controls.target).normalize();
-      camera.position.copy(center.clone().add(dir.multiplyScalar(fitDistance)));
-      controls.target.copy(center);
-      controls.update();
+      const dir = targetCameraPosRef.current.clone().sub(targetControlsTargetRef.current).normalize();
+      targetCameraPosRef.current.copy(center.clone().add(dir.multiplyScalar(fitDistance)));
+      targetControlsTargetRef.current.copy(center);
     }
-  }, [records]);
+  }, [topology, records]);
 
   return (
     <div ref={containerRef} className="relative w-full h-full bg-canvas">
       <div className="absolute top-2 left-2 text-[10px] text-ink-muted tracking-widest">
-        FLOATING WEB // TRAINING
+        CONSTELLATIONS // TRAINING
       </div>
+      {tooltip && (
+        <div
+          className="absolute z-20 pointer-events-none bg-canvas border border-ink-muted px-2 py-1 text-[10px] text-ink font-mono whitespace-nowrap"
+          style={{ left: tooltip.x + 12, top: tooltip.y + 12 }}
+        >
+          <div className="text-ink-muted">HASH: 0x{tooltip.hash.toString(16).toUpperCase().padStart(16, '0')}</div>
+          <div className="text-ink">ALLOCS: {tooltip.allocCount}</div>
+          <div className="text-heat">BACKEND: {tooltip.backend.toUpperCase()}</div>
+        </div>
+      )}
     </div>
   );
 }

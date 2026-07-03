@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { SimulateDropdown, SimulationPanel, Toast } from "../SimulationPanel";
 import type { SimulationEvent } from "../../types/ws";
@@ -6,6 +6,7 @@ import type { SimulationEvent } from "../../types/ws";
 // Mock stopSimulation so SimulationPanel doesn't make real network calls
 vi.mock("../../hooks/useApi", () => ({
   stopSimulation: vi.fn().mockResolvedValue(undefined),
+  killAllSimulations: vi.fn().mockResolvedValue(2),
 }));
 
 describe("SimulateDropdown", () => {
@@ -33,7 +34,6 @@ describe("SimulateDropdown", () => {
     fireEvent.click(screen.getByText("SIMULATE v"));
     await waitFor(() => {
       expect(screen.getByText("LOHALLOC EXAMPLE")).toBeDefined();
-      expect(screen.getByText("HTTP SERVER (PORT 4000")).toBeDefined();
       expect(screen.getByText("LONG RUNNING")).toBeDefined();
     });
   });
@@ -74,7 +74,7 @@ describe("SimulateDropdown", () => {
     });
   });
 
-  it("calls onSpawn with http-server when clicked", async () => {
+  it("calls onSpawn with stress-test when clicked", async () => {
     const onSpawn = vi
       .fn<(kind: string) => Promise<void>>()
       .mockResolvedValue(undefined);
@@ -86,10 +86,10 @@ describe("SimulateDropdown", () => {
       />,
     );
     fireEvent.click(screen.getByText("SIMULATE v"));
-    await waitFor(() => screen.getByText("HTTP SERVER (PORT 4000"));
-    fireEvent.click(screen.getByText("HTTP SERVER (PORT 4000"));
+    await waitFor(() => screen.getByText("STRESS TEST"));
+    fireEvent.click(screen.getByText("STRESS TEST"));
     await waitFor(() => {
-      expect(onSpawn).toHaveBeenCalledWith("http-server");
+      expect(onSpawn).toHaveBeenCalledWith("stress-test");
     });
   });
 
@@ -109,6 +109,40 @@ describe("SimulateDropdown", () => {
     fireEvent.click(screen.getByText("LONG RUNNING"));
     await waitFor(() => {
       expect(onSpawn).toHaveBeenCalledWith("long-running");
+    });
+  });
+
+  it("shows STRESS TEST option in dropdown", async () => {
+    const onSpawn = vi.fn();
+    render(
+      <SimulateDropdown
+        onSpawn={onSpawn}
+        durationSecs={30}
+        onDurationChange={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByText("SIMULATE v"));
+    await waitFor(() => {
+      expect(screen.getByText("STRESS TEST")).toBeDefined();
+    });
+  });
+
+  it("calls onSpawn with stress-test when clicked", async () => {
+    const onSpawn = vi
+      .fn<(kind: string) => Promise<void>>()
+      .mockResolvedValue(undefined);
+    render(
+      <SimulateDropdown
+        onSpawn={onSpawn}
+        durationSecs={30}
+        onDurationChange={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByText("SIMULATE v"));
+    await waitFor(() => screen.getByText("STRESS TEST"));
+    fireEvent.click(screen.getByText("STRESS TEST"));
+    await waitFor(() => {
+      expect(onSpawn).toHaveBeenCalledWith("stress-test");
     });
   });
 
@@ -224,6 +258,49 @@ describe("SimulationPanel", () => {
       <SimulationPanel events={[exitedEvent]} active={[]} onClose={() => {}} />,
     );
     expect(screen.queryByText("KILL")).toBeNull();
+  });
+
+  it("shows KILL ALL button when simulations are active", () => {
+    const runningEvent: SimulationEvent = {
+      ...mockEvent,
+      status: "running",
+      duration_ms: 1000,
+    };
+    render(
+      <SimulationPanel
+        events={[]}
+        active={[runningEvent]}
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("kill-all-sims")).toBeDefined();
+    expect(screen.getByText("KILL ALL")).toBeDefined();
+  });
+
+  it("does not show KILL ALL button when no simulations active", () => {
+    render(<SimulationPanel events={[]} active={[]} onClose={() => {}} />);
+    expect(screen.queryByTestId("kill-all-sims")).toBeNull();
+  });
+
+  it("calls killAllSimulations when KILL ALL button is clicked", async () => {
+    const { killAllSimulations } = await import("../../hooks/useApi");
+    vi.clearAllMocks();
+    const runningEvent: SimulationEvent = {
+      ...mockEvent,
+      status: "running",
+      duration_ms: 2000,
+    };
+    render(
+      <SimulationPanel
+        events={[]}
+        active={[runningEvent]}
+        onClose={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("kill-all-sims"));
+    await waitFor(() => {
+      expect(killAllSimulations).toHaveBeenCalled();
+    });
   });
 
   it("calls stopSimulation when KILL button is clicked", async () => {

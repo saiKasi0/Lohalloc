@@ -4,13 +4,17 @@ import type { TelemetryRecord } from '../../types/telemetry';
 
 // Mock the hooks
 vi.mock('../../hooks/useTelemetry', () => ({
-  useTelemetry: () => ({
+  useTelemetry: () => vi.fn(() => ({
     records: [] as TelemetryRecord[],
+    totalReceived: 0,
+    cumulative: { allocCount: 0, freeCount: 0, bytesAlloc: 0 },
     isConnected: false,
     paused: false,
     setPaused: () => {},
     subscribeSimEvents: () => () => {},
-  }),
+    resetState: () => {},
+    serverError: null,
+  }))(),
 }));
 
 vi.mock('../../hooks/useLiveStream', () => ({
@@ -48,20 +52,12 @@ vi.mock('../../hooks/useApi', () => ({
 }));
 
 // Mock heavy 3D components
-vi.mock('../FloatingWeb', () => ({
-  default: () => <div data-testid="floating-web-mock">FLOATING WEB MOCK</div>,
+vi.mock('../Constellations', () => ({
+  default: () => <div data-testid="constellations-mock">CONSTELLATIONS MOCK</div>,
 }));
 
 vi.mock('../CollapsedTopology', () => ({
   default: () => <div data-testid="collapsed-topology-mock">COLLAPSED MOCK</div>,
-}));
-
-vi.mock('../HeapMap', () => ({
-  HeapMap: () => <div data-testid="heapmap-mock">HEAPMAP MOCK</div>,
-}));
-
-vi.mock('../PerfTraceView', () => ({
-  PerfTraceView: () => <div data-testid="perf-mock">PERF MOCK</div>,
 }));
 
 vi.mock('../StrategyToggle', () => ({
@@ -71,10 +67,6 @@ vi.mock('../StrategyToggle', () => ({
 
 vi.mock('../TelemetrySidebar', () => ({
   default: () => <div data-testid="telemetry-mock">TELEMETRY MOCK</div>,
-}));
-
-vi.mock('../ModeToggle', () => ({
-  default: () => <div data-testid="mode-toggle-mock">MODE TOGGLE MOCK</div>,
 }));
 
 vi.mock('../TraceUploadModal', () => ({
@@ -140,18 +132,6 @@ describe('App', () => {
     const App = (await import('../../App')).default;
     render(<App />);
     expect(screen.getByTestId('telemetry-pane')).toBeDefined();
-  });
-
-  it('renders the heapmap pane', async () => {
-    const App = (await import('../../App')).default;
-    render(<App />);
-    expect(screen.getByTestId('heapmap-pane')).toBeDefined();
-  });
-
-  it('renders the perf pane', async () => {
-    const App = (await import('../../App')).default;
-    render(<App />);
-    expect(screen.getByTestId('perf-pane')).toBeDefined();
   });
 
   it('renders the strategy buttons in topology header', async () => {

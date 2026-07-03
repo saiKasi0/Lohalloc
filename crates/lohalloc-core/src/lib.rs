@@ -225,11 +225,19 @@ fn deserialize_ptr<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Err
 /// `replay_trace_json`.
 ///
 /// ```json
-/// {"op": "alloc", "size": 64, "stack_hash": 1234567890}
+/// {"timestamp": 0, "op": "alloc", "size": 64, "stack_hash": 1234567890}
 /// ```
+///
+/// `timestamp` (nanoseconds) is a **required** field. The replay engine
+/// uses it verbatim as the emitted `TelemetryRecord.timestamp`, so the GUI
+/// renders a real time axis instead of op indices. A saved live-stream
+/// trace (full `TelemetryRecord[]` from `/api/export-trace`) is a superset
+/// of this shape, so re-uploading it preserves the original wall-clock
+/// timeline. A trace missing `timestamp` is a hard parse error.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TraceOp {
+    pub timestamp: u64,
     pub op: AllocOp,
     pub size: usize,
     pub stack_hash: u64,

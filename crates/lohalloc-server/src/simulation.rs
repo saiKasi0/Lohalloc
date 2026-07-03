@@ -1,9 +1,9 @@
 //! Server-side subprocess runner for live Lohalloc simulations.
 //!
-//! Spawns real Lohalloc workloads (the `lohalloc-example` smoke binary, an
-//! additional `lohalloc-server` instance, or a long-running curl loop) with
-//! the `liblohalloc_obs` shim preloaded so their `malloc`/`free` traffic is
-//! streamed back to this server via `POST /api/telemetry`.
+//! Spawns real Lohalloc workloads (variants of the `lohalloc-example` smoke
+//! binary) with the `liblohalloc_obs` shim preloaded so their
+//! `malloc`/`free` traffic is streamed back to this server via
+//! `POST /api/telemetry`.
 //!
 //! # Binary discovery
 //!
@@ -28,27 +28,51 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The three built-in simulation kinds the GUI exposes.
+/// The built-in simulation kinds the GUI exposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SimulationKind {
     /// The `lohalloc-example` smoke binary (`cargo run -p lohalloc-example`).
     LohallocExample,
-    /// A second `lohalloc-server` instance under the shim, demonstrating
-    /// an HTTP workload.
-    HttpServer,
     /// A long-running curl loop that hits `/api/mode` repeatedly to keep
     /// the allocator hot.
     LongRunning,
+    /// Deep-call-stack, high-churn stress test (`lohalloc-example --stress`).
+    /// Generates dense topology with many unique stack hashes.
+    StressTest,
+    /// High-frequency churn: rapid alloc/dealloc cycles across all size
+    /// classes (`lohalloc-example --churn`).
+    HighChurn,
+    /// Checkerboard fragmentation: alternating alloc/free pattern that
+    /// maximises external fragmentation (`lohalloc-example --checkerboard`).
+    Checkerboard,
+    /// Mixed workloads: interleaved large contiguous blocks with thousands
+    /// of tiny allocations (`lohalloc-example --mixed-fragmentation`).
+    MixedWorkload,
 }
 
 impl SimulationKind {
+    /// Every kind, in the order accepted by [`SimulationKind::parse`]. Used
+    /// to build the accepted-kinds list in error messages and to drive
+    /// exhaustive tests, so both stay in sync with the enum automatically.
+    pub const ALL: [SimulationKind; 6] = [
+        Self::LohallocExample,
+        Self::LongRunning,
+        Self::StressTest,
+        Self::HighChurn,
+        Self::Checkerboard,
+        Self::MixedWorkload,
+    ];
+
     /// Parse a string into a [`SimulationKind`].
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "lohalloc-example" => Some(Self::LohallocExample),
-            "http-server" => Some(Self::HttpServer),
             "long-running" => Some(Self::LongRunning),
+            "stress-test" => Some(Self::StressTest),
+            "high-churn" => Some(Self::HighChurn),
+            "checkerboard" => Some(Self::Checkerboard),
+            "mixed-workload" => Some(Self::MixedWorkload),
             _ => None,
         }
     }
@@ -57,22 +81,31 @@ impl SimulationKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LohallocExample => "lohalloc-example",
-            Self::HttpServer => "http-server",
             Self::LongRunning => "long-running",
+            Self::StressTest => "stress-test",
+            Self::HighChurn => "high-churn",
+            Self::Checkerboard => "checkerboard",
+            Self::MixedWorkload => "mixed-workload",
         }
+    }
+
+    /// All accepted kind names, pipe-joined, for "unknown kind" error
+    /// messages. Derived from [`SimulationKind::ALL`] so it can't drift
+    /// from `parse`/`as_str`.
+    pub fn accepted_names() -> String {
+        Self::ALL
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join("|")
     }
 }
 
 /// Optional per-kind arguments.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SimulationArgs {
-    /// Port for the `http-server` kind (defaults to 4000). Ignored by other
-    /// kinds.
-    #[serde(default)]
-    pub port: Option<u16>,
     /// Duration in seconds. Used by `long-running` (defaults to 60) and
     /// `lohalloc-example` (loops the workload until duration elapses).
-    /// Ignored by `http-server`.
     #[serde(default)]
     pub duration_secs: Option<u64>,
 }
@@ -145,20 +178,56 @@ impl std::fmt::Display for SimulationError {
     }
 }
 
+/// The "binary + CLI flag + optional --duration-secs" shape shared by every
+/// `SimulationKind`.
+struct FlagWorkload {
+    flag: &'static str,
+    /// Default seconds for `--duration-secs` when the caller doesn't supply
+    /// one. `None` means the flag is omitted entirely when unspecified —
+    /// `lohalloc-example`'s original behavior of running to natural
+    /// completion rather than a timed duration.
+    default_duration_secs: Option<u64>,
+}
+
 impl SimulationKind {
+    /// `crate_name` and `binary_name` are always identical (every kind is a
+    /// variant of the `lohalloc-example` smoke binary) — one source of
+    /// truth instead of two matches that must be kept in sync by hand.
     fn crate_name(self) -> &'static str {
-        match self {
-            Self::LohallocExample => "lohalloc-example",
-            Self::HttpServer => "lohalloc-server",
-            Self::LongRunning => "lohalloc-example", // reuses the example binary
-        }
+        self.binary_name()
     }
 
     fn binary_name(self) -> &'static str {
+        "lohalloc-example"
+    }
+
+    /// The CLI-flag workload descriptor for this kind.
+    fn flag_workload(self) -> FlagWorkload {
         match self {
-            Self::LohallocExample => "lohalloc-example",
-            Self::HttpServer => "lohalloc-server",
-            Self::LongRunning => "lohalloc-example", // reuses the example binary
+            Self::LohallocExample => FlagWorkload {
+                flag: "--diverse",
+                default_duration_secs: None,
+            },
+            Self::LongRunning => FlagWorkload {
+                flag: "--diverse",
+                default_duration_secs: Some(60),
+            },
+            Self::StressTest => FlagWorkload {
+                flag: "--stress",
+                default_duration_secs: Some(60),
+            },
+            Self::HighChurn => FlagWorkload {
+                flag: "--churn",
+                default_duration_secs: Some(60),
+            },
+            Self::Checkerboard => FlagWorkload {
+                flag: "--checkerboard",
+                default_duration_secs: Some(60),
+            },
+            Self::MixedWorkload => FlagWorkload {
+                flag: "--mixed-fragmentation",
+                default_duration_secs: Some(60),
+            },
         }
     }
 
@@ -279,33 +348,15 @@ pub fn build_command(
     let binary =
         find_simulation_binary(kind).ok_or_else(|| SimulationError::missing_binary(kind))?;
 
-    let mut cmd = match kind {
-        SimulationKind::LohallocExample => {
-            let mut c = Command::new(&binary);
-            c.arg("--diverse");
-            if let Some(d) = args.duration_secs {
-                c.arg("--duration-secs").arg(d.to_string());
-            }
-            c
-        }
-        SimulationKind::HttpServer => {
-            let mut c = Command::new(&binary);
-            let port = args.port.unwrap_or(4000);
-            // lohalloc-server uses LOHALLOC_ADDR env var, not CLI args.
-            c.env("LOHALLOC_ADDR", format!("127.0.0.1:{}", port));
-            c
-        }
-        SimulationKind::LongRunning => {
-            // Run lohalloc-example with --diverse and --duration-secs to
-            // generate real allocation traffic under the shim for the
-            // requested duration.
-            let mut c = Command::new(&binary);
-            c.arg("--diverse");
-            let duration = args.duration_secs.unwrap_or(60);
-            c.arg("--duration-secs").arg(duration.to_string());
-            c
-        }
-    };
+    // Every kind shares the same shape: binary + a flag selecting the
+    // workload variant + an optional/defaulted --duration-secs.
+    let workload = kind.flag_workload();
+    let mut cmd = Command::new(&binary);
+    cmd.arg(workload.flag);
+    // e.g. lohalloc-example with no explicit duration: run un-timed.
+    if let Some(d) = args.duration_secs.or(workload.default_duration_secs) {
+        cmd.arg("--duration-secs").arg(d.to_string());
+    }
 
     // Inject the shim into the subprocess env.
     inject_shim(&mut cmd, shim);
@@ -316,6 +367,14 @@ pub fn build_command(
     // Pipe stdout/stderr so we can tail them if the process fails.
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+
+    // Put the child in its own process group so we can kill the entire
+    // group (including any grandchildren) on timeout or operator kill.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     Ok(cmd)
 }
@@ -336,6 +395,7 @@ fn inject_shim(cmd: &mut Command, shim: &std::path::Path) {
 }
 
 /// Spawn the configured simulation. Returns a `Child` handle on success.
+#[tracing::instrument(skip(shim, args), fields(kind = kind.as_str()))]
 pub fn spawn_simulation(
     kind: SimulationKind,
     shim: &std::path::Path,
@@ -344,9 +404,14 @@ pub fn spawn_simulation(
 ) -> Result<Child, SimulationError> {
     let mut cmd = build_command(kind, shim, server_port, args)?;
     let start = std::time::Instant::now();
+    tracing::info!(binary = kind.binary_name(), "spawning simulation");
     match cmd.spawn() {
-        Ok(child) => Ok(child),
+        Ok(child) => {
+            tracing::info!(pid = child.id(), "simulation spawned");
+            Ok(child)
+        }
         Err(e) => {
+            tracing::warn!(error = %e, "simulation spawn failed");
             // Synthesize a fake pid so the failure event is still unique.
             let _fake = NEXT_FAKE_PID.fetch_add(1, Ordering::Relaxed);
             let _ = start; // duration captured by the caller
@@ -387,14 +452,66 @@ mod tests {
 
     #[test]
     fn kind_parse_roundtrip() {
-        for k in [
-            SimulationKind::LohallocExample,
-            SimulationKind::HttpServer,
-            SimulationKind::LongRunning,
-        ] {
+        for k in SimulationKind::ALL {
             assert_eq!(SimulationKind::parse(k.as_str()), Some(k));
         }
         assert_eq!(SimulationKind::parse("nope"), None);
+    }
+
+    #[test]
+    fn accepted_names_lists_every_kind() {
+        let joined = SimulationKind::accepted_names();
+        for k in SimulationKind::ALL {
+            assert!(
+                joined.split('|').any(|n| n == k.as_str()),
+                "accepted_names() missing {}",
+                k.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn crate_name_matches_binary_name() {
+        // The two were previously two separately-maintained matches that
+        // could drift; assert they stay identical for every kind.
+        for k in SimulationKind::ALL {
+            assert_eq!(k.crate_name(), k.binary_name());
+        }
+    }
+
+    #[test]
+    fn flag_workload_present_for_every_kind() {
+        for k in SimulationKind::ALL {
+            let workload = k.flag_workload();
+            assert!(workload.flag.starts_with("--"));
+        }
+    }
+
+    #[test]
+    fn build_command_preserves_per_kind_flags_and_durations() {
+        // Table-driven regression check that the flag_workload-based
+        // build_command still emits the exact same args as the original
+        // hand-written match arms did per kind.
+        let cases: &[(SimulationKind, &str, Option<&str>)] = &[
+            (SimulationKind::LohallocExample, "--diverse", None),
+            (SimulationKind::LongRunning, "--diverse", Some("60")),
+            (SimulationKind::StressTest, "--stress", Some("60")),
+            (SimulationKind::HighChurn, "--churn", Some("60")),
+            (SimulationKind::Checkerboard, "--checkerboard", Some("60")),
+            (
+                SimulationKind::MixedWorkload,
+                "--mixed-fragmentation",
+                Some("60"),
+            ),
+        ];
+        for (kind, expected_flag, expected_default_duration) in cases {
+            let workload = kind.flag_workload();
+            assert_eq!(workload.flag, *expected_flag);
+            assert_eq!(
+                workload.default_duration_secs.map(|d| d.to_string()),
+                expected_default_duration.map(|s| s.to_string())
+            );
+        }
     }
 
     #[test]
@@ -452,7 +569,6 @@ mod tests {
     #[test]
     fn args_default_is_empty() {
         let a = SimulationArgs::default();
-        assert!(a.port.is_none());
         assert!(a.duration_secs.is_none());
     }
 }

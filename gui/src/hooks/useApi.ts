@@ -2,6 +2,7 @@ import type { Strategy, TelemetryRecord, TraceOp } from '../types/telemetry';
 import {
   FREEZE_EXPORT_URL,
   FREEZE_LIVE_URL,
+  KILL_ALL_SIMULATIONS_URL,
   MODE_URL,
   RESET_TRAINING_URL,
   ROUTING_TABLE_URL,
@@ -75,7 +76,7 @@ export async function uploadTrace(trace: TraceOp[]): Promise<ArrayBuffer> {
 /**
  * Read a trace file (JSON or CSV), parse it, and upload via uploadTrace.
  * - JSON: full file parsed as `TraceOp[]`
- * - CSV:  header row expected, columns `op,size,stack_hash`
+ * - CSV:  header row expected, columns `timestamp,op,size,stack_hash`
  */
 export async function uploadTraceFile(file: File): Promise<ArrayBuffer> {
   const text = await file.text();
@@ -85,11 +86,15 @@ export async function uploadTraceFile(file: File): Promise<ArrayBuffer> {
   if (file.name.endsWith('.json') || text.trim().startsWith('[')) {
     trace = JSON.parse(text) as TraceOp[];
   } else {
-    // CSV with header: op,size,stack_hash
+    // CSV with header: timestamp,op,size,stack_hash. The timestamp (ns) is
+    // required — the server enforces it on replay.
     const lines = text.trim().split('\n');
     trace = lines.slice(1).map((line) => {
-      const [op, size, stackHash] = line.split(',').map((s) => s.trim());
+      const [timestamp, op, size, stackHash] = line
+        .split(',')
+        .map((s) => s.trim());
       return {
+        timestamp: Number(timestamp),
         op: op as TraceOp['op'],
         size: Number(size),
         stack_hash: Number(stackHash),
@@ -238,6 +243,7 @@ export async function runSimulation(
   kind: string,
   args: Record<string, unknown> = {},
 ): Promise<SimulationSpawnResult> {
+  console.log('[api] runSimulation kind=', kind, 'args=', args);
   const res = await fetch(RUN_SIMULATION_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -251,11 +257,14 @@ export async function runSimulation(
     } catch {
       detail = await res.text().catch(() => '');
     }
+    console.error('[api] runSimulation failed:', res.status, detail);
     throw new Error(
       `simulation spawn failed (${res.status}): ${detail || res.statusText}`,
     );
   }
-  return (await res.json()) as SimulationSpawnResult;
+  const result = (await res.json()) as SimulationSpawnResult;
+  console.log('[api] runSimulation success:', result);
+  return result;
 }
 
 /**
@@ -268,4 +277,17 @@ export async function stopSimulation(pid: number): Promise<void> {
   if (!res.ok && res.status !== 404) {
     throw new Error(`stopSimulation failed: ${res.status} ${res.statusText}`);
   }
+}
+
+/**
+ * Kill ALL running simulations (emergency stop). Sends SIGKILL to every
+ * active child process. Returns the number of simulations killed.
+ */
+export async function killAllSimulations(): Promise<number> {
+  const res = await fetch(KILL_ALL_SIMULATIONS_URL, { method: 'POST' });
+  if (!res.ok) {
+    throw new Error(`killAllSimulations failed: ${res.status} ${res.statusText}`);
+  }
+  const data = await res.json();
+  return (data.killed as number) ?? 0;
 }

@@ -33,7 +33,9 @@ describe('TraceUpload', () => {
     render(<TraceUpload />);
     const input = document.querySelector('input[type="file"]') as HTMLInputElement;
 
-    const fileContent = JSON.stringify([{ op: 'alloc', size: 64, stack_hash: 100 }]);
+    const fileContent = JSON.stringify([
+      { timestamp: 0, op: 'alloc', size: 64, stack_hash: 100 },
+    ]);
     const file = new File([fileContent], 'trace.json', { type: 'application/json' });
     // jsdom doesn't implement File.text() — patch it
     file.text = vi.fn().mockResolvedValue(fileContent);
@@ -45,5 +47,30 @@ describe('TraceUpload', () => {
     await waitFor(() => {
       expect(screen.getByTestId('upload-result')).toBeDefined();
     });
+  });
+
+  it('parses the timestamp column from a CSV trace', async () => {
+    const { TraceUpload } = await import('../TraceUpload');
+    const { uploadTrace } = await import('../../hooks/useApi');
+    render(<TraceUpload />);
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+
+    const fileContent =
+      'timestamp,op,size,stack_hash\n0,alloc,64,100\n1500000,free,64,100\n';
+    const file = new File([fileContent], 'trace.csv', { type: 'text/csv' });
+    file.text = vi.fn().mockResolvedValue(fileContent);
+
+    fireEvent.change(input, { target: { files: [file] } });
+    await waitFor(() => {
+      expect(uploadTrace).toHaveBeenCalled();
+    });
+    // The parsed trace must carry the timestamp column verbatim (ns), not an
+    // op index — this is the client-side half of the "0 or 41" fix.
+    const trace = (uploadTrace as unknown as ReturnType<typeof vi.fn>).mock
+      .calls[0][0];
+    expect(trace).toEqual([
+      { timestamp: 0, op: 'alloc', size: 64, stack_hash: 100 },
+      { timestamp: 1500000, op: 'free', size: 64, stack_hash: 100 },
+    ]);
   });
 });

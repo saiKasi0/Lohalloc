@@ -218,10 +218,11 @@ export function TraceUploadModal({ onClose }: TraceUploadModalProps): JSX.Elemen
                 <span className="text-heat">A</span> MANUAL JSON FORMAT
              </p>
               <pre className="bg-canvas border border-ink-faint px-3 py-2 text-ink-muted overflow-x-auto">
-{`[ {"op": "alloc", "size": 64, "stack_hash": 12345}, ... ]`}
+{`[ {"timestamp": 0, "op": "alloc", "size": 64, "stack_hash": 12345}, ... ]`}
              </pre>
               <p className="mt-1 text-ink-muted">
-                Fields: <span className="text-ink">op</span> ("alloc" | "free"),{' '}
+                Fields: <span className="text-ink">timestamp</span> (ns, u64),{' '}
+                <span className="text-ink">op</span> ("alloc" | "free"),{' '}
                 <span className="text-ink">size</span> (bytes),{' '}
                 <span className="text-ink">stack_hash</span> (u64).
              </p>
@@ -233,9 +234,9 @@ export function TraceUploadModal({ onClose }: TraceUploadModalProps): JSX.Elemen
                 <span className="text-heat">B</span> MANUAL CSV FORMAT (HEADER ROW REQUIRED)
              </p>
               <pre className="bg-canvas border border-ink-faint px-3 py-2 text-ink-muted overflow-x-auto">
-{`op,size,stack_hash
-alloc,64,12345
-free,64,12345`}
+{`timestamp,op,size,stack_hash
+0,alloc,64,12345
+1500000,free,64,12345`}
              </pre>
            </div>
 

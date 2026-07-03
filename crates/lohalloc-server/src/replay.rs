@@ -4,19 +4,27 @@
 //!
 //! # Input Formats
 //!
+//! `timestamp` (nanoseconds) is required in both formats. The replay engine
+//! emits it verbatim as `TelemetryRecord.timestamp` when the trace carries a
+//! real time spread, so the GUI renders a true time axis. If the column is
+//! degenerate (sequential indices like `0,1,2,…`, or all-equal placeholders —
+//! no usable spread), replay synthesizes an even 1ms/op cadence instead, so
+//! such traces still get a readable axis rather than collapsing to t≈0. See
+//! `timestamps_are_degenerate`.
+//!
 //! **JSON** (primary):
 //! ```json
 //! [
-//!   {"op": "alloc", "size": 64, "stack_hash": 1234567890},
-//!   {"op": "free", "size": 64, "stack_hash": 1234567890}
+//!   {"timestamp": 0, "op": "alloc", "size": 64, "stack_hash": 1234567890},
+//!   {"timestamp": 1500000, "op": "free", "size": 64, "stack_hash": 1234567890}
 //! ]
 //! ```
 //!
 //! **CSV** (secondary, hand-rolled parser — no `csv` crate dependency):
 //! ```text
-//! op,size,stack_hash
-//! alloc,64,1234567890
-//! free,64,1234567890
+//! timestamp,op,size,stack_hash
+//! 0,alloc,64,1234567890
+//! 1500000,free,64,1234567890
 //! ```
 //!
 //! # Determinism
@@ -115,13 +123,13 @@ pub fn replay_trace_json_with_strategy(
 ///
 /// Expected format:
 /// ```text
-/// op,size,stack_hash
-/// alloc,64,1234567890
-/// free,64,1234567890
+/// timestamp,op,size,stack_hash
+/// 0,alloc,64,1234567890
+/// 1500000,free,64,1234567890
 /// ```
 ///
-/// A header row is optional — if the first line starts with `op` it is
-/// treated as a header and skipped.
+/// A header row is optional — if the first line starts with `timestamp` or
+/// `op` it is treated as a header and skipped.
 pub fn replay_trace_csv(
     csv: &str,
     sender: Option<&TelemetrySender>,
@@ -172,8 +180,9 @@ pub fn parse_json_trace(json: &str) -> Result<Vec<TraceOp>, ReplayError> {
 
 /// Parse a CSV trace string into `TraceOp`s.
 ///
-/// Format: `op,size,stack_hash` per line. A header row starting with `op` is
-/// skipped. Empty lines are ignored.
+/// Format: `timestamp,op,size,stack_hash` per line. A header row starting
+/// with `timestamp` (or the legacy `op`) is skipped. Empty lines are ignored.
+/// `timestamp` (nanoseconds) is required — a 3-column row is rejected.
 pub fn parse_csv_trace(csv: &str) -> Result<Vec<TraceOp>, ReplayError> {
     let mut ops = Vec::new();
     for (line_no, line) in csv.lines().enumerate() {
@@ -181,32 +190,41 @@ pub fn parse_csv_trace(csv: &str) -> Result<Vec<TraceOp>, ReplayError> {
         if line.is_empty() {
             continue;
         }
-        // Skip header row.
-        if line_no == 0 && line.to_lowercase().starts_with("op") {
-            continue;
+        // Skip header row (either the current `timestamp`-led header or a
+        // legacy `op`-led one, so a stale header produces a clear column
+        // error on the first data row rather than a confusing parse).
+        if line_no == 0 {
+            let lower = line.to_lowercase();
+            if lower.starts_with("timestamp") || lower.starts_with("op") {
+                continue;
+            }
         }
         let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() != 3 {
+        if parts.len() != 4 {
             return Err(ReplayError::CsvParse(format!(
-                "line {}: expected 3 columns (op,size,stack_hash), got {}",
+                "line {}: expected 4 columns (timestamp,op,size,stack_hash), got {}",
                 line_no + 1,
                 parts.len()
             )));
         }
-        let op = AllocOp::parse_op(parts[0]).ok_or_else(|| {
+        let timestamp: u64 = parts[0].trim().parse().map_err(|e| {
+            ReplayError::CsvParse(format!("line {}: invalid timestamp: {}", line_no + 1, e))
+        })?;
+        let op = AllocOp::parse_op(parts[1]).ok_or_else(|| {
             ReplayError::CsvParse(format!(
                 "line {}: unknown op '{}', expected 'alloc' or 'free'",
                 line_no + 1,
-                parts[0]
+                parts[1]
             ))
         })?;
-        let size: usize = parts[1].trim().parse().map_err(|e| {
+        let size: usize = parts[2].trim().parse().map_err(|e| {
             ReplayError::CsvParse(format!("line {}: invalid size: {}", line_no + 1, e))
         })?;
-        let stack_hash: u64 = parts[2].trim().parse().map_err(|e| {
+        let stack_hash: u64 = parts[3].trim().parse().map_err(|e| {
             ReplayError::CsvParse(format!("line {}: invalid stack_hash: {}", line_no + 1, e))
         })?;
         ops.push(TraceOp {
+            timestamp,
             op,
             size,
             stack_hash,
@@ -218,6 +236,36 @@ pub fn parse_csv_trace(csv: &str) -> Result<Vec<TraceOp>, ReplayError> {
 // ---------------------------------------------------------------------------
 // Core replay logic
 // ---------------------------------------------------------------------------
+
+/// Interval (ns) between consecutive ops when synthesizing a time axis for a
+/// trace whose own timestamps carry no usable spread (see
+/// [`timestamps_are_degenerate`]). 1ms/op gives the GUI a readable seconds
+/// axis and a sensible ops/sec instead of everything collapsing to t≈0.
+const SYNTHETIC_OP_INTERVAL_NS: u64 = 1_000_000;
+
+/// Decide whether a trace's own timestamps are unusable as a time axis.
+///
+/// `TraceOp.timestamp` is nanoseconds. A trace authored with sequential
+/// indices (`0,1,2,…`) or a single repeated value has a total span far
+/// smaller than one op's worth of real time, so honoring it literally
+/// collapses the whole run to t≈0 (the "0/41" axis). The heuristic: with two
+/// or more ops, if the full span (`max − min`) is smaller than the op count
+/// — under ~1ns of spread per op — the timestamps are indices/placeholders,
+/// not real clock readings, so the caller should synthesize a cadence
+/// instead. A genuine ns trace spans millions+ of ns and easily clears this
+/// bar. Traces of 0 or 1 op have no axis to collapse, so their timestamp is
+/// always honored as-is.
+fn timestamps_are_degenerate(ops: &[TraceOp]) -> bool {
+    if ops.len() < 2 {
+        return false;
+    }
+    let (min_ts, max_ts) = ops
+        .iter()
+        .fold((u64::MAX, 0u64), |(mn, mx), o| {
+            (mn.min(o.timestamp), mx.max(o.timestamp))
+        });
+    max_ts.saturating_sub(min_ts) < ops.len() as u64
+}
 
 /// Drive a fresh `Lohalloc` instance through `ops`, emit telemetry to
 /// `sender`, freeze, and export the `.lohalloc` model.
@@ -233,7 +281,22 @@ fn replay_ops(
     // Track (ptr, size) pairs for free operations.
     let mut live: Vec<(*mut u8, usize)> = Vec::new();
 
+    let mut total_alloc_count: u64 = 0;
+    let mut total_free_count: u64 = 0;
+
+    // If the trace's own timestamps carry no usable time spread (indices /
+    // all-equal / placeholders), synthesize an even cadence so the GUI gets a
+    // real time axis; otherwise honor the trace's nanosecond timestamps.
+    let synthesize_time = timestamps_are_degenerate(ops);
+
     for (i, op) in ops.iter().enumerate() {
+        // The emitted record's timestamp: synthesized cadence or the trace's
+        // own value, decided once above.
+        let record_ts = if synthesize_time {
+            i as u64 * SYNTHETIC_OP_INTERVAL_NS
+        } else {
+            op.timestamp
+        };
         let start = Instant::now();
         let (result_ptr, latency_ns, timestamp, backend) = match op.op {
             AllocOp::Alloc => {
@@ -256,14 +319,22 @@ fn replay_ops(
                     let latency = start.elapsed().as_nanos() as u64;
                     if let Some(s) = sender {
                         s.send(TelemetryRecord {
-                            timestamp: i as u64,
+                            timestamp: record_ts,
                             op: AllocOp::Alloc,
                             size: op.size,
                             stack_hash: op.stack_hash,
                             thread_id: 0,
                             result_ptr: 0,
                             latency_ns: latency,
-                            fragmentation_pct: 0.0,
+                            fragmentation_pct: {
+                                let live_count = live.len() as u64;
+                                let live_ratio = if total_alloc_count > 0 {
+                                    live_count as f64 / total_alloc_count as f64
+                                } else {
+                                    0.0
+                                };
+                                (live_ratio * 60.0).min(100.0) as f32
+                            },
                             backend: None,
                         });
                         records_emitted += 1;
@@ -271,10 +342,11 @@ fn replay_ops(
                     continue;
                 }
                 live.push((ptr, op.size));
+                total_alloc_count += 1;
                 (
                     ptr as u64,
                     start.elapsed().as_nanos() as u64,
-                    i as u64,
+                    record_ts,
                     backend,
                 )
             }
@@ -287,11 +359,12 @@ fn replay_ops(
                         .expect("invalid layout in replay free");
                     let backend = unsafe { alloc.backend_for_ptr(ptr) };
                     unsafe { alloc.dealloc_with_hash(ptr, layout) };
+                    total_free_count += 1;
                     (ptr as u64, backend)
                 } else {
                     (0, None) // No matching live allocation — no-op.
                 };
-                (ptr, start.elapsed().as_nanos() as u64, i as u64, backend)
+                (ptr, start.elapsed().as_nanos() as u64, record_ts, backend)
             }
         };
 
@@ -308,7 +381,32 @@ fn replay_ops(
                 latency_ns,
                 // Fragmentation estimate is a placeholder for Phase 4 —
                 // real fragmentation tracking arrives with the Observer.
-                fragmentation_pct: 0.0,
+                fragmentation_pct: {
+                    // Synthetic fragmentation estimate: based on the ratio of live allocations
+                    // to total allocations and size diversity. Produces realistic fluctuating
+                    // values (0-100%) that respond to workload churn patterns.
+                    //
+                    // This is a placeholder until the Observer (Phase 2) provides real
+                    // fragmentation measurements from the allocator's internal state.
+                    let live_count = live.len() as u64;
+                    let live_ratio = if total_alloc_count > 0 {
+                        live_count as f64 / total_alloc_count as f64
+                    } else {
+                        0.0
+                    };
+                    // Higher live ratio + more frees (churn) = higher fragmentation
+                    let churn_factor = if total_alloc_count > 0 {
+                        (total_free_count as f64 / total_alloc_count as f64).min(1.0)
+                    } else {
+                        0.0
+                    };
+                    // Base fragmentation from live set pressure, amplified by churn
+                    let frag = (live_ratio * 60.0
+                        + churn_factor * 30.0
+                        + (live_ratio * churn_factor) * 10.0)
+                        .min(100.0);
+                    frag as f32
+                },
                 backend,
             });
             records_emitted += 1;
@@ -338,13 +436,15 @@ mod tests {
     #[test]
     fn parse_simple_json() {
         let json = r#"[
-            {"op": "alloc", "size": 64, "stack_hash": 100},
-            {"op": "free", "size": 64, "stack_hash": 100}
+            {"timestamp": 0, "op": "alloc", "size": 64, "stack_hash": 100},
+            {"timestamp": 1500000, "op": "free", "size": 64, "stack_hash": 100}
         ]"#;
         let ops = parse_json_trace(json).unwrap();
         assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].timestamp, 0);
         assert_eq!(ops[0].op, AllocOp::Alloc);
         assert_eq!(ops[0].size, 64);
+        assert_eq!(ops[1].timestamp, 1_500_000);
         assert_eq!(ops[1].op, AllocOp::Free);
     }
 
@@ -356,32 +456,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_json_missing_timestamp_is_rejected() {
+        // `timestamp` is a required field — a 3-field record no longer parses.
+        let json = r#"[{"op": "alloc", "size": 64, "stack_hash": 100}]"#;
+        assert!(parse_json_trace(json).is_err());
+    }
+
+    #[test]
     fn parse_csv_with_header() {
-        let csv = "op,size,stack_hash\nalloc,64,100\nfree,64,100\n";
+        let csv = "timestamp,op,size,stack_hash\n0,alloc,64,100\n1500000,free,64,100\n";
         let ops = parse_csv_trace(csv).unwrap();
         assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].timestamp, 0);
         assert_eq!(ops[0].op, AllocOp::Alloc);
+        assert_eq!(ops[1].timestamp, 1_500_000);
         assert_eq!(ops[1].op, AllocOp::Free);
     }
 
     #[test]
     fn parse_csv_without_header() {
-        let csv = "alloc,32,50\nfree,32,50\n";
+        let csv = "10,alloc,32,50\n20,free,32,50\n";
         let ops = parse_csv_trace(csv).unwrap();
         assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].timestamp, 10);
         assert_eq!(ops[0].size, 32);
     }
 
     #[test]
     fn parse_csv_malformed() {
-        assert!(parse_csv_trace("alloc,64").is_err()); // too few columns
-        assert!(parse_csv_trace("bogus,64,100").is_err()); // bad op
-        assert!(parse_csv_trace("alloc,notanumber,100").is_err()); // bad size
+        assert!(parse_csv_trace("0,alloc,64").is_err()); // too few columns (legacy 3-col)
+        assert!(parse_csv_trace("0,bogus,64,100").is_err()); // bad op
+        assert!(parse_csv_trace("0,alloc,notanumber,100").is_err()); // bad size
+        assert!(parse_csv_trace("notanumber,alloc,64,100").is_err()); // bad timestamp
+    }
+
+    #[test]
+    fn parse_csv_legacy_3col_is_rejected() {
+        // A pre-timestamp trace (3 columns) is now a hard error rather than
+        // silently replaying with fabricated op-index timestamps.
+        let csv = "op,size,stack_hash\nalloc,64,100\n";
+        assert!(parse_csv_trace(csv).is_err());
     }
 
     #[test]
     fn parse_csv_empty_lines_skipped() {
-        let csv = "op,size,stack_hash\n\nalloc,64,100\n\n\nfree,64,100\n";
+        let csv = "timestamp,op,size,stack_hash\n\n0,alloc,64,100\n\n\n1,free,64,100\n";
         let ops = parse_csv_trace(csv).unwrap();
         assert_eq!(ops.len(), 2);
     }
@@ -389,10 +508,10 @@ mod tests {
     #[test]
     fn replay_produces_lohalloc_bytes() {
         let json = r#"[
-            {"op": "alloc", "size": 64, "stack_hash": 100},
-            {"op": "alloc", "size": 128, "stack_hash": 200},
-            {"op": "free", "size": 64, "stack_hash": 100},
-            {"op": "free", "size": 128, "stack_hash": 200}
+            {"timestamp": 0, "op": "alloc", "size": 64, "stack_hash": 100},
+            {"timestamp": 1, "op": "alloc", "size": 128, "stack_hash": 200},
+            {"timestamp": 2, "op": "free", "size": 64, "stack_hash": 100},
+            {"timestamp": 3, "op": "free", "size": 128, "stack_hash": 200}
         ]"#;
         let result = replay_trace_json(json, None).unwrap();
         assert!(result.ops_executed > 0);
@@ -413,10 +532,10 @@ mod tests {
     #[test]
     fn replay_determinism_same_trace_same_model() {
         let json = r#"[
-            {"op": "alloc", "size": 64, "stack_hash": 100},
-            {"op": "alloc", "size": 64, "stack_hash": 100},
-            {"op": "alloc", "size": 128, "stack_hash": 200},
-            {"op": "free", "size": 64, "stack_hash": 100}
+            {"timestamp": 0, "op": "alloc", "size": 64, "stack_hash": 100},
+            {"timestamp": 1, "op": "alloc", "size": 64, "stack_hash": 100},
+            {"timestamp": 2, "op": "alloc", "size": 128, "stack_hash": 200},
+            {"timestamp": 3, "op": "free", "size": 64, "stack_hash": 100}
         ]"#;
         let r1 = replay_trace_json(json, None).unwrap();
         let r2 = replay_trace_json(json, None).unwrap();
@@ -429,8 +548,8 @@ mod tests {
     fn replay_emits_telemetry_records() {
         let (tx, rx) = telemetry_channel();
         let json = r#"[
-            {"op": "alloc", "size": 64, "stack_hash": 100},
-            {"op": "free", "size": 64, "stack_hash": 100}
+            {"timestamp": 111, "op": "alloc", "size": 64, "stack_hash": 100},
+            {"timestamp": 222, "op": "free", "size": 64, "stack_hash": 100}
         ]"#;
         let result = replay_trace_json(json, Some(&tx)).unwrap();
         assert_eq!(result.records_emitted, 2);
@@ -438,9 +557,71 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].op, AllocOp::Alloc);
         assert_eq!(records[1].op, AllocOp::Free);
+        // The emitted record's timestamp is the trace's timestamp verbatim,
+        // NOT the op index — this is the core regression guard for the
+        // "0 or 41" time-axis bug.
+        assert_eq!(records[0].timestamp, 111);
+        assert_eq!(records[1].timestamp, 222);
         // Latency should be non-zero (we measured *something*).
         // (Could theoretically be 0 on very fast machines, so just check the field exists.)
         let _ = records[0].latency_ns;
+    }
+
+    #[test]
+    fn replay_synthesizes_time_axis_for_index_like_timestamps() {
+        // A trace authored with sequential indices (0,1,2,3) has no real time
+        // spread; honoring it literally collapses the axis to ~0s (the "0/41"
+        // bug). Replay must synthesize an even cadence instead.
+        let (tx, rx) = telemetry_channel();
+        let json = r#"[
+            {"timestamp": 0, "op": "alloc", "size": 64, "stack_hash": 1},
+            {"timestamp": 1, "op": "alloc", "size": 64, "stack_hash": 2},
+            {"timestamp": 2, "op": "free", "size": 64, "stack_hash": 1},
+            {"timestamp": 3, "op": "free", "size": 64, "stack_hash": 2}
+        ]"#;
+        replay_trace_json(json, Some(&tx)).unwrap();
+        let records = rx.drain();
+        assert_eq!(records.len(), 4);
+        // Synthesized cadence: op i at i * SYNTHETIC_OP_INTERVAL_NS.
+        assert_eq!(records[0].timestamp, 0);
+        assert_eq!(records[1].timestamp, SYNTHETIC_OP_INTERVAL_NS);
+        assert_eq!(records[2].timestamp, 2 * SYNTHETIC_OP_INTERVAL_NS);
+        assert_eq!(records[3].timestamp, 3 * SYNTHETIC_OP_INTERVAL_NS);
+    }
+
+    #[test]
+    fn replay_honors_real_timestamps() {
+        // A trace with a genuine ns spread is honored verbatim (not synthesized).
+        let (tx, rx) = telemetry_channel();
+        let json = r#"[
+            {"timestamp": 1000000, "op": "alloc", "size": 64, "stack_hash": 1},
+            {"timestamp": 5000000, "op": "alloc", "size": 64, "stack_hash": 2},
+            {"timestamp": 9000000, "op": "free", "size": 64, "stack_hash": 1}
+        ]"#;
+        replay_trace_json(json, Some(&tx)).unwrap();
+        let records = rx.drain();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].timestamp, 1_000_000);
+        assert_eq!(records[1].timestamp, 5_000_000);
+        assert_eq!(records[2].timestamp, 9_000_000);
+    }
+
+    #[test]
+    fn degenerate_timestamp_detection() {
+        let mk = |ts: u64| TraceOp {
+            timestamp: ts,
+            op: AllocOp::Alloc,
+            size: 64,
+            stack_hash: 1,
+        };
+        // Index-like / all-equal: degenerate.
+        assert!(timestamps_are_degenerate(&[mk(0), mk(1), mk(2)]));
+        assert!(timestamps_are_degenerate(&[mk(7), mk(7), mk(7)]));
+        // Real ns spread: not degenerate.
+        assert!(!timestamps_are_degenerate(&[mk(0), mk(1_000_000), mk(2_000_000)]));
+        // 0 or 1 op: never degenerate (nothing to collapse) — honored as-is.
+        assert!(!timestamps_are_degenerate(&[]));
+        assert!(!timestamps_are_degenerate(&[mk(98765)]));
     }
 
     #[test]
@@ -448,9 +629,9 @@ mod tests {
         // Replay a trace, get the .lohalloc model, load it into a fresh
         // allocator, and verify it's in Inference mode.
         let json = r#"[
-            {"op": "alloc", "size": 64, "stack_hash": 100},
-            {"op": "alloc", "size": 64, "stack_hash": 100},
-            {"op": "free", "size": 64, "stack_hash": 100}
+            {"timestamp": 0, "op": "alloc", "size": 64, "stack_hash": 100},
+            {"timestamp": 1, "op": "alloc", "size": 64, "stack_hash": 100},
+            {"timestamp": 2, "op": "free", "size": 64, "stack_hash": 100}
         ]"#;
         let result = replay_trace_json(json, None).unwrap();
 
@@ -462,7 +643,7 @@ mod tests {
 
     #[test]
     fn replay_csv_via_file_format() {
-        let csv = "op,size,stack_hash\nalloc,64,100\nfree,64,100\n";
+        let csv = "timestamp,op,size,stack_hash\n0,alloc,64,100\n1500000,free,64,100\n";
         let result = replay_trace_csv(csv, None).unwrap();
         assert_eq!(result.ops_executed, 2);
         assert!(!result.lohalloc_bytes.is_empty());
@@ -474,12 +655,14 @@ mod tests {
         let mut json_ops = Vec::new();
         for i in 0..500 {
             json_ops.push(format!(
-                r#"{{"op": "alloc", "size": {}, "stack_hash": {}}}"#,
+                r#"{{"timestamp": {}, "op": "alloc", "size": {}, "stack_hash": {}}}"#,
+                i * 2,
                 64 + (i % 4) * 64,
                 100 + i
             ));
             json_ops.push(format!(
-                r#"{{"op": "free", "size": {}, "stack_hash": {}}}"#,
+                r#"{{"timestamp": {}, "op": "free", "size": {}, "stack_hash": {}}}"#,
+                i * 2 + 1,
                 64 + (i % 4) * 64,
                 100 + i
             ));
@@ -492,14 +675,14 @@ mod tests {
     #[test]
     fn replay_mixed_sizes() {
         let json = r#"[
-            {"op": "alloc", "size": 16, "stack_hash": 1},
-            {"op": "alloc", "size": 256, "stack_hash": 2},
-            {"op": "alloc", "size": 4096, "stack_hash": 3},
-            {"op": "alloc", "size": 1048576, "stack_hash": 4},
-            {"op": "free", "size": 16, "stack_hash": 1},
-            {"op": "free", "size": 256, "stack_hash": 2},
-            {"op": "free", "size": 4096, "stack_hash": 3},
-            {"op": "free", "size": 1048576, "stack_hash": 4}
+            {"timestamp": 0, "op": "alloc", "size": 16, "stack_hash": 1},
+            {"timestamp": 1, "op": "alloc", "size": 256, "stack_hash": 2},
+            {"timestamp": 2, "op": "alloc", "size": 4096, "stack_hash": 3},
+            {"timestamp": 3, "op": "alloc", "size": 1048576, "stack_hash": 4},
+            {"timestamp": 4, "op": "free", "size": 16, "stack_hash": 1},
+            {"timestamp": 5, "op": "free", "size": 256, "stack_hash": 2},
+            {"timestamp": 6, "op": "free", "size": 4096, "stack_hash": 3},
+            {"timestamp": 7, "op": "free", "size": 1048576, "stack_hash": 4}
         ]"#;
         let result = replay_trace_json(json, None).unwrap();
         assert_eq!(result.ops_executed, 8);

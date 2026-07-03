@@ -88,6 +88,35 @@ fn header_pad(align: usize) -> usize {
     align_up(HEADER_SIZE, align)
 }
 
+/// Internal-fragmentation percentage for an allocation of `total` bytes
+/// served by `backend`: `(reserved - total) / reserved * 100`, where
+/// `reserved` is the actual block size the backend rounds `total` up to.
+///
+/// Each backend's rounding rule is a *pure, deterministic* function of
+/// `total` alone (size-class lookup for Slab, order lookup for Buddy,
+/// page-alignment for System), so this is computed fresh here rather than
+/// threaded back from the backend's `alloc()` call — no backend lock, no
+/// new atomics, no heap allocation, keeping the hot path unchanged.
+/// Arena is a bump allocator with no size-class rounding, so it reports 0.
+///
+/// Only called from the telemetry hooks in `write_header`/`dealloc`, so it
+/// is compiled away entirely (like the rest of the observer machinery) when
+/// `telemetry-observer` is off — production builds pay nothing for it.
+#[cfg(feature = "telemetry-observer")]
+fn fragmentation_pct_for(backend: Backend, total: usize) -> f32 {
+    let reserved = match backend {
+        Backend::Slab => lohalloc_core::slab_class_for(total)
+            .map(|class| lohalloc_core::SLAB_SIZE_CLASSES[class]),
+        Backend::Buddy => buddy::order_for(total).map(buddy::block_size),
+        Backend::System => Some(align_up(total, system::page_size())),
+        Backend::Arena => None,
+    };
+    match reserved {
+        Some(reserved) if reserved > total => (reserved - total) as f32 / reserved as f32 * 100.0,
+        _ => 0.0,
+    }
+}
+
 /// Which Execution-Plane backend produced an allocation. Tagged into the
 /// [`Header`]. Uses `lohalloc_core::Backend` (re-imported here for the
 /// header's `u8` tag).
@@ -96,6 +125,7 @@ fn header_pad(align: usize) -> usize {
 /// use in the `Header` (which stores a `u8` discriminant). The Decision
 /// Engine (`state.rs`) uses `lohalloc_core::Backend` directly.
 #[repr(u8)]
+#[derive(Clone, Copy)]
 enum Backend {
     Slab = 0,
     Buddy = 1,
@@ -174,6 +204,16 @@ thread_local! {
     /// Re-entrancy depth. >0 means we are already inside `alloc`/`dealloc` on
     /// this thread — any further allocation must bypass to `mmap` directly.
     static IN_ALLOC: Cell<usize> = const { Cell::new(0) };
+    /// Capture the start time of the allocation for latency measurement.
+    /// Set at entry to alloc(), read in emit_alloc() to compute elapsed time.
+    static ALLOC_START_NS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Retrieve the allocation start time (for telemetry latency measurement).
+/// Called by `observer::emit_alloc` to compute elapsed time.
+#[cfg(feature = "telemetry-observer")]
+pub(crate) fn alloc_start_ns() -> u64 {
+    ALLOC_START_NS.get()
 }
 
 // SAFETY: we uphold the `GlobalAlloc` contract:
@@ -191,6 +231,11 @@ unsafe impl GlobalAlloc for Lohalloc {
         let align = layout.align().max(MIN_ALIGN);
         let pad = header_pad(align);
         let total = size + pad;
+
+        // Capture the start time for latency measurement (only used when
+        // telemetry-observer feature is enabled; read in emit_alloc).
+        #[cfg(feature = "telemetry-observer")]
+        ALLOC_START_NS.set(observer::now_ns());
 
         // Re-entrancy guard: if we're already inside the allocator on this
         // thread (e.g. a backend's `Vec` growing), serve directly from mmap.
@@ -227,7 +272,10 @@ unsafe impl GlobalAlloc for Lohalloc {
         // are no-ops here).
         #[cfg(feature = "telemetry-observer")]
         {
-            observer::emit_free(header.size, header.hash, ptr as u64);
+            let frag = Backend::from_u8(header.backend)
+                .map(|b| fragmentation_pct_for(b, header.size))
+                .unwrap_or(0.0);
+            observer::emit_free(header.size, header.hash, ptr as u64, frag);
         }
 
         match Backend::from_u8(header.backend) {
@@ -439,7 +487,8 @@ impl Lohalloc {
         // `route_by_size` / `system_alloc_with_header`.
         #[cfg(feature = "telemetry-observer")]
         {
-            observer::emit_alloc(total, hash, user as u64, backend_tag);
+            let frag = fragmentation_pct_for(backend, total);
+            observer::emit_alloc(total, hash, user as u64, backend_tag, frag);
         }
 
         user
@@ -897,5 +946,73 @@ mod integration_tests {
     fn load_empty_returns_false() {
         let alloc = Lohalloc::new();
         assert!(!alloc.load(&[]), "load with empty data should return false");
+    }
+}
+
+// `fragmentation_pct_for` only exists under `telemetry-observer` — see its
+// `#[cfg]` above.
+#[cfg(all(test, feature = "telemetry-observer"))]
+mod fragmentation_tests {
+    use super::*;
+
+    #[test]
+    fn slab_mid_class_reports_nonzero_waste() {
+        // 40 bytes rounds up to the 64-byte slab class: (64-40)/64 = 37.5%.
+        let pct = fragmentation_pct_for(Backend::Slab, 40);
+        assert!(
+            (pct - 37.5).abs() < 0.01,
+            "expected ~37.5% waste, got {pct}"
+        );
+    }
+
+    #[test]
+    fn slab_exact_class_boundary_reports_zero_waste() {
+        // Exactly a slab class size (64) — no rounding, no waste.
+        let pct = fragmentation_pct_for(Backend::Slab, 64);
+        assert_eq!(pct, 0.0);
+    }
+
+    #[test]
+    fn buddy_mid_order_reports_nonzero_waste() {
+        // A request just over a power-of-two boundary rounds up to the next
+        // order, wasting close to (but less than) 50%.
+        let small_order_size = buddy::block_size(buddy::order_for(65).unwrap());
+        let pct = fragmentation_pct_for(Backend::Buddy, 65);
+        assert!(
+            pct > 0.0 && pct < 50.0,
+            "got {pct}% for size 65, reserved {small_order_size}"
+        );
+    }
+
+    #[test]
+    fn system_reports_page_rounding_waste() {
+        // 1 byte over the System threshold still rounds up to a full page;
+        // waste should be close to 100% (only 1 byte of a whole page used).
+        let pct = fragmentation_pct_for(Backend::System, 1);
+        assert!(pct > 0.0, "expected nonzero page-rounding waste, got {pct}");
+    }
+
+    #[test]
+    fn arena_reports_zero_waste() {
+        // Bump allocator: no size-class rounding.
+        assert_eq!(fragmentation_pct_for(Backend::Arena, 40), 0.0);
+    }
+
+    #[test]
+    fn fragmentation_is_bounded_0_to_100() {
+        for backend in [
+            Backend::Slab,
+            Backend::Buddy,
+            Backend::System,
+            Backend::Arena,
+        ] {
+            for size in [1usize, 7, 40, 64, 1000, 65536] {
+                let pct = fragmentation_pct_for(backend, size);
+                assert!(
+                    (0.0..=100.0).contains(&pct),
+                    "fragmentation_pct_for({size}) = {pct} out of [0,100] for backend"
+                );
+            }
+        }
     }
 }

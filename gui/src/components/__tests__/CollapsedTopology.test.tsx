@@ -42,4 +42,11 @@ describe('CollapsedTopology', () => {
     render(<CollapsedTopology entries={[]} />);
     expect(screen.getByText('AWAITING FREEZE...')).toBeDefined();
   });
+
+  it('handles a malformed hash string without crashing', () => {
+    const malformed: RoutingTableEntry[] = [{ hash: 'not-a-number', backend: 'slab' }];
+    expect(() => render(<CollapsedTopology entries={malformed} />)).not.toThrow();
+    const rows = screen.getAllByTestId('collapsed-topology-row');
+    expect(rows.length).toBe(1);
+  });
 });

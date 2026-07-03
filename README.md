@@ -30,14 +30,14 @@ into a read-only Perfect Hash Table for O(1) inference. The
 lock-free `crossbeam-channel` ring buffer so telemetry never feeds back
 into allocator latency.
 
-The implementation is built in six phases. Phases 1-5 (Foundation,
-Topology Engine, MAB + Freeze, Server & Telemetry, GUI & Trace
-Replay) are complete, plus a **Phase 5++ live telemetry streaming**
-extension (feature-gated observer hook, LD_PRELOAD shim, `POST
-/api/telemetry`, GUI live indicator) that shifts the GUI from
-replay-only to live allocation visualization. Phase 6 -- cross-platform
-benchmarking via criterion and Terraform-provisioned AWS instances --
-is in progress.
+Around the allocator sits a full observability stack: an Axum server
+exposes REST and WebSocket endpoints, and a React + Three.js GUI
+visualizes the learned topology in real time. Telemetry reaches the GUI
+two ways — **replay** (drag-and-drop a CSV/JSON trace) or **live**
+(a feature-gated observer hook + `LD_PRELOAD` shim streaming real
+allocations through `POST /api/telemetry`). Freezing the live bandit
+collapses it into the inference table and exports a portable
+`.lohalloc` model.
 
 ---
 
@@ -50,13 +50,13 @@ is in progress.
 | Rust        | 1.74+         | Workspace toolchain                  |
 | Node.js     | 20+           | GUI frontend (`gui/`)                |
 | Docker      | optional      | Linux ARM/x86 build verification     |
-| Terraform   | optional      | Phase 6 hybrid cloud benchmarking    |
+| Terraform   | optional      | Hybrid cloud benchmarking            |
 
 ### Build and test
 
 ```bash
 cargo build                            # build all crates
-cargo test --workspace                 # run 184 Rust tests
+cargo test --workspace                 # run the Rust test suite
 cargo clippy --all-targets --workspace # must be warning-free
 cargo run -p lohalloc-example          # smoke binary
 cargo run -p lohalloc-example -- --diverse --duration-secs 30  # diverse workloads
@@ -109,7 +109,7 @@ DYLD_INSERT_LIBRARIES=$PWD/shim/build/liblohalloc_obs.dylib \
 # (Linux: use LD_PRELOAD=$PWD/shim/build/liblohalloc_obs.so instead)
 ```
 
-The GUI's `TelemetrySidebar` and `FloatingWeb` light up as real
+The GUI's `TelemetrySidebar` and `Constellations` view light up as real
 allocations arrive. A `LIVE` indicator in the top bar distinguishes a
 live stream from a burst-replay. See
 [`shim/README.md`](./shim/README.md) and
@@ -188,9 +188,9 @@ use 4 KiB, some Linux aarch64 kernels use 64 KiB).
 | `aarch64-unknown-linux-gnu`     | macOS dev host    | Docker (native ARM)     |
 
 Docker images under `docker/` install the target toolchain, copy the
-workspace, and run `cargo test --target <triple>`. Phase 6 extends
-this to AWS `c6i.large` (x86_64) and `c6g.large` (ARM64) instances
-via Terraform.
+workspace, and run `cargo test --target <triple>`. The benchmarking CI
+extends this to AWS `c6i.large` (x86_64) and `c6g.large` (ARM64)
+instances via Terraform.
 
 ---
 
@@ -209,41 +209,28 @@ via Terraform.
 |-- shim/                     # LD_PRELOAD C shim: ring buffer + HTTP POST bridge for live mode
 |-- gui/                      # React + Vite + Three.js + Tailwind + Recharts
 |   `-- src/
-|       |-- components/       # HeapMap, PolicyMatrix, PerfTraceView, StrategyToggle, TraceUpload
+|       |-- components/       # Constellations, CollapsedTopology, PolicyMatrix, PerfTraceView, StrategyToggle, TraceUpload
 |       |-- hooks/            # useTelemetry (WS), useApi (REST)
 |       `-- types/            # TS types mirroring Rust telemetry schema
 |-- docker/                   # Dockerfile.linux-{x86,arm}
-|-- infra/                    # Terraform (Phase 6): AWS instances for hybrid bench
-|-- .github/workflows/        # bench.yml (Phase 6): SSH + criterion artifact upload
+|-- infra/                    # Terraform: AWS instances for hybrid bench
+|-- .github/workflows/        # bench.yml: SSH + criterion artifact upload
 `-- COPILOT.md                # Living project state, architecture, known issues
 ```
 
 ---
 
-## PHASES
-
-| # | Phase                       | Status         | Highlights                                                        |
-| - | --------------------------- | -------------- | ----------------------------------------------------------------- |
-| 1 | Global Allocator Foundation | Complete       | Slab, Buddy, System Fallback behind `GlobalAlloc` shim             |
-| 2 | Topology Engine             | Complete       | inline-asm 3-frame walk on ARM64/x86_64, XOR-shift hash, sentinel |
-| 3 | State Machine (MAB + Freeze)| Complete       | UCB1 bandit, PerfectHashTable, `.lohalloc` export/load            |
-| 4 | Server & Telemetry          | Complete       | Axum + WebSocket, crossbeam ring buffer, private replay allocator |
-| 5 | GUI & Local Trace Replay    | Complete       | Three.js HeapMap, drag-and-drop trace upload, Freeze & Export     |
-| 5++ | Live Telemetry Streaming  | Complete       | Feature-gated observer hook, LD_PRELOAD shim, POST /api/telemetry |
-| 6 | Benchmarking & Cross-Platform | In progress  | criterion vs jemalloc/mimalloc, hybrid Terraform/AWS CI           |
-
----
-
 ## TESTING
 
-- **164 Rust tests** across `lohalloc-core` (3), `lohalloc-alloc`
-  (77 -- 4 observer hook tests), `lohalloc-server` (42 -- 6 live
-  telemetry POST tests), `lohalloc-demo` (31), and `lohalloc-example`
-  (0; smoke binary).
+- **209 Rust tests** across `lohalloc-core` (3), `lohalloc-alloc`
+  (87, incl. observer-hook tests), `lohalloc-server` (118 -- unit +
+  `replay_tests` + `server_tests`, incl. live-telemetry POST tests),
+  and `lohalloc-demo` (1); `lohalloc-example` is a smoke binary with no
+  unit tests.
 - **9 shim C tests** via `make -C shim test` (ring buffer, JSON
   encoding, record size pin, emit-no-crash).
-- **30 GUI tests** under `gui/src/components/__tests__/` via Vitest
-  and React Testing Library.
+- **144 GUI tests** under `gui/src/{components,hooks}/__tests__/` via
+  Vitest and React Testing Library.
 - `cargo clippy --all-targets --workspace` must remain **warning-free**.
 - `cargo fmt --all` must remain clean.
 - GUI: `cd gui && npm run build && npx vitest run`.
@@ -262,8 +249,8 @@ target/debug/deps/lohalloc_alloc-<hash> <test_name> --nocapture
 ## DOCUMENTATION
 
 - **[COPILOT.md](./COPILOT.md)** -- full project state, current
-  architecture, known issues, phase-by-phase testing requirements.
-  Treated as ground truth by future AI sessions.
+  architecture, known issues, and testing requirements. Treated as
+  ground truth by future AI sessions.
 - **[`gui/`](./gui/)** -- frontend source, components, hooks, and
   Vitest specs under `gui/src/components/__tests__/`.
 - **[`crates/lohalloc-alloc/src/topology.rs`](./crates/lohalloc-alloc/src/topology.rs)**

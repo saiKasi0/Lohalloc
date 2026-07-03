@@ -15,6 +15,9 @@ export interface TelemetryRecord {
 }
 
 export interface TraceOp {
+  /** Nanosecond timestamp. Required — the replay engine emits it verbatim as
+   * `TelemetryRecord.timestamp`, so uploaded traces render a real time axis. */
+  timestamp: number;
   op: AllocOp;
   size: number;
   stack_hash: number;

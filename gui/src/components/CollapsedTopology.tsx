@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { getRoutingTable, type RoutingTableEntry } from '../hooks/useApi';
+import { formatHashHex } from '../utils/hash';
 
 interface CollapsedTopologyProps {
   /** Optional override; if omitted, fetched from /api/routing-table */
@@ -94,7 +95,7 @@ export default function CollapsedTopology({
                   data-testid="collapsed-topology-row"
                 >
                   <td className="px-3 py-1.5 text-ink whitespace-nowrap">
-                    {formatHash(row.hash)}
+                    {formatHashHex(row.hash)}
                  </td>
                   <td className="px-3 py-1.5 text-heat whitespace-nowrap">
                     {row.backend.toUpperCase()}
@@ -107,17 +108,4 @@ export default function CollapsedTopology({
       )}
    </div>
   );
-}
-
-/**
- * Format a u64 (received as string from JSON for JS precision) as a
- * 16-char zero-padded hex string prefixed with 0x.
- */
-function formatHash(hash: string): string {
-  try {
-    const big = BigInt(hash);
-    return '0x' + big.toString(16).padStart(16, '0').toUpperCase();
-  } catch {
-    return hash;
-  }
 }

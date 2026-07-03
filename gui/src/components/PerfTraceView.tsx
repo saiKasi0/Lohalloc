@@ -1,6 +1,7 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import {
-  LineChart,
+  ComposedChart,
+  Scatter,
   Line,
   XAxis,
   YAxis,
@@ -10,20 +11,10 @@ import {
 } from 'recharts';
 import type { TelemetryRecord } from '../types/telemetry';
 
-interface PerfDataPoint {
-  index: number;
-  p50: number;
-  p90: number;
-  p99: number;
-  throughput: number;
-}
-
 const INK = '#E5E0D8';
 const INK_MUTED = '#8A857D';
 const INK_FAINT = '#3A3733';
 const HEAT = '#FF2E2E';
-
-const WINDOW_SIZE = 500;
 
 const TOOLTIP_STYLE = {
   backgroundColor: '#0A0A0A',
@@ -35,59 +26,148 @@ const TOOLTIP_STYLE = {
 };
 
 /**
- * Linear-interpolation percentile. Caller passes a sorted ascending array.
+ * Throughput (ops/sec) has no per-record value — it's a rate, so computing
+ * it needs *some* time window to count "N ops in this slice / slice
+ * width". This width is fixed (not scaled to run length) so resolution
+ * stays consistent as a run goes on: the x-axis is an *expanding* domain
+ * (see `PerfTraceView` below — it grows with time rather than sliding a
+ * fixed-width window), so more windows simply accumulate as the run
+ * continues instead of existing ones growing coarser.
  */
-export function percentile(sortedArr: number[], p: number): number {
-  if (sortedArr.length === 0) return 0;
-  const idx = (p / 100) * (sortedArr.length - 1);
-  const lo = Math.floor(idx);
-  const hi = Math.ceil(idx);
-  if (lo === hi) return sortedArr[lo];
-  return sortedArr[lo] + (sortedArr[hi] - sortedArr[lo]) * (idx - lo);
+const THROUGHPUT_WINDOW_SEC = 0.5;
+
+export interface ScatterPoint {
+  timeSec: number;
+  /** The raw/binned value for this point — the scatter dot. */
+  value?: number;
+  /** Only set on the first/last point of a series — the two endpoints of
+   * the straight trend line `<Line connectNulls>` draws through. */
+  fit?: number;
 }
 
 /**
- * Compute the per-window perf data points:
- *   - Rolling window of last WINDOW_SIZE records
- *   - P50/P90/P99 of latency_ns at each window index
- *   - Throughput (ops/sec) derived from inter-record timestamp deltas
+ * Divisor that converts a `TelemetryRecord.timestamp` to seconds.
+ *
+ * Timestamps are **nanoseconds** by contract — both the replay engine
+ * (`TraceOp.timestamp`, enforced) and the live observer (`now_ns()`) emit ns.
+ * So the divisor is a constant 1e9. Points are always rebased to a pinned
+ * origin before display (see `computeRawPoints`), so this works for absolute
+ * (wall-clock) *and* relative (elapsed-from-0) nanosecond timestamps, and for
+ * any run length — a sub-millisecond replay or a multi-minute live stream.
+ *
+ * (This replaced a magnitude ladder that only mapped ns→s above 1e15, so a
+ * small-valued trace — e.g. `0,1,2` — rendered its op indices as "seconds",
+ * the visible half of the "0 or 41" time-axis bug.)
  */
-export function computePerfPoints(records: TelemetryRecord[]): PerfDataPoint[] {
+function detectTimestampUnit(records: TelemetryRecord[]): number {
+  const maxTs = records.reduce((mx, r) => (r.timestamp > mx ? r.timestamp : mx), 0);
+  // Degenerate all-zero (or empty) trace: avoid a pointless divide, every
+  // point is at t=0 anyway.
+  if (maxTs <= 0) return 1;
+  return 1e9;
+}
+
+/**
+ * Ordinary least squares over `{x,y}` pairs — a genuine "line of best
+ * fit" (a straight regression line, not a smoothing/EMA curve). Returns
+ * `null` for fewer than 2 points or a degenerate (all-identical-x) set,
+ * in which case no trend line is drawn.
+ */
+export function linearRegression(
+  points: { x: number; y: number }[],
+): { slope: number; intercept: number } | null {
+  const n = points.length;
+  if (n < 2) return null;
+  let sumX = 0;
+  let sumY = 0;
+  let sumXY = 0;
+  let sumXX = 0;
+  for (const { x, y } of points) {
+    sumX += x;
+    sumY += y;
+    sumXY += x * y;
+    sumXX += x * x;
+  }
+  const denom = n * sumXX - sumX * sumX;
+  if (denom === 0) return null; // all x identical — degenerate, no slope.
+  const slope = (n * sumXY - sumX * sumY) / denom;
+  const intercept = (sumY - slope * sumX) / n;
+  return { slope, intercept };
+}
+
+/**
+ * Attach a straight trend line to a scatter series. Recharts draws
+ * `<Scatter>` + `<Line>` from the SAME per-index `data` array (this is
+ * Recharts' own documented "Scatter and Line of Best Fit" pattern) — the
+ * trend line only needs its `fit` value defined on the first/last points;
+ * `<Line connectNulls>` draws one straight segment between them, ignoring
+ * the `undefined` `fit` on every point in between.
+ */
+export function withFitLine(points: { timeSec: number; value: number }[]): ScatterPoint[] {
+  if (points.length === 0) return [];
+  const reg = linearRegression(points.map((p) => ({ x: p.timeSec, y: p.value })));
+  const out: ScatterPoint[] = points.map((p) => ({ timeSec: p.timeSec, value: p.value }));
+  if (reg) {
+    out[0].fit = reg.intercept + reg.slope * out[0].timeSec;
+    out[out.length - 1].fit = reg.intercept + reg.slope * out[out.length - 1].timeSec;
+  }
+  return out;
+}
+
+/**
+ * Raw per-record scatter points for a metric that genuinely has one value
+ * per record (latency, fragmentation) — no binning/aggregation.
+ * `originTimestamp` pins the x-axis origin across renders so a record's
+ * `timeSec` never shifts as `useTelemetry`'s ring buffer trims older
+ * records — see `PerfTraceView`'s `originRef` for where this comes from.
+ */
+export function computeRawPoints(
+  records: TelemetryRecord[],
+  originTimestamp: number | undefined,
+  valueOf: (r: TelemetryRecord) => number,
+): { timeSec: number; value: number }[] {
   if (records.length === 0) return [];
+  const unit = detectTimestampUnit(records);
+  const origin = originTimestamp ?? records[0].timestamp;
+  const startSec = origin / unit;
+  return records.map((r) => ({
+    timeSec: Math.max(0, r.timestamp / unit - startSec),
+    value: valueOf(r),
+  }));
+}
 
-  const start = Math.max(0, records.length - WINDOW_SIZE);
-  const window = records.slice(start);
+/**
+ * Windowed ops/sec points — see `THROUGHPUT_WINDOW_SEC` for why throughput
+ * can't be a raw per-record scatter. Emits a zero-throughput point for
+ * every empty window too (not just non-empty ones) so idle gaps show as
+ * a real 0, matching the other two charts' "every record counted" feel,
+ * and so the trend line isn't biased by silently skipping idle stretches.
+ */
+export function computeThroughputPoints(
+  records: TelemetryRecord[],
+  originTimestamp: number | undefined,
+): { timeSec: number; value: number }[] {
+  if (records.length === 0) return [];
+  const unit = detectTimestampUnit(records);
+  const origin = originTimestamp ?? records[0].timestamp;
+  const startSec = origin / unit;
 
-  const firstTs = window[0].timestamp;
-  const looksLikeNs = firstTs > 1e12;
-
-  const points: PerfDataPoint[] = new Array(window.length);
-
-  let meanDeltaMs = 0;
-  if (window.length >= 2) {
-    let sumDelta = 0;
-    for (let i = 1; i < window.length; i++) {
-      let delta = window[i].timestamp - window[i - 1].timestamp;
-      if (looksLikeNs) delta = delta / 1e6;
-      sumDelta += delta;
-    }
-    meanDeltaMs = sumDelta / (window.length - 1);
+  const counts = new Map<number, number>();
+  let maxWIdx = 0;
+  for (const r of records) {
+    const recSec = Math.max(0, r.timestamp / unit - startSec);
+    const wIdx = Math.floor(recSec / THROUGHPUT_WINDOW_SEC);
+    counts.set(wIdx, (counts.get(wIdx) ?? 0) + 1);
+    if (wIdx > maxWIdx) maxWIdx = wIdx;
   }
-  const throughput = meanDeltaMs > 0 ? 1000 / meanDeltaMs : 0;
 
-  const latPrefix: number[] = [];
-  for (let i = 0; i < window.length; i++) {
-    latPrefix.push(window[i].latency_ns);
-    const sorted = latPrefix.slice().sort((a, b) => a - b);
-    points[i] = {
-      index: i,
-      p50: percentile(sorted, 50),
-      p90: percentile(sorted, 90),
-      p99: percentile(sorted, 99),
-      throughput,
-    };
+  const points: { timeSec: number; value: number }[] = [];
+  for (let idx = 0; idx <= maxWIdx; idx++) {
+    points.push({
+      timeSec: idx * THROUGHPUT_WINDOW_SEC,
+      value: (counts.get(idx) ?? 0) / THROUGHPUT_WINDOW_SEC,
+    });
   }
-
   return points;
 }
 
@@ -98,116 +178,177 @@ function EmptyState({ label }: { label: string }): JSX.Element {
       data-testid={`perf-empty-${label.toLowerCase().replace(/\s+/g, '-')}`}
     >
       {label}
- </div>
+    </div>
   );
 }
 
-function LatencyChart({ data }: { data: PerfDataPoint[] }): JSX.Element {
+/**
+ * Shared scatter-plus-line-of-best-fit chart. The x-axis domain is
+ * `[0, 'dataMax']` — an *expanding* domain that grows as more records
+ * arrive, rather than a fixed-width window that slides and scrolls old
+ * points off-screen.
+ */
+function ScatterFitChart({
+  data,
+  color,
+  yDomain,
+  yTickFormatter,
+  valueSuffix,
+}: {
+  data: ScatterPoint[];
+  color: string;
+  yDomain?: [number | string, number | string];
+  yTickFormatter?: (v: number) => string;
+  valueSuffix: string;
+}): JSX.Element {
   return (
-   <div className="h-full w-full p-2">
+    <div className="h-full w-full p-2">
       {data.length === 0 ? (
         <EmptyState label="AWAITING TELEMETRY..." />
       ) : (
         <ResponsiveContainer width="100%" height="100%">
-          <LineChart data={data} margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
+          <ComposedChart data={data} margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
             <CartesianGrid strokeDasharray="3 3" stroke={INK_FAINT} />
-            <XAxis dataKey="index" stroke={INK_MUTED} fontSize={10} tick={{ fill: INK_MUTED }} />
-            <YAxis
+            <XAxis
+              dataKey="timeSec"
               stroke={INK_MUTED}
               fontSize={10}
               tick={{ fill: INK_MUTED }}
-              domain={([dataMin, dataMax]: [number, number]) => [
-                Math.max(0, Math.floor(dataMin * 0.9)),
-                Math.ceil(dataMax * 1.1),
-              ]}
-              allowDataOverflow={false}
-            />
-            <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={{ color: INK_MUTED }} />
-            <Line type="monotone" dataKey="p50" stroke={INK} strokeWidth={2} dot={false} name="P50" />
-            <Line
-              type="monotone"
-              dataKey="p90"
-              stroke={INK_MUTED}
-              strokeWidth={1}
-              strokeDasharray="4 4"
-              dot={false}
-              name="P90"
-            />
-            <Line type="monotone" dataKey="p99" stroke={HEAT} strokeWidth={2} dot={false} name="P99" />
-         </LineChart>
-       </ResponsiveContainer>
-     )}
-   </div>
-  );
-}
-
-function ThroughputChart({ data }: { data: PerfDataPoint[] }): JSX.Element {
-  return (
-   <div className="h-full w-full p-2">
-      {data.length === 0 ? (
-        <EmptyState label="AWAITING TELEMETRY..." />
-      ) : (
-        <ResponsiveContainer width="100%" height="100%">
-          <LineChart data={data} margin={{ top: 10, right: 20, left: 0, bottom: 5 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke={INK_FAINT} />
-            <XAxis dataKey="index" stroke={INK_MUTED} fontSize={10} tick={{ fill: INK_MUTED }} />
-            <YAxis
-              stroke={INK_MUTED}
-              fontSize={10}
-              tick={{ fill: INK_MUTED }}
-              domain={([_dataMin, dataMax]: [number, number]) => [0, Math.ceil(dataMax * 1.1)]}
-              allowDataOverflow={false}
-              tickFormatter={(v: number) => {
-                if (v >= 1e6) return `${(v / 1e6).toFixed(1)}Mops/s`;
-                if (v >= 1e3) return `${(v / 1e3).toFixed(1)}Kops/s`;
-                return `${v.toFixed(0)}ops/s`;
+              type="number"
+              domain={[0, 'dataMax']}
+              label={{
+                value: 'Time (s)',
+                position: 'insideBottom',
+                offset: -2,
+                fill: INK_MUTED,
+                fontSize: 10,
               }}
+              tickFormatter={(v: number) => v.toFixed(1)}
+            />
+            <YAxis
+              stroke={INK_MUTED}
+              fontSize={10}
+              tick={{ fill: INK_MUTED }}
+              domain={yDomain ?? [0, 'dataMax']}
+              tickFormatter={yTickFormatter}
             />
             <Tooltip
               contentStyle={TOOLTIP_STYLE}
               labelStyle={{ color: INK_MUTED }}
-              formatter={(v: number) => `${v.toFixed(0)} ops/s`}
+              formatter={(v: number) =>
+                yTickFormatter ? yTickFormatter(v) : `${v.toFixed(2)}${valueSuffix}`
+              }
+              labelFormatter={(label: number) => `${label.toFixed(2)}s`}
+            />
+            <Scatter
+              dataKey="value"
+              fill={color}
+              fillOpacity={0.5}
+              isAnimationActive={false}
+              name="value"
             />
             <Line
-              type="monotone"
-              dataKey="throughput"
-              stroke={HEAT}
+              dataKey="fit"
+              stroke={color}
               strokeWidth={2}
               dot={false}
-              name="OPS/SEC"
+              activeDot={false}
+              connectNulls
+              isAnimationActive={false}
+              legendType="none"
+              name="trend"
             />
-         </LineChart>
-       </ResponsiveContainer>
-     )}
-   </div>
+          </ComposedChart>
+        </ResponsiveContainer>
+      )}
+    </div>
   );
 }
 
 export function PerfTraceView({ records }: { records: TelemetryRecord[] }): JSX.Element {
-  const data = useMemo<PerfDataPoint[]>(() => computePerfPoints(records), [records]);
+  // Pins the origin timestamp for the current run so points never rebase
+  // to a shifting `records[0]` (the "graph rewinds instead of appends"
+  // bug). Resets when `records` is cleared (a new run, or the CLEAR
+  // button).
+  const originRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (records.length === 0) {
+      originRef.current = null;
+    } else if (originRef.current === null) {
+      originRef.current = records[0].timestamp;
+    }
+  }, [records]);
+
+  const latencyData = useMemo(
+    () =>
+      withFitLine(
+        computeRawPoints(records, originRef.current ?? undefined, (r) => r.latency_ns),
+      ),
+    [records],
+  );
+  const throughputData = useMemo(
+    () => withFitLine(computeThroughputPoints(records, originRef.current ?? undefined)),
+    [records],
+  );
+  const fragmentationData = useMemo(
+    () =>
+      withFitLine(
+        computeRawPoints(records, originRef.current ?? undefined, (r) => r.fragmentation_pct),
+      ),
+    [records],
+  );
+
 
   return (
     <div
-     className="h-full w-full bg-canvas text-ink font-mono flex flex-row overflow-hidden"
+      className="h-full w-full bg-canvas text-ink font-mono flex flex-row overflow-hidden"
       data-testid="perf-trace-view"
     >
-     <div className="flex-1 flex flex-col border-r border-ink-faint min-w-0">
-       <div className="px-3 py-1.5 border-b border-ink-faint text-[10px] tracking-widest text-ink-muted flex items-center justify-between">
-         <span>LATENCY P50/P90/P99</span>
-         <span className="text-ink">{data.length.toString().padStart(5, '0')} PT</span>
-       </div>
-       <div className="flex-1 min-h-0 overflow-hidden">
-         <LatencyChart data={data} />
-       </div>
-     </div>
-     <div className="flex-1 flex flex-col min-w-0">
-       <div className="px-3 py-1.5 border-b border-ink-faint text-[10px] tracking-widest text-ink-muted">
-         THROUGHPUT (OPS/SEC)
-       </div>
-       <div className="flex-1 min-h-0 overflow-hidden">
-         <ThroughputChart data={data} />
-       </div>
-     </div>
-   </div>
- );
+      {/* Latency */}
+      <div className="flex-1 flex flex-col border-r border-ink-faint min-w-0">
+        <div className="px-3 py-1.5 border-b border-ink-faint text-[10px] tracking-widest text-ink-muted flex items-center justify-between">
+          <span>LATENCY (ns)</span>
+          <span className="text-ink">{latencyData.length.toString().padStart(5, '0')} PT</span>
+        </div>
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <ScatterFitChart data={latencyData} color={INK} valueSuffix="ns" />
+        </div>
+      </div>
+      {/* Throughput */}
+      <div className="flex-1 flex flex-col border-r border-ink-faint min-w-0">
+        <div className="px-3 py-1.5 border-b border-ink-faint text-[10px] tracking-widest text-ink-muted flex items-center justify-between">
+          <span>THROUGHPUT (OPS/SEC)</span>
+          <span className="text-ink">{throughputData.length.toString().padStart(5, '0')} PT</span>
+        </div>
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <ScatterFitChart
+            data={throughputData}
+            color={HEAT}
+            valueSuffix="ops/s"
+            yTickFormatter={(v: number) => {
+              if (v >= 1e6) return `${(v / 1e6).toFixed(1)}Mops/s`;
+              if (v >= 1e3) return `${(v / 1e3).toFixed(1)}Kops/s`;
+              return `${v.toFixed(0)}ops/s`;
+            }}
+          />
+        </div>
+      </div>
+      {/* Fragmentation */}
+      <div className="flex-1 flex flex-col min-w-0">
+        <div className="px-3 py-1.5 border-b border-ink-faint text-[10px] tracking-widest text-ink-muted flex items-center justify-between">
+          <span>FRAGMENTATION (%)</span>
+          <span className="text-ink">{fragmentationData.length.toString().padStart(5, '0')} PT</span>
+        </div>
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <ScatterFitChart
+            data={fragmentationData}
+            color={HEAT}
+            valueSuffix="%"
+            yDomain={[0, 100]}
+            yTickFormatter={(v: number) => `${v.toFixed(0)}%`}
+          />
+        </div>
+      </div>
+    </div>
+  );
 }

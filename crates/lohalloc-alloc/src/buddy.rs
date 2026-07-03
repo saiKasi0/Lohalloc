@@ -285,13 +285,17 @@ impl Drop for Buddy {
 // ---- free functions --------------------------------------------------------
 
 /// Size of a block at `order` (bytes).
-fn block_size(order: usize) -> usize {
+///
+/// `pub(crate)` so `lib.rs` can compute internal-fragmentation percentages
+/// (actual block size vs. requested size) without touching `Buddy`'s
+/// internal free-list state — see `fragmentation_pct_for`.
+pub(crate) fn block_size(order: usize) -> usize {
     MIN_BLOCK << order
 }
 
 /// Order needed to satisfy a request of `size` bytes (ceil to power of two,
 /// clamp to `MAX_ORDER`).
-fn order_for(size: usize) -> Option<usize> {
+pub(crate) fn order_for(size: usize) -> Option<usize> {
     if size == 0 || size > lohalloc_core::BUDDY_MAX {
         return None;
     }
