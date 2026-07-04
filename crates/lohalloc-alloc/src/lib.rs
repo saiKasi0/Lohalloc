@@ -40,6 +40,7 @@ pub mod arena;
 pub mod bandit;
 pub mod buddy;
 mod clock;
+mod magazine;
 #[cfg(feature = "telemetry-observer")]
 pub mod observer;
 pub mod perfect_hash;
@@ -86,7 +87,15 @@ struct Header {
     /// without needing a `Layout` — required for `free(ptr)`, which only
     /// ever receives the pointer.
     align_log2: u8,
-    _pad: [u8; 5],
+    /// For `Backend::Slab` allocations: the slab size-class index of the
+    /// underlying block, so the free path (and the magazine push) never
+    /// recomputes it. Note this is the class of the *total* (request +
+    /// header padding), which can differ from `size_class_hint` (computed
+    /// from the pre-padding request size — e.g. a 250-byte request has
+    /// hint 5/256 but a 298-byte total in class 6/512).
+    /// [`SIZE_CLASS_UNTRACKED`] for every non-Slab backend.
+    slab_class: u8,
+    _pad: [u8; 4],
     /// Size passed to the backend's `alloc` (the *total* including this
     /// header's padding). Slab/Buddy use it to compute the free-list/ order on
     /// dealloc. System ignores it (uses `base`/`map_len`).
@@ -219,6 +228,35 @@ pub struct Lohalloc {
     /// `freeze()`/`load()` (which already touch the state lock) — a single
     /// relaxed atomic load costs far less than a `Mutex` lock/unlock pair.
     frozen: AtomicBool,
+    /// Retention cache for large System-backend mappings (see
+    /// `system::SystemCache`): freed 1 MiB+ mappings are kept populated and
+    /// reused instead of munmap'd, matching (and beating) glibc's
+    /// large-chunk retention on the 2-8 MiB workload.
+    ///
+    /// Guarded by `system_cache_lock` (a CAS try-lock), NOT a
+    /// `std::sync::Mutex` — deliberately. This cache sits on the
+    /// re-entrancy-bypass path, and on macOS a std Mutex's *first lock
+    /// lazily `Box::new`s its pthread mutex* (i.e. locking allocates). A
+    /// Mutex here recursed: first lock → Box::new → our malloc → bypass →
+    /// lock again (OnceBox still initializing) → Box::new → … → stack
+    /// overflow (reproduced as a SIGSEGV in the cabi test harness). Every
+    /// other backend Mutex survives its own first-lock allocation only
+    /// because the bypass path it recurses into is Mutex-free — a
+    /// load-bearing property this field must not break.
+    system_cache: core::cell::UnsafeCell<system::SystemCache>,
+    /// CAS guard for `system_cache`: allocation-free, non-blocking. On
+    /// contention or re-entry the caller simply skips the cache (correct:
+    /// it's a best-effort retention layer over plain mmap/munmap).
+    system_cache_lock: AtomicBool,
+    /// Count of System allocations served from the retention cache
+    /// (testability/introspection).
+    system_cache_hits: AtomicU64,
+    /// Unique id for the per-thread magazine layer (see `magazine.rs`'s
+    /// ownership doc): 0 = unassigned, lazily claimed from a process-wide
+    /// monotonic counter on first slab use. Ids are never reused, so a
+    /// thread's magazine can always tell "my instance's blocks" from a
+    /// previous instance's (whose regions may already be unmapped).
+    magazine_id: AtomicU64,
     /// Lock-free copy of the frozen `PerfectHashTable`, published by
     /// `freeze()`/`load()` (null while in Training mode). The Inference
     /// alloc fast path loads this pointer instead of taking the `state`
@@ -256,7 +294,60 @@ impl Lohalloc {
             // Decision Engine starts in Training mode.
             state: Mutex::new(state::AllocatorState::new_training_const()),
             frozen: AtomicBool::new(false),
+            system_cache: core::cell::UnsafeCell::new(system::SystemCache::new()),
+            system_cache_lock: AtomicBool::new(false),
+            system_cache_hits: AtomicU64::new(0),
+            magazine_id: AtomicU64::new(0),
             frozen_table: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+
+    /// Number of System allocations served from the mapping retention
+    /// cache since this instance was created.
+    pub fn system_cache_hits(&self) -> u64 {
+        self.system_cache_hits.load(Ordering::Relaxed)
+    }
+
+    /// Run `f` with exclusive access to the system mapping cache, WITHOUT
+    /// ever allocating or blocking: a CAS try-lock. Returns `None` if the
+    /// lock is currently held (another thread, or a re-entrant call on
+    /// this thread) — callers treat that as a cache miss/decline and fall
+    /// through to plain mmap/munmap, which is always correct.
+    fn with_system_cache<R>(&self, f: impl FnOnce(&mut system::SystemCache) -> R) -> Option<R> {
+        if self
+            .system_cache_lock
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        // SAFETY: the CAS above grants exclusive access until the store
+        // below; `f` cannot re-enter this cache (a re-entrant attempt
+        // fails the CAS and skips it).
+        let result = f(unsafe { &mut *self.system_cache.get() });
+        self.system_cache_lock.store(false, Ordering::Release);
+        Some(result)
+    }
+
+    /// This instance's magazine owner id, claimed lazily (never 0, never
+    /// reused across instances).
+    #[inline]
+    fn magazine_owner(&self) -> u64 {
+        let id = self.magazine_id.load(Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+        // First use: claim a fresh id. Racing threads may both claim; the
+        // CAS loser adopts the winner's id, and the loser's id is simply
+        // skipped (the counter is monotonic, gaps are fine).
+        static NEXT_MAGAZINE_ID: AtomicU64 = AtomicU64::new(1);
+        let fresh = NEXT_MAGAZINE_ID.fetch_add(1, Ordering::Relaxed);
+        match self
+            .magazine_id
+            .compare_exchange(0, fresh, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => fresh,
+            Err(winner) => winner,
         }
     }
 }
@@ -336,9 +427,13 @@ unsafe impl GlobalAlloc for Lohalloc {
         let total = size + pad;
 
         // Capture the start time for latency measurement (only used when
-        // telemetry-observer feature is enabled; read in emit_alloc).
+        // telemetry-observer feature is enabled; read in emit_alloc). Gated
+        // on a sink actually being installed so the compiled-in-but-idle
+        // case costs one relaxed load, not a clock read per alloc.
         #[cfg(feature = "telemetry-observer")]
-        ALLOC_START_NS.set(observer::now_ns());
+        if observer::sink_installed() {
+            ALLOC_START_NS.set(observer::now_ns());
+        }
 
         // Re-entrancy guard: if we're already inside the allocator on this
         // thread (e.g. a backend's `Vec` growing), serve directly from mmap.
@@ -368,13 +463,29 @@ unsafe impl GlobalAlloc for Lohalloc {
             debug_assert!(false, "dealloc: bad header magic");
             return;
         }
+        unsafe { self.dealloc_with_header(ptr, header) };
+    }
+}
 
-        // Telemetry hook (compiled away when the feature is off). Emit the
-        // free record before routing so the GUI sees every deallocation,
-        // even those that will be silently dropped (e.g. Arena frees, which
-        // are no-ops here).
+impl Lohalloc {
+    /// The body of [`GlobalAlloc::dealloc`] after the header has been read
+    /// and its magic verified — split out so the C-ABI paths
+    /// ([`Self::try_dealloc_raw`], `lohalloc-cabi`'s `realloc`) can reuse
+    /// their *own* single header read instead of reading it again here
+    /// (the cabi `free` used to read the 48-byte header twice per call,
+    /// `realloc` three times).
+    ///
+    /// # Safety
+    /// `ptr` must be a live allocation produced by this allocator and
+    /// `header` the (magic-verified) header read from `ptr - HEADER_SIZE`.
+    unsafe fn dealloc_with_header(&self, ptr: *mut u8, header: Header) {
+        // Telemetry hook (compiled away when the feature is off; skipped
+        // with one relaxed load when no sink is installed). Emit the free
+        // record before routing so the GUI sees every deallocation, even
+        // those that will be silently dropped (e.g. Arena frees, which are
+        // no-ops here).
         #[cfg(feature = "telemetry-observer")]
-        {
+        if observer::sink_installed() {
             let frag = Backend::from_u8(header.backend)
                 .map(|b| fragmentation_pct_for(b, header.size))
                 .unwrap_or(0.0);
@@ -407,8 +518,33 @@ unsafe impl GlobalAlloc for Lohalloc {
         match Backend::from_u8(header.backend) {
             Some(Backend::Slab) => {
                 let block = ptr.sub(pad);
-                if let Ok(mut slab) = self.slab.lock() {
-                    unsafe { slab.dealloc(block, header.size) };
+                // Class comes straight from the header (written at alloc
+                // time) — no size-class recompute on the free path.
+                let class = header.slab_class as usize;
+                if header.slab_class == SIZE_CLASS_UNTRACKED
+                    || class >= lohalloc_core::SLAB_SIZE_CLASSES.len()
+                {
+                    // Defensive: a Slab-tagged header must carry a valid
+                    // class; fall back to the size-derived path.
+                    debug_assert!(false, "slab header without a valid class");
+                    if let Ok(mut slab) = self.slab.lock() {
+                        unsafe { slab.dealloc(block, header.size) };
+                    }
+                } else {
+                    let owner = self.magazine_owner();
+                    if !magazine::push(owner, class, block) {
+                        // Magazine full: flush half of it plus this block
+                        // back to the central slab in one locked batch.
+                        let mut buf = [core::ptr::null_mut::<u8>(); 16];
+                        let flush = magazine::refill_count(class).min(buf.len());
+                        let n = magazine::take(owner, class, &mut buf[..flush]);
+                        if let Ok(mut slab) = self.slab.lock() {
+                            unsafe {
+                                slab.dealloc_batch(class, &buf[..n]);
+                                slab.dealloc_class(block, class);
+                            }
+                        }
+                    }
                 }
             }
             Some(Backend::Buddy) => {
@@ -418,9 +554,16 @@ unsafe impl GlobalAlloc for Lohalloc {
                 }
             }
             Some(Backend::System) => {
-                // Release the exact mapping recorded at alloc time.
-                unsafe {
-                    libc::munmap(header.base as *mut core::ffi::c_void, header.map_len);
+                // Offer the mapping to the retention cache (populated pages
+                // stay resident for reuse); munmap if declined or the
+                // try-lock is contended.
+                let retained = self
+                    .with_system_cache(|c| c.put(header.base, header.map_len))
+                    .unwrap_or(false);
+                if !retained {
+                    unsafe {
+                        libc::munmap(header.base as *mut core::ffi::c_void, header.map_len);
+                    }
                 }
             }
             Some(Backend::Arena) => {
@@ -501,7 +644,9 @@ impl Lohalloc {
             if let Some(ptr) = self.try_backend(backend, total, align, pad, hash, size_class) {
                 return ptr;
             }
-            return self.route_by_size(total, align, pad, hash, size_class);
+            // Fallthrough remembers the failed backend so it's never
+            // re-locked/re-tried inside the size chain.
+            return self.route_by_size(total, align, pad, hash, size_class, Some(backend));
         }
 
         let (recommended, is_training) = if let Ok(mut st) = self.state.lock() {
@@ -519,7 +664,7 @@ impl Lohalloc {
                     return ptr;
                 }
             }
-            return self.route_by_size(total, align, pad, hash, size_class);
+            return self.route_by_size(total, align, pad, hash, size_class, recommended);
         }
 
         // Training: time the *actual* outcome (success, or failure +
@@ -529,8 +674,10 @@ impl Lohalloc {
         let ptr = match recommended {
             Some(backend) => self
                 .try_backend(backend, total, align, pad, hash, size_class)
-                .unwrap_or_else(|| self.route_by_size(total, align, pad, hash, size_class)),
-            None => self.route_by_size(total, align, pad, hash, size_class),
+                .unwrap_or_else(|| {
+                    self.route_by_size(total, align, pad, hash, size_class, Some(backend))
+                }),
+            None => self.route_by_size(total, align, pad, hash, size_class, None),
         };
         let latency_ns = clock::now_ns().saturating_sub(t0);
 
@@ -542,6 +689,34 @@ impl Lohalloc {
     }
 
     /// Attempt an allocation via a specific backend. Returns the user pointer
+    /// Serve a raw Slab block for `total` bytes via this thread's magazine
+    /// (no lock on a hit), falling back to one batched, locked visit to the
+    /// central slab on a miss (refills half a magazine + serves this op, so
+    /// the Mutex is amortized over `refill_count` operations).
+    fn slab_block_via_magazine(&self, total: usize) -> Option<*mut u8> {
+        let class = lohalloc_core::slab_class_for(total)?;
+        let owner = self.magazine_owner();
+        if let Some(block) = magazine::pop(owner, class) {
+            return Some(block);
+        }
+        // Magazine miss: batch-refill under the central lock.
+        let mut buf = [core::ptr::null_mut::<u8>(); 16]; // >= max refill_count
+        let want = magazine::refill_count(class).min(buf.len());
+        let n = {
+            let mut slab = self.slab.lock().ok()?;
+            slab.alloc_batch(class, &mut buf[..want])
+        };
+        if n == 0 {
+            return None;
+        }
+        for &p in buf.iter().take(n).skip(1) {
+            // The magazine was just empty, so the extras always fit.
+            let pushed = magazine::push(owner, class, p);
+            debug_assert!(pushed);
+        }
+        Some(buf[0])
+    }
+
     /// on success, `None` on failure (e.g. Arena full, Slab exhausted).
     fn try_backend(
         &self,
@@ -555,23 +730,19 @@ impl Lohalloc {
         let local_backend = Backend::from_core(backend);
         match backend {
             lohalloc_core::Backend::Slab if total <= SLAB_MAX => {
-                if let Ok(mut slab) = self.slab.lock() {
-                    slab.alloc(total).map(|block| {
-                        self.write_header(
-                            block,
-                            pad,
-                            local_backend,
-                            total,
-                            0,
-                            0,
-                            hash,
-                            size_class_hint,
-                            align,
-                        )
-                    })
-                } else {
-                    None
-                }
+                self.slab_block_via_magazine(total).map(|block| {
+                    self.write_header(
+                        block,
+                        pad,
+                        local_backend,
+                        total,
+                        0,
+                        0,
+                        hash,
+                        size_class_hint,
+                        align,
+                    )
+                })
             }
             lohalloc_core::Backend::Buddy if total <= BUDDY_MAX => {
                 if let Ok(mut buddy) = self.buddy.lock() {
@@ -634,6 +805,12 @@ impl Lohalloc {
     }
 
     /// Size-based fallback routing (Phase 1): Slab → Buddy → System.
+    ///
+    /// `skip` is the backend a recommendation-driven `try_backend` attempt
+    /// already failed with (if any): re-locking and re-trying a backend that
+    /// just failed is guaranteed wasted work, and before this parameter
+    /// existed a failed recommendation re-walked the whole chain including
+    /// the failed backend — measurable under the arena-exhaustion pathology.
     fn route_by_size(
         &self,
         total: usize,
@@ -641,28 +818,27 @@ impl Lohalloc {
         pad: usize,
         hash: u64,
         size_class_hint: u8,
+        skip: Option<lohalloc_core::Backend>,
     ) -> *mut u8 {
-        // 1. Slab: small, naturally-aligned requests.
-        if total <= SLAB_MAX {
-            if let Ok(mut slab) = self.slab.lock() {
-                if let Some(block) = slab.alloc(total) {
-                    return self.write_header(
-                        block,
-                        pad,
-                        Backend::Slab,
-                        total,
-                        0,
-                        0,
-                        hash,
-                        size_class_hint,
-                        align,
-                    );
-                }
+        // 1. Slab: small, naturally-aligned requests (magazine-first).
+        if total <= SLAB_MAX && skip != Some(lohalloc_core::Backend::Slab) {
+            if let Some(block) = self.slab_block_via_magazine(total) {
+                return self.write_header(
+                    block,
+                    pad,
+                    Backend::Slab,
+                    total,
+                    0,
+                    0,
+                    hash,
+                    size_class_hint,
+                    align,
+                );
             }
         }
 
         // 2. Buddy: medium, variable-size.
-        if total <= BUDDY_MAX {
+        if total <= BUDDY_MAX && skip != Some(lohalloc_core::Backend::Buddy) {
             if let Ok(mut buddy) = self.buddy.lock() {
                 if let Some(block) = buddy.alloc(total) {
                     return self.write_header(
@@ -695,6 +871,30 @@ impl Lohalloc {
         size_class_hint: u8,
     ) -> *mut u8 {
         let pad = header_pad(align);
+        let eff_align = align.max(system::page_size());
+
+        // Retention cache first: a previously-freed mapping of a fitting
+        // length is reused with its pages still populated — this is what
+        // lets the System backend match glibc's large-chunk retention
+        // instead of paying mmap + page faults + munmap per operation.
+        // (Try-lock semantics: contention/re-entry = miss = plain mmap.)
+        if let Some(Some((raw_base, raw_len))) = self.with_system_cache(|c| c.get(total, eff_align))
+        {
+            self.system_cache_hits.fetch_add(1, Ordering::Relaxed);
+            let block = system::align_up_addr(raw_base, eff_align) as *mut u8;
+            return self.write_header(
+                block,
+                pad,
+                Backend::System,
+                total,
+                raw_base,
+                raw_len,
+                hash,
+                size_class_hint,
+                align,
+            );
+        }
+
         let mapping = match system::alloc_pages(total, align) {
             Some(m) => m,
             None => return core::ptr::null_mut(),
@@ -737,12 +937,23 @@ impl Lohalloc {
     ) -> *mut u8 {
         let user = unsafe { block.add(pad) };
         let backend_tag = backend as u8;
+        // Slab blocks record their size-class index so the free path (and
+        // the magazine push) never recomputes it. One branchless clz here
+        // on the alloc side; non-Slab backends carry the untracked marker.
+        let slab_class = if matches!(backend, Backend::Slab) {
+            lohalloc_core::slab_class_for(total)
+                .map(|c| c as u8)
+                .unwrap_or(SIZE_CLASS_UNTRACKED)
+        } else {
+            SIZE_CLASS_UNTRACKED
+        };
         let header = Header {
             magic: MAGIC,
             backend: backend_tag,
             size_class_hint,
             align_log2: align.trailing_zeros() as u8,
-            _pad: [0; 5],
+            slab_class,
+            _pad: [0; 4],
             size: total,
             base,
             map_len,
@@ -752,12 +963,13 @@ impl Lohalloc {
             core::ptr::write_unaligned(user.sub(HEADER_SIZE) as *mut Header, header);
         }
 
-        // Telemetry hook (compiled away when the feature is off). This is
-        // the single chokepoint every successful allocation flows through,
-        // so we emit here rather than at each call site in `try_backend` /
+        // Telemetry hook (compiled away when the feature is off; skipped
+        // with one relaxed load when no sink is installed). This is the
+        // single chokepoint every successful allocation flows through, so
+        // we emit here rather than at each call site in `try_backend` /
         // `route_by_size` / `system_alloc_with_header`.
         #[cfg(feature = "telemetry-observer")]
-        {
+        if observer::sink_installed() {
             let frag = fragmentation_pct_for(backend, total);
             observer::emit_alloc(total, hash, user as u64, backend_tag, frag);
         }
@@ -1151,6 +1363,79 @@ impl Lohalloc {
         let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
         header.magic == MAGIC
     }
+
+    /// Fused `owns` + `dealloc_raw`: one header read decides ownership AND
+    /// routes the free. Returns `false` (doing nothing) for null or a
+    /// foreign pointer — the caller delegates to the real libc. The
+    /// separate `owns()` → `dealloc_raw()` sequence `lohalloc-cabi::free`
+    /// used to run read the same 48-byte header twice per call.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::owns`].
+    pub unsafe fn try_dealloc_raw(&self, ptr: *mut u8) -> bool {
+        if ptr.is_null() {
+            return false;
+        }
+        let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
+        if header.magic != MAGIC {
+            return false;
+        }
+        unsafe { self.dealloc_with_header(ptr, header) };
+        true
+    }
+
+    /// Fused `owns` + `usable_size`: one header read. `None` for null or a
+    /// foreign pointer (caller delegates to the real libc).
+    ///
+    /// # Safety
+    /// Same contract as [`Self::owns`].
+    pub unsafe fn try_usable_size(&self, ptr: *mut u8) -> Option<usize> {
+        if ptr.is_null() {
+            return None;
+        }
+        let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
+        if header.magic != MAGIC {
+            return None;
+        }
+        let pad = header_pad(1usize << header.align_log2);
+        Some(header.size.saturating_sub(pad))
+    }
+
+    /// Fused single-read `realloc` support for `lohalloc-cabi`: returns the
+    /// usable size AND a token to later free the old pointer without
+    /// re-reading its header. `None` for null/foreign pointers.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::owns`]; the returned closure-free "token"
+    /// is just the header copy — `ptr` must stay live until the paired
+    /// [`Self::dealloc_with_header_token`] call.
+    pub unsafe fn usable_size_for_realloc(&self, ptr: *mut u8) -> Option<(usize, ReallocToken)> {
+        if ptr.is_null() {
+            return None;
+        }
+        let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
+        if header.magic != MAGIC {
+            return None;
+        }
+        let pad = header_pad(1usize << header.align_log2);
+        let usable = header.size.saturating_sub(pad);
+        Some((usable, ReallocToken { header }))
+    }
+
+    /// Free `ptr` using the header captured by
+    /// [`Self::usable_size_for_realloc`] — zero additional header reads.
+    ///
+    /// # Safety
+    /// `ptr` must be the same live allocation the token was created from.
+    pub unsafe fn dealloc_with_header_token(&self, ptr: *mut u8, token: ReallocToken) {
+        unsafe { self.dealloc_with_header(ptr, token.header) };
+    }
+}
+
+/// Opaque header snapshot for the fused cabi `realloc` path — see
+/// [`Lohalloc::usable_size_for_realloc`].
+pub struct ReallocToken {
+    header: Header,
 }
 
 // ---------------------------------------------------------------------------
@@ -1216,6 +1501,195 @@ mod integration_tests {
             "published frozen table must drive routing"
         );
         unsafe { alloc.dealloc_with_hash(ptr, layout) };
+    }
+
+    #[test]
+    fn forced_arena_chains_then_falls_through_at_cap() {
+        // A frozen model routing a hot site to Arena used to degrade
+        // permanently once the single 1 MiB region filled (every alloc paid
+        // lock + fail + full re-route). With chaining, the arena grows to
+        // its cap and only then falls through — and the fallthrough must
+        // still serve correctly via the size chain.
+        let hash = 0xA4E4_0001u64;
+        let size = 4096usize;
+        let sc = state::size_class_for(size);
+        let key = state::combine_hash_size_class(hash, sc);
+        let table = perfect_hash::PerfectHashTable::from_entries(vec![(
+            key,
+            sc,
+            lohalloc_core::Backend::Arena,
+        )]);
+        let alloc = Lohalloc::new();
+        assert!(alloc.load(&table.serialize()));
+        let layout = Layout::from_size_align(size, 16).unwrap();
+
+        // ~66 MiB of requests: ~32 MiB lands in the chained arena (cap),
+        // the rest must fall through to Slab — every single one succeeds.
+        let mut ptrs = Vec::new();
+        for i in 0..16_000 {
+            let p = unsafe { alloc.alloc_with_hash(layout, hash) };
+            assert!(!p.is_null(), "alloc {i} must succeed");
+            ptrs.push(p);
+        }
+        assert_eq!(
+            unsafe { alloc.backend_for_ptr(ptrs[0]) },
+            Some(lohalloc_core::Backend::Arena),
+            "early allocs are arena-served"
+        );
+        let counters = alloc.backend_counters();
+        assert!(
+            counters.arena_capacity > 1 << 20,
+            "arena must have chained past one chunk (capacity = {})",
+            counters.arena_capacity
+        );
+        assert_eq!(
+            unsafe { alloc.backend_for_ptr(*ptrs.last().unwrap()) },
+            Some(lohalloc_core::Backend::Slab),
+            "post-cap allocs fall through to the size chain"
+        );
+        for p in ptrs {
+            unsafe { alloc.dealloc_with_hash(p, layout) };
+        }
+    }
+
+    #[test]
+    fn system_cache_reuses_mapping() {
+        // Same-size large alloc → free → alloc must be served from the
+        // retention cache: hit counter increments and the same mapping
+        // (identical pointer) comes back.
+        let alloc = Lohalloc::new();
+        let layout = Layout::from_size_align(2 << 20, 16).unwrap(); // 2 MiB
+
+        let p1 = unsafe { alloc.alloc(layout) };
+        assert!(!p1.is_null());
+        assert_eq!(alloc.system_cache_hits(), 0);
+        unsafe { alloc.dealloc(p1, layout) };
+
+        let p2 = unsafe { alloc.alloc(layout) };
+        assert!(!p2.is_null());
+        assert_eq!(
+            alloc.system_cache_hits(),
+            1,
+            "second alloc must hit the cache"
+        );
+        assert_eq!(p1, p2, "cache hit must reuse the same mapping");
+        // Memory must be writable (pages still mapped).
+        unsafe { core::ptr::write_bytes(p2, 0xAB, 2 << 20) };
+        unsafe { alloc.dealloc(p2, layout) };
+    }
+
+    #[test]
+    fn system_cache_respects_byte_cap() {
+        // Freeing more large mappings than the 64 MiB retention cap must
+        // munmap the excess, never hoard unboundedly: verify by exercising
+        // 96 MiB of frees, then confirming reuse still works (the cache is
+        // functional) — retention bounds are asserted at the SystemCache
+        // unit level; here we just prove nothing corrupts at the cap.
+        let alloc = Lohalloc::new();
+        let layout = Layout::from_size_align(8 << 20, 16).unwrap(); // 8 MiB
+        let mut ptrs = Vec::new();
+        for _ in 0..12 {
+            let p = unsafe { alloc.alloc(layout) };
+            assert!(!p.is_null());
+            ptrs.push(p);
+        }
+        for p in ptrs {
+            unsafe { alloc.dealloc(p, layout) };
+        }
+        let p = unsafe { alloc.alloc(layout) };
+        assert!(!p.is_null());
+        assert!(alloc.system_cache_hits() >= 1);
+        unsafe { alloc.dealloc(p, layout) };
+    }
+
+    #[test]
+    fn system_cache_over_aligned_request_falls_through() {
+        // A cached page-aligned mapping can't serve a much stricter
+        // alignment unless it happens to fit — the fit check must reject
+        // rather than hand out a misaligned block.
+        let alloc = Lohalloc::new();
+        let plain = Layout::from_size_align(2 << 20, 16).unwrap();
+        let p1 = unsafe { alloc.alloc(plain) };
+        unsafe { alloc.dealloc(p1, plain) };
+
+        // 4 MiB alignment: the retained 2 MiB mapping can almost never
+        // satisfy align_up(base, 4MiB)+2MiB within its length; whether it
+        // falls through or (rarely) fits, the result must be aligned.
+        let strict = Layout::from_size_align(2 << 20, 4 << 20).unwrap();
+        let p2 = unsafe { alloc.alloc(strict) };
+        assert!(!p2.is_null());
+        assert_eq!(
+            (p2 as usize) % (4 << 20),
+            0,
+            "over-aligned request must return an aligned pointer"
+        );
+        unsafe { alloc.dealloc(p2, strict) };
+    }
+
+    #[test]
+    fn magazine_cross_thread_alloc_free_roundtrip() {
+        // Blocks allocated on one thread and freed on another must migrate
+        // cleanly (they land in the freeing thread's magazine or the
+        // central slab) — and remain reusable afterwards.
+        use std::sync::mpsc;
+        use std::sync::Arc;
+
+        let alloc = Arc::new(Lohalloc::new());
+        let layout = Layout::from_size_align(200, 16).unwrap();
+        let (tx, rx) = mpsc::channel::<usize>();
+
+        let producer = {
+            let a = Arc::clone(&alloc);
+            std::thread::spawn(move || {
+                for _ in 0..5_000 {
+                    let p = unsafe { a.alloc(layout) };
+                    assert!(!p.is_null());
+                    tx.send(p as usize).unwrap();
+                }
+            })
+        };
+        let consumer = {
+            let a = Arc::clone(&alloc);
+            std::thread::spawn(move || {
+                for addr in rx {
+                    unsafe { a.dealloc(addr as *mut u8, layout) };
+                }
+            })
+        };
+        producer.join().unwrap();
+        consumer.join().unwrap();
+
+        // The allocator must still serve correctly after heavy migration.
+        for _ in 0..1_000 {
+            let p = unsafe { alloc.alloc(layout) };
+            assert!(!p.is_null());
+            unsafe { alloc.dealloc(p, layout) };
+        }
+    }
+
+    #[test]
+    fn magazine_churn_keeps_slab_regions_bounded() {
+        // Alloc/free churn through the magazine layer must recycle blocks —
+        // the central slab's region count stays flat instead of growing.
+        let alloc = Lohalloc::new();
+        let layout = Layout::from_size_align(200, 16).unwrap();
+        let mut live = Vec::new();
+        for _round in 0..500 {
+            for _ in 0..64 {
+                let p = unsafe { alloc.alloc(layout) };
+                assert!(!p.is_null());
+                live.push(p);
+            }
+            for p in live.drain(..) {
+                unsafe { alloc.dealloc(p, layout) };
+            }
+        }
+        let counters = alloc.backend_counters();
+        assert!(
+            counters.slab_region_count < 8,
+            "slab regions must stay bounded under magazine churn, got {}",
+            counters.slab_region_count
+        );
     }
 
     #[test]

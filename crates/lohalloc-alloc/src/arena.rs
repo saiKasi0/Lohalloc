@@ -1,12 +1,32 @@
 //! Bump Arena sub-allocator — dense topological clusters.
 //!
-//! A bump-pointer allocator backed by a single `mmap` region. Allocations
-//! advance a cursor forward, aligned to `max(align, MIN_ALIGN)`. There is no
-//! per-allocation `free`; memory is reclaimed via [`BumpArena::reset`], which
-//! moves the cursor back to the arena base. This is the "reset-based reclaim"
-//! model from the v3 spec: the Decision Engine (Phase 3) routes entire
-//! topological clusters (temporary, bulk allocations with a shared lifetime)
-//! to a Bump Arena and resets it when the cluster is done.
+//! A bump-pointer allocator backed by a **chain** of `mmap` chunks.
+//! Allocations advance a cursor forward within the current chunk, aligned to
+//! `max(align, MIN_ALIGN)`; when the chunk fills, the arena advances to the
+//! next chunk in the chain (recycling one rewound by `reset`, or mapping a
+//! fresh one) up to [`MAX_CHUNKS`]. There is no per-allocation `free`; memory
+//! is reclaimed via [`BumpArena::reset`], which rewinds every chunk's cursor.
+//! This is the "reset-based reclaim" model from the v3 spec: the Decision
+//! Engine (Phase 3) routes entire topological clusters (temporary, bulk
+//! allocations with a shared lifetime) to a Bump Arena and resets it when the
+//! cluster is done.
+//!
+//! # Why chaining (and why a cap)
+//!
+//! The original arena was a single fixed 1 MiB region that returned `None`
+//! forever once full. Under a frozen (Inference) routing model that maps a
+//! hot call site to Arena, that meant **every** subsequent allocation at that
+//! site paid lock + failed-attempt + full size-chain re-route — a permanent
+//! per-op penalty measured as a prime contributor to the adversarial-mixed
+//! benchmark's 6-10× gap. Chaining keeps the bump fast path intact while
+//! letting the arena grow; the [`MAX_CHUNKS`] cap (32 MiB total) bounds
+//! memory for workloads that never reset, after which allocation falls back
+//! to the size-based chain exactly as before.
+//!
+//! Chunks are mapped aligned to their (power-of-two-rounded) size, so the
+//! default 1 MiB chunks are 1 MiB-aligned — `ptr & !(CHUNK - 1)` recovers a
+//! chunk base, which keeps the door open for per-chunk live-count recycling
+//! later without another layout change.
 //!
 //! # Why no per-allocation free?
 //!
@@ -14,61 +34,115 @@
 //! pointer increment. Adding per-block free lists would destroy this
 //! property. Instead, the arena is reset wholesale. This works because
 //! topological clusters identified by the stack hash tend to have bursty,
-//! correlated lifetimes (e.g. all allocations within a single request handler).
+//! correlated lifetimes (e.g. all allocations within a single request
+//! handler). Dealloc for Arena-tagged blocks stays a no-op in `lib.rs`.
 
 use crate::system;
-use lohalloc_core::{align_up, MIN_ALIGN};
+use lohalloc_core::{align_up, round_up_pow2, MIN_ALIGN};
 
-/// Default arena size: 1 MiB. Large enough for most clusters, small enough
-/// that we don't waste too much memory if a cluster is small.
-const DEFAULT_ARENA_SIZE: usize = 1 << 20; // 1 MiB
+/// Default per-chunk size: 1 MiB. Large enough for most clusters, small
+/// enough that we don't waste too much memory if a cluster is small.
+const DEFAULT_CHUNK_SIZE: usize = 1 << 20; // 1 MiB
 
-/// A bump-pointer allocator backed by a single `mmap` region.
-///
-/// Allocations are O(1) — just a cursor increment. Deallocation is a no-op;
-/// memory is reclaimed via [`reset`](Self::reset).
-pub struct BumpArena {
-    /// The backing mmap region. Kept alive for the arena's lifetime so the
-    /// memory stays mapped. Never directly read — its `Drop` releases the
-    /// mapping when the arena is dropped.
+/// Maximum number of chained chunks (32 × 1 MiB = 32 MiB by default). At the
+/// cap, `alloc` returns `None` and the caller falls through to size-based
+/// routing — the pre-chaining behavior, just 32× later.
+const MAX_CHUNKS: usize = 32;
+
+/// One mmap-backed bump chunk.
+struct Chunk {
+    /// The backing mapping. Kept alive so the memory stays mapped; its
+    /// `Drop` releases the mapping when the arena is dropped.
     #[allow(dead_code)]
     mapping: system::Mapping,
-    /// The base address of the arena (aligned start).
+    /// Aligned start of the chunk.
     base: *mut u8,
-    /// Total usable capacity from `base`.
+    /// Usable bytes from `base`.
     capacity: usize,
-    /// Current cursor (next free byte). Always >= `base` and <= `base + capacity`.
+    /// Next free byte. `base <= cursor <= base + capacity`.
     cursor: usize,
+}
+
+unsafe impl Send for Chunk {}
+
+impl Chunk {
+    fn new(size: usize) -> Option<Self> {
+        // Align the mapping to the pow2-rounded chunk size (>= page) so the
+        // default 1 MiB chunks are 1 MiB-aligned (see module doc).
+        let align = round_up_pow2(size).max(system::page_size()).max(MIN_ALIGN);
+        let mapping = system::alloc_pages(size, align)?;
+        let base = mapping.as_ptr();
+        // Clamp to the requested size: over-aligned mappings report up to
+        // ~2× `size` usable (alloc_pages over-maps then trims the pointer,
+        // not the tail), which would silently double the MAX_CHUNKS byte
+        // cap. The clamp keeps "32 chunks × 1 MiB" meaning exactly 32 MiB.
+        let capacity = mapping.usable().min(size);
+        Some(Self {
+            mapping,
+            base,
+            capacity,
+            cursor: base as usize,
+        })
+    }
+
+    fn alloc(&mut self, size: usize, align: usize) -> Option<*mut u8> {
+        let aligned = align_up(self.cursor, align);
+        if aligned.checked_add(size)? > (self.base as usize) + self.capacity {
+            return None;
+        }
+        self.cursor = aligned + size;
+        Some(aligned as *mut u8)
+    }
+
+    fn used(&self) -> usize {
+        self.cursor - self.base as usize
+    }
+}
+
+/// A bump-pointer allocator backed by a chain of `mmap` chunks.
+///
+/// Allocations are O(1) — a cursor increment, with an amortized chunk
+/// advance. Deallocation is a no-op; memory is reclaimed via
+/// [`reset`](Self::reset).
+pub struct BumpArena {
+    /// All mapped chunks. `chunks[current]` is the one being bumped; chunks
+    /// before it are full (until `reset` rewinds everything). The Vec only
+    /// grows (≤ `MAX_CHUNKS` entries); its own heap growth is served through
+    /// the caller's re-entrancy bypass when this arena lives inside the
+    /// process's global allocator.
+    chunks: Vec<Chunk>,
+    /// Index of the chunk currently being bumped.
+    current: usize,
+    /// Size for newly mapped chunks (`DEFAULT_CHUNK_SIZE` unless constructed
+    /// via `with_capacity`, which tests use to exercise the cap cheaply).
+    chunk_size: usize,
 }
 
 unsafe impl Send for BumpArena {}
 
 impl BumpArena {
-    /// Create a new arena with the default capacity (1 MiB).
+    /// Create a new arena with the default chunk size (1 MiB).
     pub fn new() -> Option<Self> {
-        Self::with_capacity(DEFAULT_ARENA_SIZE)
+        Self::with_capacity(DEFAULT_CHUNK_SIZE)
     }
 
-    /// Create a new arena with `capacity` bytes. The actual mapping is
-    /// rounded up to a whole number of pages and aligned to at least
-    /// `MIN_ALIGN`.
-    pub fn with_capacity(capacity: usize) -> Option<Self> {
-        let align = MIN_ALIGN.max(system::page_size());
-        let mapping = system::alloc_pages(capacity, align)?;
-        let base = mapping.as_ptr();
-        let usable = mapping.usable();
+    /// Create a new arena whose chunks are `chunk_size` bytes (rounded up to
+    /// whole pages). The first chunk is mapped eagerly.
+    pub fn with_capacity(chunk_size: usize) -> Option<Self> {
+        let first = Chunk::new(chunk_size)?;
+        let mut chunks = Vec::with_capacity(MAX_CHUNKS);
+        chunks.push(first);
         Some(Self {
-            mapping,
-            base,
-            capacity: usable,
-            cursor: base as usize,
+            chunks,
+            current: 0,
+            chunk_size,
         })
     }
 
     /// Allocate `size` bytes aligned to at least `max(align, MIN_ALIGN)`.
     ///
-    /// Returns a pointer to the allocated block, or `None` if the arena is
-    /// full.
+    /// Returns `None` only when `size` can never fit in a chunk or the
+    /// [`MAX_CHUNKS`] cap is exhausted.
     ///
     /// # Safety contract for the caller
     /// The returned pointer is valid until `reset` is called. Reading/writing
@@ -77,39 +151,61 @@ impl BumpArena {
         if size == 0 {
             return None;
         }
-
         let align = align.max(MIN_ALIGN);
-        let current = self.cursor;
-        let aligned = align_up(current, align);
 
-        // Check for overflow / arena full.
-        if aligned.checked_add(size)? > (self.base as usize) + self.capacity {
+        // Fast path: bump the current chunk.
+        if let Some(p) = self.chunks[self.current].alloc(size, align) {
+            return Some(p);
+        }
+
+        // A request that can't fit even in an empty chunk must fail rather
+        // than chain fresh chunks forever.
+        if size.checked_add(align)? > self.chunks[self.current].capacity.max(self.chunk_size) {
             return None;
         }
 
-        self.cursor = aligned + size;
-        Some(aligned as *mut u8)
+        // Advance: reuse the next already-mapped chunk (rewound by `reset`)
+        // or map a new one below the cap.
+        loop {
+            if self.current + 1 < self.chunks.len() {
+                self.current += 1;
+            } else if self.chunks.len() < MAX_CHUNKS {
+                let chunk = Chunk::new(self.chunk_size)?;
+                self.chunks.push(chunk);
+                self.current += 1;
+            } else {
+                return None; // cap reached — caller falls through
+            }
+            if let Some(p) = self.chunks[self.current].alloc(size, align) {
+                return Some(p);
+            }
+        }
     }
 
-    /// Reset the arena: move the cursor back to the base. All prior
-    /// allocations are invalidated.
+    /// Reset the arena: rewind every chunk's cursor and start bumping from
+    /// the first chunk again. All prior allocations are invalidated. Chunks
+    /// stay mapped (recycled on the next fill cycle).
     pub fn reset(&mut self) {
-        self.cursor = self.base as usize;
+        for chunk in &mut self.chunks {
+            chunk.cursor = chunk.base as usize;
+        }
+        self.current = 0;
     }
 
-    /// Total usable capacity (bytes).
+    /// Total usable capacity across all currently mapped chunks (bytes).
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.chunks.iter().map(|c| c.capacity).sum()
     }
 
-    /// Bytes allocated since the last `reset`.
+    /// Bytes allocated since the last `reset`, across all chunks.
     pub fn used(&self) -> usize {
-        self.cursor - (self.base as usize)
+        self.chunks.iter().map(Chunk::used).sum()
     }
 
-    /// Bytes still available.
+    /// Bytes still available in mapped chunks (does not count unmapped
+    /// potential growth up to the cap).
     pub fn remaining(&self) -> usize {
-        self.capacity - self.used()
+        self.capacity() - self.used()
     }
 }
 
@@ -135,7 +231,7 @@ mod tests {
 
         // After reset, the next allocation should start from the base again.
         let p3 = arena.alloc(64, 16).expect("alloc after reset");
-        assert_eq!(p3 as usize, arena.base as usize);
+        assert_eq!(p3 as usize, arena.chunks[0].base as usize);
     }
 
     #[test]
@@ -146,26 +242,63 @@ mod tests {
     }
 
     #[test]
-    fn arena_full_returns_none() {
-        let mut arena = BumpArena::new().expect("arena");
-        // Fill the arena completely by allocating until it's full.
+    fn chains_past_one_chunk() {
+        // >1 chunk of total traffic must keep succeeding (the original
+        // single-region arena failed here forever). Derive the alloc count
+        // from the *actual* chunk capacity — `with_capacity(4096)` maps a
+        // whole page, which is 16 KiB on Apple Silicon (never assume 4 KiB).
+        let mut arena = BumpArena::with_capacity(4096).expect("arena");
+        let first_chunk_cap = arena.chunks[0].capacity;
+        let allocs = first_chunk_cap / 256 + 8; // guaranteed to spill over
+        for i in 0..allocs {
+            assert!(
+                arena.alloc(256, 16).is_some(),
+                "alloc {i}/{allocs} must succeed while below the cap"
+            );
+        }
+        assert!(arena.chunks.len() > 1, "expected multiple chunks");
+    }
+
+    #[test]
+    fn arena_full_returns_none_at_cap() {
+        // Small chunks so the MAX_CHUNKS cap is reachable quickly:
+        // 32 chunks × 4 KiB = 128 KiB total.
+        let mut arena = BumpArena::with_capacity(4096).expect("arena");
         let mut total = 0;
         while arena.alloc(256, 16).is_some() {
             total += 1;
-            // Safety valve: don't loop forever if something is wrong.
-            if total > 10000 {
+            if total > 10_000 {
                 break;
             }
         }
-        // Arena is now full; the next allocation should fail.
-        let p = arena.alloc(256, 16);
-        assert!(p.is_none(), "arena should be full after {} allocs", total);
-
-        // After reset, we should be able to allocate again.
-        arena.reset();
+        assert_eq!(
+            arena.chunks.len(),
+            MAX_CHUNKS,
+            "should have chained to the cap"
+        );
         assert!(
-            arena.alloc(256, 16).is_some(),
-            "arena should work after reset"
+            arena.alloc(256, 16).is_none(),
+            "cap reached after {total} allocs — further allocs must fail"
+        );
+
+        // Reset recycles every chunk: allocation works again without any
+        // new mapping.
+        let mapped = arena.chunks.len();
+        arena.reset();
+        assert_eq!(arena.used(), 0);
+        assert!(arena.alloc(256, 16).is_some(), "works after reset");
+        assert_eq!(arena.chunks.len(), mapped, "reset must not map chunks");
+    }
+
+    #[test]
+    fn oversized_request_fails_without_chaining() {
+        let mut arena = BumpArena::with_capacity(4096).expect("arena");
+        let before = arena.chunks.len();
+        assert!(arena.alloc(1 << 20, 16).is_none());
+        assert_eq!(
+            arena.chunks.len(),
+            before,
+            "an unservable request must not burn chunks"
         );
     }
 
@@ -200,5 +333,16 @@ mod tests {
         // Pointers should be monotonically increasing.
         assert!(p2 as usize > p1 as usize);
         assert!(p3 as usize > p2 as usize);
+    }
+
+    #[test]
+    fn default_chunks_are_chunk_aligned() {
+        // 1 MiB chunks must be 1 MiB-aligned so `ptr & !(1MiB-1)` recovers
+        // the chunk base (future live-count recycling relies on this).
+        let arena = BumpArena::new().expect("arena");
+        assert!(is_aligned(
+            arena.chunks[0].base as usize,
+            DEFAULT_CHUNK_SIZE
+        ));
     }
 }

@@ -134,7 +134,10 @@ fn adv_exhaust_forces_fallthrough_once_arena_full() {
     let harness = HarnessDriver { alloc };
     let recording = RecordingDriver::new(&harness, &harness.alloc);
 
-    let ptrs = workloads::workload_exhaust_no_free(&recording, hashes::W_ADV_EXHAUST, 8_000);
+    // The arena now CHAINS 1 MiB chunks up to a 32 MiB cap (it used to be a
+    // single 1 MiB region), so exhausting it takes > 32 MiB of live,
+    // never-freed traffic: 140_000 × (208B + 48B header) ≈ 36 MiB.
+    let ptrs = workloads::workload_exhaust_no_free(&recording, hashes::W_ADV_EXHAUST, 140_000);
 
     let arena_frac = recording.fraction_served_by(Backend::Arena);
     assert!(

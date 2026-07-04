@@ -303,14 +303,16 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
         return;
     }
     let p = ptr as *mut u8;
-    if unsafe { ALLOC.owns(p) } {
-        unsafe { ALLOC.dealloc_raw(p) };
-    } else if let Some(real_free) = libc_free() {
-        unsafe { real_free(ptr) };
+    // Fused ownership-check + free: one 48-byte header read instead of the
+    // two the separate `owns()` → `dealloc_raw()` sequence paid.
+    if !unsafe { ALLOC.try_dealloc_raw(p) } {
+        if let Some(real_free) = libc_free() {
+            unsafe { real_free(ptr) };
+        }
+        // No real `free` resolvable: leak rather than risk corrupting an
+        // allocator we don't understand (should not happen under a normal
+        // dynamic link).
     }
-    // No real `free` resolvable: leak rather than risk corrupting an
-    // allocator we don't understand (should not happen under a normal
-    // dynamic link).
 }
 
 /// # Safety
@@ -344,14 +346,16 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, new_size: usize) -> *mut c_vo
     }
 
     let p = ptr as *mut u8;
-    if !unsafe { ALLOC.owns(p) } {
+    // One header read serves the ownership check, the usable-size query,
+    // AND (via the token) the final free — this path used to read the same
+    // header three times.
+    let Some((old_usable, token)) = (unsafe { ALLOC.usable_size_for_realloc(p) }) else {
         return match libc_realloc() {
             Some(real_realloc) => unsafe { real_realloc(ptr, new_size) },
             None => core::ptr::null_mut(),
         };
-    }
+    };
 
-    let old_usable = unsafe { ALLOC.usable_size(p) };
     let new_ptr = unsafe { malloc(new_size) };
     if new_ptr.is_null() {
         return core::ptr::null_mut();
@@ -359,7 +363,7 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, new_size: usize) -> *mut c_vo
     let copy_len = old_usable.min(new_size);
     unsafe {
         core::ptr::copy_nonoverlapping(p, new_ptr as *mut u8, copy_len);
-        ALLOC.dealloc_raw(p);
+        ALLOC.dealloc_with_header_token(p, token);
     }
     new_ptr
 }
@@ -448,12 +452,12 @@ pub unsafe extern "C" fn malloc_usable_size(ptr: *mut c_void) -> usize {
         return 0;
     }
     let p = ptr as *mut u8;
-    if unsafe { ALLOC.owns(p) } {
-        unsafe { ALLOC.usable_size(p) }
-    } else {
-        libc_malloc_usable_size()
+    // Fused ownership-check + size query: one header read, not two.
+    match unsafe { ALLOC.try_usable_size(p) } {
+        Some(usable) => usable,
+        None => libc_malloc_usable_size()
             .map(|real| unsafe { real(ptr) })
-            .unwrap_or(0)
+            .unwrap_or(0),
     }
 }
 

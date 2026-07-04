@@ -9,7 +9,13 @@ publish = false
 
 [dependencies]
 lohalloc-core.workspace = true
-lohalloc-alloc = { workspace = true, features = ["telemetry-observer"] }
+# NOTE: deliberately NO telemetry-observer feature. It was once enabled here,
+# which compiled per-op observer hooks into every #[global_allocator] build
+# this crate produces (2× now_ns() + pthread_self + size-class rescans per op,
+# unconditional at runtime even when frozen and with no sink installed) —
+# measured at ~60-90ns/op, making the Rust benchmark rows ~3× slower than the
+# same allocator via lohalloc-cabi. Nothing in this crate uses the observer.
+lohalloc-alloc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hdrhistogram = "7"

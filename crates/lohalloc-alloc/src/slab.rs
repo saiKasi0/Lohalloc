@@ -60,25 +60,52 @@ impl Slab {
     /// is UB.
     pub fn alloc(&mut self, size: usize) -> Option<*mut u8> {
         let class = slab_class_for(size)?;
-        let class_size = SLAB_SIZE_CLASSES[class];
+        self.alloc_class(class)
+    }
 
-        let head = self.free_heads[class].take();
-        match head {
-            Some(block) => {
-                // Pop the front of the free list. The block's `next` field holds
-                // the new head.
+    /// Allocate one block of an already-computed `class` — the class-aware
+    /// fast path used by the per-thread magazine layer (`lib.rs` computes
+    /// the class once per op instead of rescanning here and at dealloc).
+    pub fn alloc_class(&mut self, class: usize) -> Option<*mut u8> {
+        debug_assert!(class < NUM_CLASSES);
+        loop {
+            if let Some(block) = self.free_heads[class].take() {
+                // Pop the front of the free list. The block's `next` field
+                // holds the new head.
                 let node = unsafe { &mut *block };
                 self.free_heads[class] = node.next;
-                Some(block as *mut u8)
+                return Some(block as *mut u8);
             }
-            None => {
-                // Refill: map a region and slice it into blocks of `class_size`.
-                self.refill(class, class_size)?;
-                // The refill pushed blocks onto the list; recurse once to pop.
-                // (Guaranteed to terminate: refill either mapped blocks or not.)
-                self.alloc(size)
+            // Refill: map a region and slice it into blocks of the class
+            // size, then loop to pop (refill either added blocks or failed).
+            self.refill(class, SLAB_SIZE_CLASSES[class])?;
+        }
+    }
+
+    /// Pop up to `out.len()` blocks of `class` in one locked visit — the
+    /// magazine refill path. Attempts one region refill if the list runs
+    /// dry mid-batch. Returns how many blocks were written to `out`.
+    pub fn alloc_batch(&mut self, class: usize, out: &mut [*mut u8]) -> usize {
+        debug_assert!(class < NUM_CLASSES);
+        let mut n = 0;
+        let mut refilled = false;
+        while n < out.len() {
+            match self.free_heads[class].take() {
+                Some(block) => {
+                    let node = unsafe { &mut *block };
+                    self.free_heads[class] = node.next;
+                    out[n] = block as *mut u8;
+                    n += 1;
+                }
+                None => {
+                    if refilled || self.refill(class, SLAB_SIZE_CLASSES[class]).is_none() {
+                        break;
+                    }
+                    refilled = true;
+                }
             }
         }
+        n
     }
 
     /// Free a block previously returned by `alloc` with the same `size`. After
@@ -95,12 +122,32 @@ impl Slab {
                 return;
             }
         };
+        unsafe { self.dealloc_class(ptr, class) };
+    }
+
+    /// Free a block of an already-known `class` — see [`Self::alloc_class`].
+    ///
+    /// # Safety
+    /// `ptr` must be a block of exactly this class, not double-freed.
+    pub unsafe fn dealloc_class(&mut self, ptr: *mut u8, class: usize) {
+        debug_assert!(class < NUM_CLASSES);
         // Push to front of free list.
         let node = ptr as *mut FreeNode;
         unsafe {
             (*node).next = self.free_heads[class].take();
         }
         self.free_heads[class] = Some(node);
+    }
+
+    /// Push a whole batch of `class` blocks back in one locked visit — the
+    /// magazine flush path.
+    ///
+    /// # Safety
+    /// Every pointer must be a block of exactly this class, not double-freed.
+    pub unsafe fn dealloc_batch(&mut self, class: usize, blocks: &[*mut u8]) {
+        for &b in blocks {
+            unsafe { self.dealloc_class(b, class) };
+        }
     }
 
     /// Map a fresh region sized to hold several `class_size` blocks and thread
@@ -117,9 +164,13 @@ impl Slab {
         let usable = region.usable();
         let n = usable / stride;
 
-        // Thread blocks `1..n` onto the free list (block 0 handled by alloc pop).
+        // Thread every block onto the free list. (The pre-loop version of
+        // `alloc` skipped block 0 here on the assumption its recursion
+        // would pop it; the loop-based `alloc_class`/`alloc_batch` pop
+        // strictly from the list, so all `n` blocks must be threaded or
+        // block 0 leaks once per region.)
         let mut next = self.free_heads[class];
-        for i in (1..n).rev() {
+        for i in (0..n).rev() {
             let block = unsafe { base.add(i * stride) } as *mut FreeNode;
             unsafe {
                 (*block).next = next;

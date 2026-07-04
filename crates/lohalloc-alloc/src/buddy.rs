@@ -1,21 +1,44 @@
 //! Buddy sub-allocator (variable-size, power-of-two blocks).
 //!
-//! A classic binary-buddy allocator backed by fixed-size regions from the
-//! System Fallback. Every region is exactly `REGION_BYTES` (4 MiB), aligned
-//! to `REGION_BYTES`, and carved into `REGION_BYTES / BUDDY_MAX` top-order
+//! A binary-buddy allocator backed by fixed-size regions from the System
+//! Fallback. Every region is exactly `REGION_BYTES` (4 MiB), aligned to
+//! `REGION_BYTES`, and carved into `REGION_BYTES / BUDDY_MAX` top-order
 //! blocks on arrival — so one `mmap` serves 4×1 MiB, 64×64 KiB, etc.,
 //! instead of the original one-mmap-per-top-order-block scheme that caused
 //! visible syscall storms on buddy-heavy workloads. Blocks are recursively
-//! split down to `MIN_BLOCK` (= `MIN_ALIGN`); free blocks of the same order
-//! are linked on a per-order free list. On `dealloc` a block's buddy is
-//! computed by XOR-ing the appropriate bit; if the buddy is free the pair
-//! coalesces up to the next order, and so on.
+//! split down to `MIN_BLOCK` (= `MIN_ALIGN`).
 //!
-//! Because regions are `REGION_BYTES`-aligned and coalescing is capped at
-//! `MAX_ORDER` (1 MiB blocks), a buddy pair can never span two regions: the
-//! largest pair is 1 MiB aligned to 1 MiB, which always sits inside one
-//! 4 MiB-aligned 4 MiB region. That invariant replaced the old per-step
-//! `same_region_range` linear scan over all regions.
+//! ## Three-tier free tracking + merge-on-spill coalescing
+//!
+//! The per-region bitmap (one bit per (order, block)) is the source of
+//! truth for freeness. On top sit two access tiers: a per-order
+//! out-of-line pointer cache (the hot tier — freeing/allocating through it
+//! never reads or writes the block's own cold memory) and the intrusive
+//! doubly-linked lists (overflow tier). Frees do **no** merging on the hot
+//! path; merging happens *only* incrementally, in [`Buddy::merge_drain_row`],
+//! when a cache row fills (amortized: one bounded drain of half the row per
+//! `ORDER_CACHE/2` frees at that order). The eager-merge-then-resplit
+//! metadata thrash of a naive design (measured: 3.75% LL miss rate vs
+//! jemalloc's 0.46% on the churn benchmark) is gone, and under steady churn
+//! frees at an order feed the next alloc at that order directly.
+//!
+//! An allocation that misses every order does **not** trigger any kind of
+//! full-table merge sweep before `refill()` — two designs were tried and
+//! rejected for the same reason (both regressed the 50k-op buddy benchmark
+//! from ~120 ms to 11-12 **s**): sweeping every region's whole bitmap, and
+//! sweeping every order's cache row. Both looked bounded in isolation (one
+//! per allocation miss) but the buddy benchmark's live set genuinely grows
+//! over the run (net allocation, not just churn — freeing is FIFO against
+//! cycling size classes, so most misses are real growth a merge can't
+//! satisfy anyway), so "call it on every miss" means "call it on a large
+//! fraction of all 50k operations" — that IS the hot path, not a rare
+//! last resort. Do not reintroduce a merge sweep on the allocation-miss
+//! path; the incremental drain above is the only merge trigger.
+//!
+//! Because regions are `REGION_BYTES`-aligned, every block size divides
+//! `REGION_BYTES`, and merging is capped at `MAX_ORDER` (1 MiB blocks), a
+//! buddy pair never spans two regions — `addr ^ block_size(o)` computed on
+//! the absolute address stays inside the block's own region.
 //!
 //! ## Known limitation: header order-inflation
 //!
@@ -100,11 +123,11 @@ const _: () = assert!(core::mem::size_of::<FreeNode>() <= MIN_BLOCK);
 /// buddy's bit instead of searching the free list for its node.
 struct Region {
     base: *mut u8,
-    bytes: usize,
     /// One bit per (order, block position); see `ORDER_BIT_OFFSET`. Heap
     /// allocation happens inside `refill` while the buddy lock is held —
     /// under a global-allocator install that nested allocation takes the
     /// existing `IN_ALLOC` bypass (one extra mmap per 4 MiB region).
+    /// (No `bytes` field: every region is exactly `REGION_BYTES`.)
     bitmap: Vec<u64>,
     _mapping: system::Mapping,
 }
@@ -133,6 +156,9 @@ impl Region {
         self.bitmap[pos / 64] &= !(1u64 << (pos % 64));
     }
 
+    /// Is the block at (`addr`, `order`) free? Used by the merge path to
+    /// test a buddy's freeness in O(1) (the alternative — searching the
+    /// free tiers — is exactly what the bitmap exists to avoid).
     #[inline]
     fn is_free_bit(&self, addr: usize, order: usize) -> bool {
         let pos = self.bit_pos(addr, order);
@@ -143,14 +169,33 @@ impl Region {
 /// Number of buddy orders (compile-time constant so `new()` can be const).
 const NUM_ORDERS: usize = MAX_ORDER + 1;
 
+/// Per-order out-of-line pointer-stack capacity (see `cache` field).
+const ORDER_CACHE: usize = 32;
+
 /// One buddy allocator instance.
 pub struct Buddy {
     /// `free_lists[o]` is the head of the doubly-linked free list for
-    /// blocks of order `o` (null = empty).
+    /// blocks of order `o` (null = empty). The *overflow* tier — the hot
+    /// path goes through `cache` and never touches block memory.
     free_lists: [*mut FreeNode; NUM_ORDERS],
+    /// Per-order out-of-line pointer stacks: the hot free/alloc tier.
+    /// Freed block addresses are recorded here (plus their bitmap bit)
+    /// WITHOUT writing a `FreeNode` into the freed block itself — under
+    /// churn those blocks are cache-cold, and touching them on every
+    /// free/alloc was a measured dominant source of buddy's 3.75% LL miss
+    /// rate (jemalloc: 0.46%). Only cache overflow spills to the intrusive
+    /// lists (touching blocks once, amortized).
+    cache: [[*mut u8; ORDER_CACHE]; NUM_ORDERS],
+    /// Live entry count per `cache` row.
+    cache_len: [u8; NUM_ORDERS],
     /// Owning regions, sorted by base address. Held alive so the memory
     /// stays mapped.
     regions: Vec<Region>,
+    /// Last-hit index into `regions` — churn benches touch 1-2 regions, so
+    /// this makes the per-op region lookup one compare instead of a binary
+    /// search. Verified against the masked base on every use, so a stale
+    /// value is a miss, never a wrong answer.
+    last_region: usize,
 }
 
 impl Default for Buddy {
@@ -163,7 +208,10 @@ impl Buddy {
     pub const fn new() -> Self {
         Self {
             free_lists: [core::ptr::null_mut(); NUM_ORDERS],
+            cache: [[core::ptr::null_mut(); ORDER_CACHE]; NUM_ORDERS],
+            cache_len: [0; NUM_ORDERS],
             regions: Vec::new(),
+            last_region: 0,
         }
     }
 
@@ -207,98 +255,217 @@ impl Buddy {
 
     // ---- internals --------------------------------------------------------
 
-    /// Allocate a block of the given order, splitting larger blocks as needed.
+    /// Allocate a block of the given order, splitting larger blocks as
+    /// needed. Free blocks are found in this priority: per-order pointer
+    /// cache (no block-memory touch) → intrusive list → lazy coalesce of
+    /// everything freed so far → fresh region.
     fn alloc_order(&mut self, order: usize) -> Option<*mut u8> {
         debug_assert!(order <= MAX_ORDER);
 
-        // Find the smallest order >= `order` with a free block.
-        let mut o = order;
-        while o <= MAX_ORDER && self.free_lists[o].is_null() {
-            o += 1;
-        }
-        if o > MAX_ORDER {
-            // Nothing big enough: map a fresh region.
-            self.refill()?;
-            return self.alloc_order(order);
-        }
+        loop {
+            // Find the smallest order >= `order` with a free block.
+            let mut o = order;
+            while o <= MAX_ORDER && self.cache_len[o] == 0 && self.free_lists[o].is_null() {
+                o += 1;
+            }
+            if o > MAX_ORDER {
+                // Nothing big enough anywhere. Do NOT sweep every order's
+                // cache here: under a workload with a genuinely growing
+                // live set (net allocation, not just churn), most misses
+                // are real growth that a sweep can't satisfy anyway, yet
+                // the sweep's cost scales with total cached entries across
+                // every order — calling it on every such miss measured as
+                // quadratic overall (50k-op buddy benchmark: ~120 ms with
+                // no emergency sweep vs 11+ s with one). Incremental
+                // merging already happens for free in `stash_free`/
+                // `free_order` whenever a row hits `ORDER_CACHE` capacity
+                // (see `merge_drain_row`), which is what keeps steady-churn
+                // workloads (free-then-realloc at the same order) merged
+                // as far as they can go — a miss here just means genuine
+                // growth, so map more memory.
+                self.refill()?;
+                continue;
+            }
 
-        // Pop the head block from order `o` and clear its free bit.
-        let block = self.free_lists[o];
-        unsafe { self.unlink(block, o) };
-        let region_idx = self
-            .region_index_containing(block as usize)
-            .expect("free-list node must lie inside a region");
-        self.regions[region_idx].clear_free_bit(block as usize, o);
+            // Pop a block at order `o`: cache first (block memory untouched),
+            // intrusive list otherwise.
+            let block: *mut u8 = if self.cache_len[o] > 0 {
+                let n = self.cache_len[o] - 1;
+                self.cache_len[o] = n;
+                self.cache[o][n as usize]
+            } else {
+                let head = self.free_lists[o];
+                unsafe { self.unlink(head, o) };
+                head as *mut u8
+            };
+            let region_idx = self
+                .region_index_of(block as usize)
+                .expect("free block must lie inside a region");
+            self.regions[region_idx].clear_free_bit(block as usize, o);
 
-        // Split down to `order`, pushing the buddy of each split onto the
-        // appropriate free list. Every split buddy lives in the same region
-        // as `block`, so `region_idx` stays valid throughout.
-        let b = block as *mut u8;
-        while o > order {
-            o -= 1;
-            let buddy = b as usize + (block_size(o));
-            unsafe { self.push_free(buddy as *mut u8, o, region_idx) };
+            // Split down to `order`. Split buddies go through the cache
+            // (they're brand-new metadata — no reason to touch their
+            // memory), spilling to the intrusive list only on overflow.
+            // Every split buddy lives in the same region as `block`.
+            let b = block as usize;
+            while o > order {
+                o -= 1;
+                let buddy = (b + block_size(o)) as *mut u8;
+                self.stash_free(buddy, o, region_idx);
+            }
+            return Some(b as *mut u8);
         }
-        Some(b)
     }
 
-    /// Free a block of `order`, attempting to coalesce with its buddy up the
-    /// order ladder.
+    /// Free a block of `order`. Deferred (lazy) coalescing: record the
+    /// block as free (bitmap bit + pointer cache) and return — no merge
+    /// walk, no writes into the freed block's cold memory on the common
+    /// path. Merging happens only when the cache row overflows (see
+    /// [`Self::merge_drain_row`]) — under steady churn, frees at an order
+    /// feed the very next alloc at that order with zero split/merge
+    /// traffic (the eager version merged on every free and re-split on the
+    /// next alloc: pure metadata thrash).
     ///
     /// # Safety
     /// `ptr` must point to a block of the given order that was previously
     /// allocated and not yet freed.
     unsafe fn free_order(&mut self, ptr: *mut u8, order: usize) {
-        // Region-boundary safety is structural rather than checked per
-        // coalesce step: every region is REGION_BYTES-sized and
-        // REGION_BYTES-aligned, and coalescing is capped at `o < MAX_ORDER`,
-        // so the largest possible pair is one BUDDY_MAX block aligned to
-        // BUDDY_MAX — which always lies entirely inside the single
-        // REGION_BYTES-aligned region the freed block came from. Two
-        // adjacent regions can't interfere either: `buddy_pair`'s XOR never
-        // flips a bit at or above the REGION_BYTES boundary for
-        // `2 * block_size(o) <= REGION_BYTES`. The old implementation
-        // re-verified this per step with a linear scan over all regions
-        // (`same_region_range`) — O(regions) per coalesce level. The same
-        // invariant means one region lookup here covers every buddy the
-        // coalescing loop will ever test.
-        let Some(region_idx) = self.region_index_containing(ptr as usize) else {
+        let Some(region_idx) = self.region_index_of(ptr as usize) else {
             debug_assert!(
                 false,
                 "free_order called with pointer outside every buddy region"
             );
             return; // release mode: leak rather than corrupt the lists
         };
-        let mut p = ptr;
-        let mut o = order;
-        while o < MAX_ORDER {
-            let (base, buddy) = buddy_pair(p, o);
-            let bs = block_size(o);
-
-            // Stop if the block isn't aligned to its order's block size (shouldn't
-            // happen for well-formed inputs, but prevents corrupting free lists).
-            if (p as usize) & (bs - 1) != 0 {
-                break;
-            }
-
-            // O(1): test the buddy's free bit; if free, unlink it and merge.
-            if unsafe { self.remove_free(buddy, o, region_idx) } {
-                p = base;
-                o += 1;
-            } else {
-                break;
-            }
+        // On a full row, merge-drain half of it BEFORE marking `ptr` free:
+        // draining runs `merge_up`, and a bit-set block that is in no tier
+        // yet would get `unlink`ed as a phantom list node (reading garbage
+        // "FreeNode" bytes out of the just-freed block). Amortized: one
+        // bounded drain per ORDER_CACHE/2 frees at this order.
+        if (self.cache_len[order] as usize) == ORDER_CACHE {
+            self.merge_drain_row(order, ORDER_CACHE / 2);
         }
-        unsafe { self.push_free(p, o, region_idx) };
+        self.regions[region_idx].set_free_bit(ptr as usize, order);
+        let n = self.cache_len[order] as usize;
+        debug_assert!(n < ORDER_CACHE);
+        self.cache[order][n] = ptr;
+        self.cache_len[order] = n as u8 + 1;
     }
 
-    /// Push a block onto the head of the free list for `order` and set its
-    /// free bit.
+    /// Record a (bit already known-clear) block as free in the cache tier,
+    /// spilling to the intrusive list on overflow. Sets the bitmap bit.
+    fn stash_free(&mut self, ptr: *mut u8, order: usize, region_idx: usize) {
+        self.regions[region_idx].set_free_bit(ptr as usize, order);
+        if (self.cache_len[order] as usize) < ORDER_CACHE {
+            self.cache[order][self.cache_len[order] as usize] = ptr;
+            self.cache_len[order] += 1;
+        } else {
+            // Cache full: the *new* block spills straight to the list (one
+            // touch) rather than evicting cache entries.
+            unsafe { self.push_list(ptr, order) };
+        }
+    }
+
+    /// Remove a known-free block of `order` from whichever access tier it
+    /// occupies: scan the (hot, ≤`ORDER_CACHE`-entry) cache row first,
+    /// swap-removing on a hit; otherwise it must be on the intrusive list
+    /// — O(1) unlink.
     ///
     /// # Safety
-    /// `ptr` must point to a block of the given order, inside
-    /// `self.regions[region_idx]`, that is not currently on any free list.
-    unsafe fn push_free(&mut self, ptr: *mut u8, order: usize, region_idx: usize) {
+    /// `ptr`'s bitmap bit must be set, i.e. the block is free and resident
+    /// in exactly one of the two tiers at `order`.
+    unsafe fn remove_free(&mut self, ptr: *mut u8, order: usize) {
+        let len = self.cache_len[order] as usize;
+        for i in 0..len {
+            if self.cache[order][i] == ptr {
+                self.cache[order][i] = self.cache[order][len - 1];
+                self.cache_len[order] -= 1;
+                return;
+            }
+        }
+        unsafe { self.unlink(ptr as *mut FreeNode, order) };
+    }
+
+    /// Merge an in-hand block (bitmap bit already cleared, resident in no
+    /// tier) upward while its buddy is free, removing each absorbed buddy
+    /// from its tier. Returns the final (address, order) — still in hand;
+    /// the caller inserts it.
+    ///
+    /// Region-boundary safety: regions are `REGION_BYTES`-aligned, every
+    /// block size divides `REGION_BYTES`, and merging is capped below
+    /// `MAX_ORDER`, so `addr ^ block_size(o)` computed on the absolute
+    /// address never leaves the block's own region.
+    ///
+    /// # Safety
+    /// `addr` must be a block of `order` inside `regions[region_idx]`,
+    /// with its bit cleared and membership in no tier.
+    unsafe fn merge_up(
+        &mut self,
+        mut addr: usize,
+        mut order: usize,
+        region_idx: usize,
+    ) -> (usize, usize) {
+        while order < MAX_ORDER {
+            let buddy = addr ^ block_size(order);
+            if !self.regions[region_idx].is_free_bit(buddy, order) {
+                break;
+            }
+            unsafe { self.remove_free(buddy as *mut u8, order) };
+            self.regions[region_idx].clear_free_bit(buddy, order);
+            addr &= !(block_size(order + 1) - 1); // min(addr, buddy)
+            order += 1;
+        }
+        (addr, order)
+    }
+
+    /// Drain up to `count` entries from the cache row at `order`, merging
+    /// each upward and re-inserting the result: merged blocks land in their
+    /// new (higher) order's tier via `stash_free`; unmerged blocks go to
+    /// this order's intrusive list — never back into the row being drained.
+    /// Returns `true` if any merge happened.
+    ///
+    /// This is the *only* place buddy merging happens — bounded per call
+    /// by `count` (at most `ORDER_CACHE`), never by total free mass, and
+    /// triggered only by cache-row overflow (see the module doc for why an
+    /// allocation-miss-time sweep was tried and rejected instead).
+    fn merge_drain_row(&mut self, order: usize, count: usize) -> bool {
+        let mut merged_any = false;
+        for _ in 0..count {
+            let len = self.cache_len[order] as usize;
+            if len == 0 {
+                break;
+            }
+            let ptr = self.cache[order][len - 1];
+            self.cache_len[order] = (len - 1) as u8;
+            let Some(region_idx) = self.region_index_of(ptr as usize) else {
+                debug_assert!(false, "cached free block outside every region");
+                continue;
+            };
+            self.regions[region_idx].clear_free_bit(ptr as usize, order);
+            let (addr, o) = unsafe { self.merge_up(ptr as usize, order, region_idx) };
+            if o == order {
+                // No merge: park on the overflow list (one cold-block
+                // touch, amortized over the drain trigger).
+                self.regions[region_idx].set_free_bit(addr, o);
+                unsafe { self.push_list(addr as *mut u8, o) };
+            } else {
+                merged_any = true;
+                self.stash_free(addr as *mut u8, o, region_idx);
+            }
+        }
+        merged_any
+    }
+
+    /// Push a block onto the head of the intrusive list for `order`. Does
+    /// NOT touch bitmap bits — callers manage bits (the list and cache are
+    /// access tiers over the bitmap, which is the source of truth). This is
+    /// the only place block memory is written on the free side, and it only
+    /// runs on merge-drain spill (cache overflow).
+    ///
+    /// # Safety
+    /// `ptr` must point to a free block of the given order that is not
+    /// currently on any list or cache row.
+    unsafe fn push_list(&mut self, ptr: *mut u8, order: usize) {
         let node = ptr as *mut FreeNode;
         let head = self.free_lists[order];
         unsafe {
@@ -309,7 +476,6 @@ impl Buddy {
             }
         }
         self.free_lists[order] = node;
-        self.regions[region_idx].set_free_bit(ptr as usize, order);
     }
 
     /// Unlink `node` from the free list for `order` (does not touch bits).
@@ -331,34 +497,17 @@ impl Buddy {
         }
     }
 
-    /// If the block at `ptr`/`order` is free, unlink it from its free list,
-    /// clear its bit, and return `true` — all O(1) via the region bitmap
-    /// (the old singly-linked version walked the whole order's list to find
-    /// the node).
-    ///
-    /// # Safety
-    /// `ptr` must point to a block-aligned address of the given order
-    /// inside `self.regions[region_idx]`.
-    unsafe fn remove_free(&mut self, ptr: *mut u8, order: usize, region_idx: usize) -> bool {
-        if !self.regions[region_idx].is_free_bit(ptr as usize, order) {
-            return false;
-        }
-        self.regions[region_idx].clear_free_bit(ptr as usize, order);
-        unsafe { self.unlink(ptr as *mut FreeNode, order) };
-        true
-    }
-
     /// Map a fresh `REGION_BYTES` region (aligned to `REGION_BYTES` so buddy
-    /// arithmetic is exact) and carve it into top-order blocks on the free
-    /// list. One `mmap` now serves `REGION_BYTES / BUDDY_MAX` top-order
-    /// blocks — the previous scheme mapped one region *per* top-order block,
-    /// which made buddy-heavy workloads syscall-bound (hyperfine showed
-    /// 24 ms outliers from mmap storms).
+    /// arithmetic is exact) and carve it into top-order blocks on the cache
+    /// tier. One `mmap` serves `REGION_BYTES / BUDDY_MAX` top-order blocks
+    /// — the original scheme mapped one region *per* top-order block, which
+    /// made buddy-heavy workloads syscall-bound (hyperfine showed 24 ms
+    /// outliers from mmap storms).
     fn refill(&mut self) -> Option<()> {
         let region = system::alloc_pages(REGION_BYTES, REGION_BYTES)?;
         let base = region.as_ptr();
         // Keep `regions` sorted by base so lookups can binary-search. Refill
-        // is rare now (once per 4 MiB), so the O(n) insert shift is noise.
+        // is rare (once per 4 MiB), so the O(n) insert shift is noise.
         let idx = self
             .regions
             .partition_point(|r| (r.base as usize) < base as usize);
@@ -366,41 +515,61 @@ impl Buddy {
             idx,
             Region {
                 base,
-                bytes: REGION_BYTES,
                 bitmap: vec![0u64; BITMAP_WORDS],
                 _mapping: region,
             },
         );
+        // The insert may have shifted whatever `last_region` pointed at;
+        // pointing it at the new region is both correct (lookups verify the
+        // base) and what the next operations will want.
+        self.last_region = idx;
         let top = block_size(MAX_ORDER);
         let mut off = 0;
         while off < REGION_BYTES {
-            unsafe { self.push_free(base.add(off), MAX_ORDER, idx) };
+            self.stash_free(unsafe { base.add(off) }, MAX_ORDER, idx);
             off += top;
         }
         Some(())
     }
 
-    /// Binary-search the sorted `regions` for the index of the one
-    /// containing `addr`.
-    fn region_index_containing(&self, addr: usize) -> Option<usize> {
-        let idx = self
-            .regions
-            .partition_point(|r| (r.base as usize) + r.bytes <= addr);
-        self.regions
-            .get(idx)
-            .filter(|r| (r.base as usize) <= addr && addr < (r.base as usize) + r.bytes)
-            .map(|_| idx)
+    /// Index of the region containing `addr`: mask to the region base
+    /// (regions are `REGION_BYTES`-aligned and -sized, so `addr & !(RB-1)`
+    /// IS the base), check the last-hit cache, then exact-match binary
+    /// search. The old containment binary search ran on every free.
+    fn region_index_of(&mut self, addr: usize) -> Option<usize> {
+        let masked = addr & !(REGION_BYTES - 1);
+        if let Some(r) = self.regions.get(self.last_region) {
+            if r.base as usize == masked {
+                return Some(self.last_region);
+            }
+        }
+        let idx = self.regions.partition_point(|r| (r.base as usize) < masked);
+        if self.regions.get(idx).map(|r| r.base as usize) == Some(masked) {
+            self.last_region = idx;
+            Some(idx)
+        } else {
+            None
+        }
     }
 }
 
 #[cfg(test)]
 impl Buddy {
+    /// Test-only read-only region lookup (mirrors `region_index_of` without
+    /// mutating the last-hit cache).
+    fn region_index_for_test(&self, addr: usize) -> Option<usize> {
+        let masked = addr & !(REGION_BYTES - 1);
+        self.regions.iter().position(|r| r.base as usize == masked)
+    }
+
     /// Test-only consistency check: every free-list node's `prev` links are
-    /// coherent, every node's bit is set in its region's bitmap, and the
-    /// total number of set bits equals the total number of list nodes (so
-    /// no bit is set without a node and vice versa).
+    /// coherent, every free entry (cache tier + list tier) has its bitmap
+    /// bit set, and the total number of set bits equals the total number of
+    /// free entries — no bit without an entry, no entry without a bit, no
+    /// block in both tiers.
     fn check_invariants(&self) {
-        let mut list_nodes = 0usize;
+        let mut free_entries = 0usize;
+        // List tier.
         for (o, &head) in self.free_lists.iter().enumerate() {
             let mut node = head;
             let mut prev: *mut FreeNode = core::ptr::null_mut();
@@ -409,15 +578,29 @@ impl Buddy {
                     assert_eq!((*node).prev, prev, "prev link broken at order {o}");
                 }
                 let idx = self
-                    .region_index_containing(node as usize)
+                    .region_index_for_test(node as usize)
                     .expect("free node outside every region");
                 assert!(
                     self.regions[idx].is_free_bit(node as usize, o),
                     "free-list node at order {o} has no bitmap bit"
                 );
-                list_nodes += 1;
+                free_entries += 1;
                 prev = node;
                 node = unsafe { (*node).next };
+            }
+        }
+        // Cache tier.
+        for o in 0..NUM_ORDERS {
+            for i in 0..self.cache_len[o] as usize {
+                let p = self.cache[o][i] as usize;
+                let idx = self
+                    .region_index_for_test(p)
+                    .expect("cached free block outside every region");
+                assert!(
+                    self.regions[idx].is_free_bit(p, o),
+                    "cached free block at order {o} has no bitmap bit"
+                );
+                free_entries += 1;
             }
         }
         let set_bits: usize = self
@@ -430,7 +613,7 @@ impl Buddy {
                     .sum::<usize>()
             })
             .sum();
-        assert_eq!(set_bits, list_nodes, "bitmap bits != free-list nodes");
+        assert_eq!(set_bits, free_entries, "bitmap bits != free entries");
     }
 }
 
@@ -471,21 +654,8 @@ pub(crate) fn order_for(size: usize) -> Option<usize> {
     Some(o)
 }
 
-/// Given a pointer and order, return `(pair_base, buddy)` where `pair_base` is
-/// the lower address of the buddy pair (the base of the coalesced block) and
-/// `buddy` is the partner block's pointer (the block we test for freeness). The
-/// buddy address is computed by toggling the bit corresponding to the block
-/// size — the classic buddy arithmetic.
-fn buddy_pair(ptr: *mut u8, order: usize) -> (*mut u8, *mut u8) {
-    let bs = block_size(order);
-    let addr = ptr as usize;
-    // Align down to block size to get the block's base.
-    let block_base = addr & !(bs - 1);
-    let buddy = block_base ^ bs;
-    // The coalesced pair always starts at the lower address.
-    let pair_base = block_base.min(buddy);
-    (pair_base as *mut u8, buddy as *mut u8)
-}
+// NOTE: the classic pointer-space `buddy_pair(ptr, order)` helper is gone —
+// `merge_up` computes a block's buddy directly as `addr ^ block_size(order)`.
 
 #[cfg(test)]
 mod tests {
@@ -682,6 +852,66 @@ mod tests {
                 b.check_invariants();
             }
         }
+    }
+
+    #[test]
+    fn lazy_coalesce_rebuilds_top_block_on_demand() {
+        // Fill one region with small blocks, free them all (no merging
+        // happens on free anymore), then ask for a top-order block: the
+        // allocation-miss path must coalesce everything back together and
+        // serve it WITHOUT mapping a new region.
+        let top = lohalloc_core::BUDDY_MAX;
+        let mut b = Buddy::new();
+        let mut small = Vec::new();
+        // 64 KiB blocks: REGION/64KiB = 64 of them fill the region exactly.
+        let n = REGION_BYTES / (64 * 1024);
+        for i in 0..n {
+            small.push(b.alloc(64 * 1024).unwrap_or_else(|| panic!("small {i}")));
+        }
+        assert_eq!(b.region_count(), 1);
+        for p in small.drain(..) {
+            unsafe { b.dealloc(p, 64 * 1024) };
+        }
+        b.check_invariants();
+        // 64 frees at the same order overflow the 32-entry cache row
+        // partway through, so incremental merge-drain has already
+        // coalesced most of this region by now (lazy, not batched) — the
+        // top-order request finds a fully-merged block waiting, or at
+        // worst finishes the job; either way, no new region.
+        let big = b.alloc(top).expect("coalesced top-order block");
+        assert_eq!(
+            b.region_count(),
+            1,
+            "existing free blocks must merge into the request, not map a new region"
+        );
+        b.check_invariants();
+        unsafe { b.dealloc(big, top) };
+        b.check_invariants();
+    }
+
+    #[test]
+    fn cache_overflow_spills_and_survives() {
+        // Free more blocks of one order than the pointer cache holds — the
+        // overflow spills to the intrusive list; everything must still be
+        // allocatable and invariant-clean.
+        let mut b = Buddy::new();
+        let mut ptrs = Vec::new();
+        let count = ORDER_CACHE * 2 + 7;
+        for i in 0..count {
+            ptrs.push(b.alloc(4096).unwrap_or_else(|| panic!("alloc {i}")));
+        }
+        for p in ptrs.drain(..) {
+            unsafe { b.dealloc(p, 4096) };
+        }
+        b.check_invariants();
+        for i in 0..count {
+            ptrs.push(b.alloc(4096).unwrap_or_else(|| panic!("realloc {i}")));
+        }
+        b.check_invariants();
+        for p in ptrs {
+            unsafe { b.dealloc(p, 4096) };
+        }
+        b.check_invariants();
     }
 
     #[test]

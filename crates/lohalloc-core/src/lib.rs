@@ -267,14 +267,20 @@ pub const MIN_ALIGN: usize = 16;
 
 /// Returns the index into [`SLAB_SIZE_CLASSES`] for `size`, or `None` if `size`
 /// exceeds the largest slab class.
+///
+/// Branchless `leading_zeros` math instead of a linear scan: this runs 2-3×
+/// on every allocator hot-path operation (routing size-class, slab alloc,
+/// slab dealloc), so the old 12-element `.position()` loop was a measurable
+/// per-op tax (~5-15ns). Classes are pow2 `8 << class`, so
+/// `class = ceil(log2(max(size, 8))) - 3`. Verified exhaustively equivalent
+/// to the scan for 0..=20000 (see `slab_class_matches_linear_scan`).
+#[inline]
 pub fn slab_class_for(size: usize) -> Option<usize> {
-    if size == 0 {
-        return Some(0);
+    if size > SLAB_MAX {
+        return None;
     }
-    SLAB_SIZE_CLASSES
-        .iter()
-        .position(|&c| c >= size)
-        .filter(|&i| SLAB_SIZE_CLASSES[i] <= SLAB_MAX)
+    let s = size.max(1) - 1;
+    Some((usize::BITS - s.max(7).leading_zeros()) as usize - 3)
 }
 
 /// Rounds `size` up to the next power of two (minimum 1). Buddy allocator and
@@ -315,6 +321,25 @@ mod tests {
         assert_eq!(slab_class_for(100), Some(4)); // 128 (index 4)
         assert_eq!(slab_class_for(16384), Some(11));
         assert_eq!(slab_class_for(16385), None);
+    }
+
+    #[test]
+    fn slab_class_matches_linear_scan() {
+        // The branchless clz formula must agree with the original linear
+        // scan over the class table for every size in and around the slab
+        // range (0..=20000 covers all 12 classes plus the None region).
+        fn scan(size: usize) -> Option<usize> {
+            if size == 0 {
+                return Some(0);
+            }
+            SLAB_SIZE_CLASSES
+                .iter()
+                .position(|&c| c >= size)
+                .filter(|&i| SLAB_SIZE_CLASSES[i] <= SLAB_MAX)
+        }
+        for size in 0..=20000 {
+            assert_eq!(slab_class_for(size), scan(size), "mismatch at {size}");
+        }
     }
 
     #[test]

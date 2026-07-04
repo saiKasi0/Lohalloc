@@ -138,6 +138,17 @@ pub fn clear_sink() {
     SINK.store(core::ptr::null_mut(), Ordering::Release);
 }
 
+/// Fast "is anyone listening?" check — one relaxed atomic load. The hot-path
+/// call sites in `lib.rs` consult this *before* doing any telemetry work
+/// (timestamps, `pthread_self`, fragmentation math), so a binary compiled
+/// with `telemetry-observer` but with no sink installed pays ~one load per
+/// op instead of ~60-90ns of dead bookkeeping (measured — this exact
+/// overhead once made the Rust benchmark rows 3× slower than the C rows).
+#[inline(always)]
+pub(crate) fn sink_installed() -> bool {
+    !SINK.load(Ordering::Relaxed).is_null()
+}
+
 /// Read the currently installed sink (for tests).
 pub fn current_sink() -> Option<TelemetrySink> {
     let p = SINK.load(Ordering::Acquire);
