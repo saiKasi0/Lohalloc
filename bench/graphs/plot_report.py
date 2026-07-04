@@ -6,10 +6,17 @@ Usage:
 
 Reads the aggregator's report (the `rows` array) and emits grouped-bar charts:
 
-  native-timing-<lang>.png   mean wall-clock ns/invocation, workload x allocator
-  cache-d1-<lang>.png        cachegrind D1 (L1-data) miss rate, workload x allocator
-  cache-ll-<lang>.png        cachegrind LL (last-level) miss rate, workload x allocator
-  rust-latency-p99.png       lohalloc per-op alloc p99, workload x mode
+  native-timing-<lang>.png      mean wall-clock ns/invocation, workload x allocator
+  native-throughput-<lang>.png  Mops/s (ops / mean time), workload x allocator
+  cache-d1-<lang>.png           cachegrind D1 (L1-data) miss rate, workload x allocator
+  cache-ll-<lang>.png           cachegrind LL (last-level) miss rate, workload x allocator
+  cache-d1-perop-<lang>.png     D1 misses PER OP, workload x allocator — the
+                                denominator-immune view (a mode that does less
+                                per-op bookkeeping shows a higher *rate* on the
+                                same misses; see aggregate.rs's module doc)
+  rust-latency-p99.png          lohalloc per-op alloc p99, workload x mode
+  rust-latency-p50.png          lohalloc per-op alloc p50, workload x mode
+  rust-latency-mean.png         lohalloc per-op alloc mean, workload x mode
 
 Only charts with data are written. matplotlib-only (no pandas); dark palette
 mirrors the project's "hardware terminal" aesthetic so the images sit well
@@ -163,6 +170,16 @@ def main():
             sv,
         )
 
+    # 1b. Native throughput (same timing data, ops/sec view).
+    for lang, (cats, sv) in collect(rows, "native-timing", "throughput_mops").items():
+        wrote_any |= grouped_bar(
+            out_dir / f"native-throughput-{lang}.png",
+            f"Native throughput — {lang}",
+            "Mops / s",
+            cats,
+            sv,
+        )
+
     # 2. Cache miss rates, per language.
     for lang, (cats, sv) in collect(rows, "cachegrind", "d1_miss_rate").items():
         wrote_any |= grouped_bar(
@@ -181,12 +198,40 @@ def main():
             sv,
         )
 
-    # 3. Rust per-op alloc p99, workload x mode (single language: rust).
+    # 2b. Absolute D1 misses per workload op — the denominator-immune view
+    # (see aggregate.rs's module doc for why the rate alone misleads on
+    # training-vs-inference comparisons).
+    for lang, (cats, sv) in collect(rows, "cachegrind", "d1_misses_per_op").items():
+        wrote_any |= grouped_bar(
+            out_dir / f"cache-d1-perop-{lang}.png",
+            f"D1 misses per op — {lang}",
+            "D1 misses / op",
+            cats,
+            sv,
+        )
+
+    # 3. Rust per-op alloc latency, workload x mode (single language: rust).
     for lang, (cats, sv) in collect(rows, "rust-latency", "alloc_p99_ns").items():
         wrote_any |= grouped_bar(
             out_dir / "rust-latency-p99.png",
             "Rust per-op alloc p99 (hdrhistogram)",
             "p99 ns",
+            cats,
+            sv,
+        )
+    for lang, (cats, sv) in collect(rows, "rust-latency", "alloc_p50_ns").items():
+        wrote_any |= grouped_bar(
+            out_dir / "rust-latency-p50.png",
+            "Rust per-op alloc p50 (hdrhistogram)",
+            "p50 ns",
+            cats,
+            sv,
+        )
+    for lang, (cats, sv) in collect(rows, "rust-latency", "alloc_mean_ns").items():
+        wrote_any |= grouped_bar(
+            out_dir / "rust-latency-mean.png",
+            "Rust per-op alloc mean (hdrhistogram)",
+            "mean ns",
             cats,
             sv,
         )

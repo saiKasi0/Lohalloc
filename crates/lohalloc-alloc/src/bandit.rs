@@ -55,18 +55,13 @@ use std::collections::BTreeMap;
 
 use lohalloc_core::{Backend, Signature};
 
-/// UCB1 exploration constant. Higher = more exploration.
-const EXPLORATION_C: f64 = 2.0;
+use crate::tune::TrainingConfig;
 
-/// Penalty applied to a new arm's UCB score when it would differ from the
-/// last-chosen arm. Prevents jitter under steady workloads.
-const HYSTERESIS_PENALTY: f64 = 0.15;
-
-/// Baseline reward assigned to each arm when a Signature is first seen.
-/// Also used as the initial `sum_reward` so the first selection is the
-/// baseline-preferred arm.
-const BASELINE_REWARDS: [f64; 4] = [1.0, 0.8, 0.3, 0.9];
-// Index order: [Slab=0, Buddy=1, System=2, Arena=3]
+// The former hard-coded constants (`EXPLORATION_C = 2.0`,
+// `HYSTERESIS_PENALTY = 0.15`, `BASELINE_REWARDS = [1.0, 0.8, 0.3, 0.9]`)
+// now live in `tune::TrainingConfig` (`ucb_c`, `hysteresis`,
+// `baseline_rewards`) with the same values as defaults — see `tune.rs`.
+// Index order for `baseline_rewards`: [Slab=0, Buddy=1, System=2, Arena=3].
 
 /// Per-arm statistics tracked by the bandit for one Signature.
 #[derive(Clone, Debug)]
@@ -103,19 +98,25 @@ struct SignatureStats {
     total_pulls: u32,
     /// The last backend selected for this signature (for hysteresis).
     last_choice: Option<Backend>,
+    /// How many consecutive `select()` calls have picked `last_choice`
+    /// without switching. Drives `freeze_mode=converged` (see
+    /// [`BanditPolicy::is_converged`]); costs one increment-or-reset per
+    /// selection.
+    stable_count: u32,
 }
 
 impl SignatureStats {
-    fn new() -> Self {
+    fn new(baselines: &[f64; 4]) -> Self {
         Self {
             arms: [
-                ArmStats::new(BASELINE_REWARDS[0]),
-                ArmStats::new(BASELINE_REWARDS[1]),
-                ArmStats::new(BASELINE_REWARDS[2]),
-                ArmStats::new(BASELINE_REWARDS[3]),
+                ArmStats::new(baselines[0]),
+                ArmStats::new(baselines[1]),
+                ArmStats::new(baselines[2]),
+                ArmStats::new(baselines[3]),
             ],
             total_pulls: 4, // Each arm starts with 1 pull.
             last_choice: None,
+            stable_count: 0,
         }
     }
 }
@@ -152,10 +153,21 @@ impl BanditPolicy {
     }
 
     /// Select the best backend for the given Signature using UCB1 with
-    /// hysteresis. If the signature is unseen, it is initialized with
-    /// baseline rewards.
+    /// hysteresis, reading knobs from the process-wide
+    /// [`tune::config`](crate::tune::config). If the signature is unseen,
+    /// it is initialized with the configured baseline rewards.
     pub fn select(&mut self, sig: Signature) -> Backend {
-        let entry = self.stats.entry(sig).or_insert_with(SignatureStats::new);
+        self.select_with(sig, crate::tune::config())
+    }
+
+    /// [`select`](Self::select) with an explicit config — the testable
+    /// core (unit tests can't safely mutate the process-wide `OnceLock`
+    /// under parallel execution).
+    pub fn select_with(&mut self, sig: Signature, cfg: &TrainingConfig) -> Backend {
+        let entry = self
+            .stats
+            .entry(sig)
+            .or_insert_with(|| SignatureStats::new(&cfg.baseline_rewards));
         let total = entry.total_pulls as f64;
 
         let mut best = Backend::Slab;
@@ -165,7 +177,7 @@ impl BanditPolicy {
             let backend = backend_from_index(i);
             // UCB1: mean_reward + C * sqrt(ln(N) / n_i)
             let exploration = if arm.pulls > 0 {
-                EXPLORATION_C * (total.ln() / (arm.pulls as f64)).sqrt()
+                cfg.ucb_c * (total.ln() / (arm.pulls as f64)).sqrt()
             } else {
                 f64::INFINITY // Unpulled arms have infinite exploration value.
             };
@@ -174,7 +186,7 @@ impl BanditPolicy {
             // Hysteresis: penalize arms that differ from the last choice.
             if let Some(last) = entry.last_choice {
                 if backend != last {
-                    score -= HYSTERESIS_PENALTY;
+                    score -= cfg.hysteresis;
                 }
             }
 
@@ -184,13 +196,18 @@ impl BanditPolicy {
             }
         }
 
-        // Update pull counts and last_choice. The reward for this pull
-        // arrives later via `update()` (once the real outcome is measured) —
-        // `select()` only accounts for the pull itself, it does not inject
-        // any reward.
+        // Update pull counts, last_choice, and the convergence streak. The
+        // reward for this pull arrives later via `update()` (once the real
+        // outcome is measured) — `select()` only accounts for the pull
+        // itself, it does not inject any reward.
         let arm = &mut entry.arms[best as usize];
         arm.pulls += 1;
         entry.total_pulls += 1;
+        entry.stable_count = if entry.last_choice == Some(best) {
+            entry.stable_count.saturating_add(1)
+        } else {
+            0
+        };
         entry.last_choice = Some(best);
 
         best
@@ -200,10 +217,62 @@ impl BanditPolicy {
     /// completes. This updates the arm's statistics, allowing the bandit to
     /// learn from allocation outcomes.
     pub fn update(&mut self, sig: Signature, backend: Backend, reward: f64) {
-        let entry = self.stats.entry(sig).or_insert_with(SignatureStats::new);
+        let entry = self
+            .stats
+            .entry(sig)
+            .or_insert_with(|| SignatureStats::new(&crate::tune::config().baseline_rewards));
         let arm = &mut entry.arms[backend as usize];
         arm.sum_reward += reward;
         // Note: pulls was already incremented in select(). We don't double-count.
+    }
+
+    /// True once every observed Signature's routing has stabilized — the
+    /// trigger for `freeze_mode=converged` (checked by the embedding layer
+    /// every few ops; the bandit never freezes itself).
+    ///
+    /// A Signature counts as converged when BOTH hold:
+    /// 1. its last `stable_n` consecutive selections all picked the same
+    ///    arm (`stable_count >= stable_n`), and
+    /// 2. every other arm's mean reward plus a **unit confidence radius**
+    ///    `sqrt(ln(total) / pulls_i)` stays below the winner's mean. A
+    ///    streak alone can be hysteresis-induced luck; separation means
+    ///    more selections cannot plausibly flip the mean ranking that
+    ///    `freeze()` will lock in.
+    ///
+    /// The radius is deliberately the UCB bonus **without** the
+    /// exploration constant: UCB1's steady state re-pulls a suboptimal
+    /// arm whenever `ucb_c * radius` climbs back above its reward gap Δ,
+    /// so with the *full* bonus, separation is structurally unreachable —
+    /// arms hover at the re-exploration boundary forever. Dividing out
+    /// `ucb_c` makes the criterion exactly right: equilibrium pull counts
+    /// (`n_i ≈ ucb_c²·ln N / Δ²`) put the unit radius at ≈ Δ/ucb_c, which
+    /// is strictly inside any *real* gap whenever `ucb_c > 1` (default 2),
+    /// while a zero gap (genuinely tied arms) never separates.
+    ///
+    /// An empty bandit is *not* converged (nothing was learned — freezing
+    /// would lock in pure size-based fallback).
+    pub fn is_converged(&self, stable_n: u32) -> bool {
+        if self.stats.is_empty() {
+            return false;
+        }
+        self.stats.values().all(|entry| {
+            if entry.stable_count < stable_n {
+                return false;
+            }
+            let best = Self::best_arm_index(entry);
+            let total = entry.total_pulls as f64;
+            let best_mean = entry.arms[best].mean_reward();
+            entry.arms.iter().enumerate().all(|(i, arm)| {
+                if i == best {
+                    return true;
+                }
+                if arm.pulls == 0 {
+                    return false; // never-pulled arm: interval unbounded
+                }
+                let radius = (total.ln() / (arm.pulls as f64)).sqrt();
+                arm.mean_reward() + radius < best_mean
+            })
+        })
     }
 
     /// Collapse the bandit into a flat list of `(combined_key, size_class,
@@ -527,5 +596,78 @@ mod tests {
         let bandit = BanditPolicy::new();
         assert!(bandit.is_empty());
         assert_eq!(bandit.len(), 0);
+    }
+
+    #[test]
+    fn config_plumbs_through_ucb_c_zero_is_greedy() {
+        // With ucb_c = 0 (and no hysteresis) the policy is purely greedy:
+        // after one arm's mean reward dominates, exploration never pulls
+        // the others again — observable as a perfect selection streak. The
+        // default ucb_c = 2.0 provably keeps exploring (ln N grows), so a
+        // long unbroken streak also proves the config value is actually
+        // read, not the old hard-coded constant.
+        let cfg = TrainingConfig {
+            ucb_c: 0.0,
+            hysteresis: 0.0,
+            ..TrainingConfig::default()
+        };
+        let mut bandit = BanditPolicy::new();
+        let s = sig(500);
+
+        // Establish Arena as dominant with a few shaped pulls.
+        for _ in 0..8 {
+            let b = bandit.select_with(s, &cfg);
+            bandit.update(s, b, if b == Backend::Arena { 1.0 } else { 0.0 });
+        }
+        // Greedy phase: every selection must now be Arena, no exceptions.
+        for i in 0..200 {
+            let b = bandit.select_with(s, &cfg);
+            assert_eq!(b, Backend::Arena, "greedy run broke at pull {i}");
+            bandit.update(s, b, 1.0);
+        }
+    }
+
+    #[test]
+    fn converges_on_stable_workload_not_on_adversarial() {
+        let cfg = TrainingConfig::default();
+        let stable_n = 32;
+
+        // Stable: Arena always wins by a wide margin -> must converge.
+        let mut stable = BanditPolicy::new();
+        let s = sig(600);
+        for _ in 0..3000 {
+            let b = stable.select_with(s, &cfg);
+            stable.update(s, b, if b == Backend::Arena { 1.0 } else { 0.05 });
+        }
+        assert!(
+            stable.is_converged(stable_n),
+            "a decisively-won workload must report convergence"
+        );
+
+        // Adversarial: two arms permanently tied -> UCB intervals never
+        // separate, must NOT converge no matter how long it runs.
+        let mut tied = BanditPolicy::new();
+        let t = sig(601);
+        for _ in 0..3000 {
+            let b = tied.select_with(t, &cfg);
+            let r = match b {
+                Backend::Slab | Backend::Arena => 0.5,
+                _ => 0.5,
+            };
+            tied.update(t, b, r);
+        }
+        assert!(
+            !tied.is_converged(stable_n),
+            "permanently-tied arms must never report convergence"
+        );
+    }
+
+    #[test]
+    fn empty_bandit_is_not_converged() {
+        let bandit = BanditPolicy::new();
+        assert!(
+            !bandit.is_converged(1),
+            "freezing an empty bandit would lock in pure fallback routing"
+        );
     }
 }

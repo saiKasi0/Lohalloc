@@ -1,0 +1,11 @@
+# Throughput / memory-density-focused training config (LOHALLOC_TUNE).
+#
+# Flattens the reward-curve knee (tolerates occasional slow ops in exchange
+# for better mean cost) and adds a fragmentation penalty so the bandit
+# prefers backends that pack tighter when raw latencies are close.
+#
+# Placeholder values pending a `make bench-tune` sweep — see the plan's
+# Step 8. Replace with the sweep's throughput-group winner.
+focus=throughput
+ucb_c=2.0
+hysteresis=0.15

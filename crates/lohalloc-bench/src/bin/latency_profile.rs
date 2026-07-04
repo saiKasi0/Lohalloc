@@ -123,6 +123,10 @@ fn percentiles(hist: &Histogram<u64>) -> (u64, u64, u64, u64, f64) {
 }
 
 fn main() {
+    // Install the tune config (LOHALLOC_TUNE + LOHALLOC_* env overrides) so
+    // sweep-driven runs (`tune_sweep`) shape the private instance's training
+    // — safe to do plainly in an ordinary binary (no interposition).
+    lohalloc_alloc::tune::load_from_env();
     let args = parse_args();
     let hash = hash_for(&args.workload);
 

@@ -1,0 +1,13 @@
+# Latency-focused training config (LOHALLOC_TUNE).
+#
+# This is the DEFAULT behavior — every value here equals the built-in
+# default, so loading it changes nothing. It exists so the three focus
+# presets sit side by side and so a run can be explicit about its intent.
+#
+# Optimizes for low tail latency: a small reward-curve knee punishes slow
+# ops hard, and no fragmentation penalty (raw speed only).
+#
+# Placeholder pending a `make bench-tune` sweep — see the plan's Step 8.
+focus=latency
+ucb_c=2.0
+hysteresis=0.15

@@ -32,6 +32,21 @@
 //! or a PMU (cachegrind counters are always present when run at all; real
 //! PMU counters are best-effort and rarely available in CI/cloud VMs).
 //!
+//! # Miss *rates* vs misses *per op* — read both, trust per-op
+//!
+//! Cachegrind rows carry two views of the same counts: `d1_miss_rate`
+//! (misses / total data refs) and `d1_misses_per_op` (misses / workload
+//! ops). The rate's denominator is *everything the process did*, so any
+//! change that removes work shrinks the denominator and inflates the rate
+//! without a single extra miss — e.g. freezing removes the per-op
+//! state-Mutex and bandit-update bookkeeping (~2.8× fewer data refs per op
+//! on slab). Real example from `results/20260704T181553`: rust/mt-slab-t4
+//! *inference* has FEWER absolute misses than training (8,987 vs 12,015)
+//! yet a HIGHER rate (1.75% vs 1.02%). Per-op misses are
+//! denominator-immune; use them for any training-vs-inference or
+//! before-vs-after layout comparison, and keep the rate only for
+//! same-mode cross-allocator comparisons where per-op work is comparable.
+//!
 //! ```sh
 //! cargo run -p lohalloc-bench --bin aggregate --release -- --results-dir results
 //! ```
@@ -53,12 +68,63 @@ struct Row {
     mode: String,
     /// Mean wall-clock time per invocation, nanoseconds (native-timing only).
     mean_ns: Option<f64>,
+    /// Workload throughput in million ops / second (native-timing only;
+    /// ops recovered from the hyperfine command tail — see
+    /// [`ops_from_command`]). Includes process startup in the denominator,
+    /// which is fine for cross-allocator comparison: every allocator runs
+    /// the identical binary at the identical op count.
+    throughput_mops: Option<f64>,
     /// D1 (L1 data cache) miss rate, 0.0-1.0 (cachegrind only).
     d1_miss_rate: Option<f64>,
     /// Last-level cache miss rate, 0.0-1.0 (cachegrind only).
     ll_miss_rate: Option<f64>,
+    /// D1 misses per workload op (cachegrind only). Denominator-immune —
+    /// see the module doc's "Miss rates vs misses per op" section.
+    d1_misses_per_op: Option<f64>,
+    /// LL misses per workload op (cachegrind only).
+    ll_misses_per_op: Option<f64>,
+    /// p50 alloc latency, nanoseconds (rust-latency only).
+    alloc_p50_ns: Option<f64>,
+    /// Mean alloc latency, nanoseconds (rust-latency only).
+    alloc_mean_ns: Option<f64>,
     /// p99 alloc latency, nanoseconds (rust-latency only).
     alloc_p99_ns: Option<f64>,
+    /// Mean dealloc latency, nanoseconds (rust-latency only).
+    dealloc_mean_ns: Option<f64>,
+    /// Per-op alloc throughput in million allocs / second
+    /// (= 1e3 / alloc_mean_ns; rust-latency only). Unlike
+    /// `throughput_mops` this excludes process startup — it is the pure
+    /// hot-path rate.
+    rust_throughput_mops: Option<f64>,
+}
+
+/// A `Row` with every metric `None` — each loader branch fills in only its
+/// own source's fields.
+fn empty_row(
+    source: &'static str,
+    lang: String,
+    allocator: String,
+    workload: String,
+    mode: String,
+) -> Row {
+    Row {
+        source,
+        lang,
+        allocator,
+        workload,
+        mode,
+        mean_ns: None,
+        throughput_mops: None,
+        d1_miss_rate: None,
+        ll_miss_rate: None,
+        d1_misses_per_op: None,
+        ll_misses_per_op: None,
+        alloc_p50_ns: None,
+        alloc_mean_ns: None,
+        alloc_p99_ns: None,
+        dealloc_mean_ns: None,
+        rust_throughput_mops: None,
+    }
 }
 
 #[derive(Deserialize)]
@@ -69,6 +135,19 @@ struct HyperfineExport {
 #[derive(Deserialize)]
 struct HyperfineResult {
     mean: f64, // seconds
+    /// The benchmarked command line — hyperfine always exports it. Every
+    /// command in this harness ends `... <workload> <OPS>`, so the ops
+    /// count is recoverable from the trailing token (no sidecar files, no
+    /// filename-format changes).
+    #[serde(default)]
+    command: Option<String>,
+}
+
+/// Recover the workload op count from a hyperfine command string's trailing
+/// token. Returns `None` (never panics) for commands that don't end in a
+/// number — throughput is then simply omitted for that row.
+fn ops_from_command(command: &str) -> Option<u64> {
+    command.split_whitespace().next_back()?.parse().ok()
 }
 
 #[derive(Deserialize)]
@@ -77,6 +156,10 @@ struct CachegrindResult {
     allocator: String,
     workload: String,
     mode: String,
+    /// Optional so pre-Step-7.5 raw files (which always wrote it anyway)
+    /// and hand-assembled directories both keep parsing.
+    #[serde(default)]
+    ops: Option<u64>,
     d_refs: u64,
     d1_misses: u64,
     ll_misses: u64,
@@ -87,6 +170,14 @@ struct RustLatencyResult {
     workload: String,
     mode: String,
     alloc_p99_ns: f64,
+    /// Optional for forward/backward compatibility with older raw files;
+    /// `latency_profile` has always written them.
+    #[serde(default)]
+    alloc_p50_ns: Option<f64>,
+    #[serde(default)]
+    alloc_mean_ns: Option<f64>,
+    #[serde(default)]
+    dealloc_mean_ns: Option<f64>,
 }
 
 /// Parse `native-<lang>-<allocator>-<workload>-<mode>.json` (workload may
@@ -130,17 +221,15 @@ fn load_rows(dir: &Path) -> Vec<Row> {
             match serde_json::from_str::<HyperfineExport>(&text) {
                 Ok(export) => {
                     if let Some(r) = export.results.first() {
-                        rows.push(Row {
-                            source: "native-timing",
-                            lang,
-                            allocator,
-                            workload,
-                            mode,
-                            mean_ns: Some(r.mean * 1e9),
-                            d1_miss_rate: None,
-                            ll_miss_rate: None,
-                            alloc_p99_ns: None,
-                        });
+                        let mut row = empty_row("native-timing", lang, allocator, workload, mode);
+                        row.mean_ns = Some(r.mean * 1e9);
+                        row.throughput_mops = r
+                            .command
+                            .as_deref()
+                            .and_then(ops_from_command)
+                            .filter(|&ops| ops > 0 && r.mean > 0.0)
+                            .map(|ops| ops as f64 / r.mean / 1e6);
+                        rows.push(row);
                     }
                 }
                 Err(e) => eprintln!("failed to parse {path:?} as hyperfine export: {e}"),
@@ -148,43 +237,38 @@ fn load_rows(dir: &Path) -> Vec<Row> {
         } else if stem.starts_with("cachegrind-") {
             match serde_json::from_str::<CachegrindResult>(&text) {
                 Ok(cg) => {
-                    let d1_rate = if cg.d_refs > 0 {
-                        Some(cg.d1_misses as f64 / cg.d_refs as f64)
-                    } else {
-                        None
-                    };
-                    let ll_rate = if cg.d_refs > 0 {
-                        Some(cg.ll_misses as f64 / cg.d_refs as f64)
-                    } else {
-                        None
-                    };
-                    rows.push(Row {
-                        source: "cachegrind",
-                        lang: cg.lang,
-                        allocator: cg.allocator,
-                        workload: cg.workload,
-                        mode: cg.mode,
-                        mean_ns: None,
-                        d1_miss_rate: d1_rate,
-                        ll_miss_rate: ll_rate,
-                        alloc_p99_ns: None,
-                    });
+                    let mut row =
+                        empty_row("cachegrind", cg.lang, cg.allocator, cg.workload, cg.mode);
+                    if cg.d_refs > 0 {
+                        row.d1_miss_rate = Some(cg.d1_misses as f64 / cg.d_refs as f64);
+                        row.ll_miss_rate = Some(cg.ll_misses as f64 / cg.d_refs as f64);
+                    }
+                    if let Some(ops) = cg.ops.filter(|&o| o > 0) {
+                        row.d1_misses_per_op = Some(cg.d1_misses as f64 / ops as f64);
+                        row.ll_misses_per_op = Some(cg.ll_misses as f64 / ops as f64);
+                    }
+                    rows.push(row);
                 }
                 Err(e) => eprintln!("failed to parse {path:?} as cachegrind result: {e}"),
             }
         } else if stem.starts_with("rust_") || stem.starts_with("rust-") {
             match serde_json::from_str::<RustLatencyResult>(&text) {
-                Ok(r) => rows.push(Row {
-                    source: "rust-latency",
-                    lang: "rust".to_string(),
-                    allocator: "lohalloc".to_string(),
-                    workload: r.workload,
-                    mode: r.mode,
-                    mean_ns: None,
-                    d1_miss_rate: None,
-                    ll_miss_rate: None,
-                    alloc_p99_ns: Some(r.alloc_p99_ns),
-                }),
+                Ok(r) => {
+                    let mut row = empty_row(
+                        "rust-latency",
+                        "rust".to_string(),
+                        "lohalloc".to_string(),
+                        r.workload,
+                        r.mode,
+                    );
+                    row.alloc_p99_ns = Some(r.alloc_p99_ns);
+                    row.alloc_p50_ns = r.alloc_p50_ns;
+                    row.alloc_mean_ns = r.alloc_mean_ns;
+                    row.dealloc_mean_ns = r.dealloc_mean_ns;
+                    row.rust_throughput_mops =
+                        r.alloc_mean_ns.filter(|&m| m > 0.0).map(|m| 1e3 / m);
+                    rows.push(row);
+                }
                 Err(e) => eprintln!("failed to parse {path:?} as rust latency result: {e}"),
             }
         }
@@ -256,40 +340,58 @@ fn write_markdown(
     }
 
     out.push_str("## Native timing (hyperfine)\n\n");
-    out.push_str("| lang | allocator | workload | mode | mean (ns) |\n|---|---|---|---|---|\n");
+    out.push_str(
+        "| lang | allocator | workload | mode | mean (ns) | throughput (Mops/s) |\n|---|---|---|---|---|---|\n",
+    );
     for row in rows.iter().filter(|r| r.source == "native-timing") {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {:.0} |\n",
+            "| {} | {} | {} | {} | {:.0} | {} |\n",
             row.lang,
             row.allocator,
             row.workload,
             row.mode,
-            row.mean_ns.unwrap_or(0.0)
+            row.mean_ns.unwrap_or(0.0),
+            row.throughput_mops
+                .map_or_else(|| "-".to_string(), |t| format!("{t:.2}")),
         ));
     }
 
     out.push_str("\n## Cache metrics (cachegrind, simulated)\n\n");
-    out.push_str("| lang | allocator | workload | mode | D1 miss rate | LL miss rate |\n|---|---|---|---|---|---|\n");
+    out.push_str(
+        "Rates dilute when a mode does more per-op bookkeeping (training) — \
+         per-op misses are the denominator-immune view; see the module doc.\n\n",
+    );
+    out.push_str("| lang | allocator | workload | mode | D1 miss rate | LL miss rate | D1 misses/op | LL misses/op |\n|---|---|---|---|---|---|---|---|\n");
     for row in rows.iter().filter(|r| r.source == "cachegrind") {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {:.4} | {:.4} |\n",
+            "| {} | {} | {} | {} | {:.4} | {:.4} | {} | {} |\n",
             row.lang,
             row.allocator,
             row.workload,
             row.mode,
             row.d1_miss_rate.unwrap_or(0.0),
-            row.ll_miss_rate.unwrap_or(0.0)
+            row.ll_miss_rate.unwrap_or(0.0),
+            row.d1_misses_per_op
+                .map_or_else(|| "-".to_string(), |v| format!("{v:.2}")),
+            row.ll_misses_per_op
+                .map_or_else(|| "-".to_string(), |v| format!("{v:.2}")),
         ));
     }
 
     out.push_str("\n## Rust per-op latency (hdrhistogram)\n\n");
-    out.push_str("| workload | mode | alloc p99 (ns) |\n|---|---|---|\n");
+    out.push_str("| workload | mode | alloc p50 (ns) | alloc mean (ns) | alloc p99 (ns) | dealloc mean (ns) | throughput (Mops/s) |\n|---|---|---|---|---|---|---|\n");
     for row in rows.iter().filter(|r| r.source == "rust-latency") {
+        let fmt = |v: Option<f64>| v.map_or_else(|| "-".to_string(), |x| format!("{x:.0}"));
         out.push_str(&format!(
-            "| {} | {} | {:.0} |\n",
+            "| {} | {} | {} | {} | {:.0} | {} | {} |\n",
             row.workload,
             row.mode,
-            row.alloc_p99_ns.unwrap_or(0.0)
+            fmt(row.alloc_p50_ns),
+            fmt(row.alloc_mean_ns),
+            row.alloc_p99_ns.unwrap_or(0.0),
+            fmt(row.dealloc_mean_ns),
+            row.rust_throughput_mops
+                .map_or_else(|| "-".to_string(), |t| format!("{t:.2}")),
         ));
     }
 
@@ -399,5 +501,75 @@ fn main() {
             "note: regression gate would FAIL (informational; pass --gate to enforce) — see {}",
             md_path.display()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ops_from_command_parses_trailing_number() {
+        assert_eq!(
+            ops_from_command(
+                "env LOHALLOC_MODEL=/tmp/m.lohalloc LD_PRELOAD=x.so build/bench_main_c adv-mixed 50000"
+            ),
+            Some(50000)
+        );
+        // MT workload names carry a -tN suffix but ops is still the tail.
+        assert_eq!(
+            ops_from_command("taskset -c 0-3 build/bench_main_c mt-mixed-t4 8000"),
+            Some(8000)
+        );
+    }
+
+    #[test]
+    fn ops_from_command_rejects_non_numeric_tail() {
+        assert_eq!(ops_from_command("build/bench_main_c slab"), None);
+        assert_eq!(ops_from_command(""), None);
+        assert_eq!(ops_from_command("   "), None);
+        // Negative / non-integer tails must not parse as u64.
+        assert_eq!(ops_from_command("cmd workload -5"), None);
+        assert_eq!(ops_from_command("cmd workload 1.5"), None);
+    }
+
+    #[test]
+    fn throughput_math_from_hyperfine_row() {
+        // 50_000 ops in 2ms = 25 Mops/s.
+        let ops = ops_from_command("bin slab 50000").unwrap();
+        let mean_seconds = 0.002;
+        let mops = ops as f64 / mean_seconds / 1e6;
+        assert!((mops - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn per_op_misses_are_denominator_immune() {
+        // The exact scenario from the module doc: training does ~2.8x more
+        // refs. Rates invert (training looks better); per-op misses tell
+        // the truth (inference has fewer misses per op).
+        let ops = 2000u64;
+        let (train_refs, train_misses) = (1_181_790u64, 12_015u64);
+        let (inf_refs, inf_misses) = (512_268u64, 8_987u64);
+
+        let train_rate = train_misses as f64 / train_refs as f64;
+        let inf_rate = inf_misses as f64 / inf_refs as f64;
+        assert!(
+            inf_rate > train_rate,
+            "rate view: inference 'worse' ({inf_rate:.4} > {train_rate:.4})"
+        );
+
+        let train_per_op = train_misses as f64 / ops as f64;
+        let inf_per_op = inf_misses as f64 / ops as f64;
+        assert!(
+            inf_per_op < train_per_op,
+            "per-op view: inference actually better ({inf_per_op:.2} < {train_per_op:.2})"
+        );
+    }
+
+    #[test]
+    fn rust_throughput_from_mean_latency() {
+        // alloc_mean_ns = 40ns -> 25 M allocs/s.
+        let mean_ns = 40.0f64;
+        assert!((1e3 / mean_ns - 25.0).abs() < 1e-9);
     }
 }

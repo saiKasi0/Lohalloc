@@ -1,0 +1,10 @@
+# Balanced training config (LOHALLOC_TUNE).
+#
+# A middle knee and a light fragmentation penalty — trades a little tail
+# latency for better mean cost and memory density.
+#
+# Placeholder values pending a `make bench-tune` sweep — see the plan's
+# Step 8. Replace with the sweep's balanced-group winner.
+focus=balanced
+ucb_c=2.0
+hysteresis=0.15

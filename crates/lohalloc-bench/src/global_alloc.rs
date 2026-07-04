@@ -59,6 +59,13 @@ pub fn global_lohalloc_is_inference() -> bool {
     ALLOC.is_inference()
 }
 
+/// Whether the process-wide Lohalloc allocator's training has converged —
+/// the `freeze_mode=converged` poll (see `Lohalloc::is_converged`).
+#[cfg(feature = "alloc-lohalloc")]
+pub fn global_lohalloc_is_converged() -> bool {
+    ALLOC.is_converged()
+}
+
 /// Process-wide count of frozen-table lookup misses — see
 /// `Lohalloc::pht_miss_count`. ~0 on a model-loaded run proves the model's
 /// (ASLR-normalized) keys matched this process's call sites.

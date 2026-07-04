@@ -1,0 +1,353 @@
+//! Step 8 ablation sweep: run the training→inference pipeline once per
+//! tune-config point and rank the results — the "front-loaded, automated
+//! ablation" harness that turns `focus` presets from guesses into measured
+//! winners.
+//!
+//! ```sh
+//! cargo run -p lohalloc-bench --bin tune_sweep --release -- \
+//!     --grid bench/tune-grid.json --workloads slab,buddy,adv-mixed \
+//!     --ops 100000 --out results/tune-sweep
+//! # or via the Makefile: make bench-tune
+//! ```
+//!
+//! # How it works
+//!
+//! The training config is a process-wide `OnceLock` (`lohalloc_alloc::tune`),
+//! so distinct config points **cannot** coexist in one process — each grid
+//! point therefore runs as a child `latency_profile` process with
+//! `LOHALLOC_TUNE=<generated key=value file>` in its environment (JSON stays
+//! at this harness layer; the allocator only ever parses the flat file).
+//! Per (config, workload) the sweep runs `--mode training` and
+//! `--mode inference` and collects the `LatencyReport` metrics Step 7.5
+//! established: mean / p50 / p99 alloc latency and per-op throughput.
+//!
+//! # Grid format
+//!
+//! A JSON object mapping tune keys to candidate value lists; the sweep runs
+//! the full cartesian product:
+//!
+//! ```json
+//! { "focus": ["latency", "throughput"], "ucb_c": [1.0, 2.0] }
+//! ```
+//!
+//! Values may be strings or numbers; they are written verbatim as
+//! `key=value` lines (see `tune.rs` for the key table).
+//!
+//! # Ranking
+//!
+//! One ranked table per `focus` value found in the grid (configs without a
+//! `focus` key rank in the "latency" group, the default): `throughput`
+//! groups rank by inference throughput (descending), everything else by
+//! inference p99 (ascending) — each group is judged by the metric it claims
+//! to optimize. Same-session methodology applies: all children run
+//! back-to-back on this machine, so ratios *within* one sweep are
+//! comparable; absolute numbers across sweeps are not.
+
+use std::collections::BTreeMap;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct LatencyReport {
+    alloc_p50_ns: u64,
+    alloc_p99_ns: u64,
+    alloc_mean_ns: f64,
+}
+
+/// One grid point: ordered `(key, value)` pairs (BTreeMap for a stable,
+/// readable config label).
+type ConfigPoint = BTreeMap<String, String>;
+
+struct RunResult {
+    label: String,
+    focus: String,
+    workload: String,
+    /// (p50, p99, mean, mops) per mode.
+    training: Option<(u64, u64, f64, f64)>,
+    inference: Option<(u64, u64, f64, f64)>,
+}
+
+fn parse_args() -> (PathBuf, Vec<String>, usize, PathBuf) {
+    let mut grid = PathBuf::from("bench/tune-grid.json");
+    let mut workloads = vec![
+        "slab".to_string(),
+        "buddy".to_string(),
+        "adv-mixed".to_string(),
+    ];
+    let mut ops = 100_000usize;
+    let mut out = PathBuf::from("results/tune-sweep");
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--grid" => grid = args.next().map(PathBuf::from).unwrap_or(grid),
+            "--workloads" => {
+                if let Some(list) = args.next() {
+                    workloads = list.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+            "--ops" => ops = args.next().and_then(|s| s.parse().ok()).unwrap_or(ops),
+            "--out" => out = args.next().map(PathBuf::from).unwrap_or(out),
+            other => eprintln!("tune_sweep: ignoring unknown arg {other}"),
+        }
+    }
+    (grid, workloads, ops, out)
+}
+
+/// Expand a `{key: [v1, v2, ...]}` grid into its cartesian product. Keys
+/// iterate in JSON-object order via `serde_json::Map` (preserve_order is
+/// off, so alphabetical — deterministic either way).
+fn expand_grid(grid: &serde_json::Map<String, serde_json::Value>) -> Vec<ConfigPoint> {
+    let mut points: Vec<ConfigPoint> = vec![ConfigPoint::new()];
+    for (key, values) in grid {
+        let Some(list) = values.as_array() else {
+            eprintln!("tune_sweep: grid key {key} is not an array — skipping");
+            continue;
+        };
+        let mut next = Vec::with_capacity(points.len() * list.len());
+        for point in &points {
+            for v in list {
+                let mut p = point.clone();
+                // Strings render without JSON quotes; numbers/bools as-is.
+                let rendered = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                p.insert(key.clone(), rendered);
+                next.push(p);
+            }
+        }
+        points = next;
+    }
+    points
+}
+
+/// Render a config point as the flat `key=value` file `tune.rs` parses.
+fn tune_file_body(point: &ConfigPoint) -> String {
+    let mut body = String::from("# generated by tune_sweep\n");
+    for (k, v) in point {
+        body.push_str(&format!("{k}={v}\n"));
+    }
+    body
+}
+
+/// Short human-readable label for one config point.
+fn label_for(point: &ConfigPoint) -> String {
+    if point.is_empty() {
+        return "defaults".to_string();
+    }
+    point
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Run one `latency_profile` child and parse its report. Returns
+/// `(p50, p99, mean, mops)`.
+fn run_child(
+    tune_path: &std::path::Path,
+    workload: &str,
+    mode: &str,
+    ops: usize,
+    out_json: &std::path::Path,
+) -> Option<(u64, u64, f64, f64)> {
+    // The sweep and the profiler are built from the same workspace/profile,
+    // so the sibling binary sits next to our own executable.
+    let profiler = env::current_exe().ok()?.with_file_name("latency_profile");
+    let status = Command::new(&profiler)
+        .env("LOHALLOC_TUNE", tune_path)
+        .args([
+            "--workload",
+            workload,
+            "--mode",
+            mode,
+            "--ops",
+            &ops.to_string(),
+        ])
+        .arg("--out")
+        .arg(out_json)
+        .status()
+        .map_err(|e| eprintln!("tune_sweep: failed to spawn {profiler:?}: {e}"))
+        .ok()?;
+    if !status.success() {
+        eprintln!("tune_sweep: {workload}/{mode} exited with {status}");
+        return None;
+    }
+    let report: LatencyReport = serde_json::from_str(&fs::read_to_string(out_json).ok()?).ok()?;
+    let mops = if report.alloc_mean_ns > 0.0 {
+        1e3 / report.alloc_mean_ns
+    } else {
+        0.0
+    };
+    Some((
+        report.alloc_p50_ns,
+        report.alloc_p99_ns,
+        report.alloc_mean_ns,
+        mops,
+    ))
+}
+
+fn fmt_metrics(m: Option<(u64, u64, f64, f64)>) -> String {
+    match m {
+        Some((p50, p99, mean, mops)) => {
+            format!("p50={p50}ns p99={p99}ns mean={mean:.0}ns thpt={mops:.2}Mops/s")
+        }
+        None => "(failed)".to_string(),
+    }
+}
+
+fn main() {
+    let (grid_path, workloads, ops, out_dir) = parse_args();
+
+    let grid_text = match fs::read_to_string(&grid_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("tune_sweep: cannot read grid {grid_path:?}: {e}");
+            std::process::exit(2);
+        }
+    };
+    let grid: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(&grid_text) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("tune_sweep: grid {grid_path:?} is not a JSON object of arrays: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    let points = expand_grid(&grid);
+    if let Err(e) = fs::create_dir_all(&out_dir) {
+        eprintln!("tune_sweep: cannot create {out_dir:?}: {e}");
+        std::process::exit(2);
+    }
+    eprintln!(
+        "tune_sweep: {} config points x {} workloads x 2 modes (ops={ops})",
+        points.len(),
+        workloads.len()
+    );
+
+    let mut results: Vec<RunResult> = Vec::new();
+    for (i, point) in points.iter().enumerate() {
+        let label = label_for(point);
+        let focus = point
+            .get("focus")
+            .cloned()
+            .unwrap_or_else(|| "latency".to_string());
+        let tune_path = out_dir.join(format!("config-{i}.tune"));
+        if let Err(e) = fs::write(&tune_path, tune_file_body(point)) {
+            eprintln!("tune_sweep: cannot write {tune_path:?}: {e}");
+            continue;
+        }
+        for workload in &workloads {
+            eprintln!("==> [{}/{}] {label} / {workload}", i + 1, points.len());
+            let json = |mode: &str| out_dir.join(format!("raw-{i}-{workload}-{mode}.json"));
+            let training = run_child(&tune_path, workload, "training", ops, &json("training"));
+            let inference = run_child(&tune_path, workload, "inference", ops, &json("inference"));
+            results.push(RunResult {
+                label: label.clone(),
+                focus: focus.clone(),
+                workload: workload.clone(),
+                training,
+                inference,
+            });
+        }
+    }
+
+    // Ranked report: one section per focus group, ranked per workload by
+    // the metric that focus claims to optimize.
+    let mut report = String::from("# tune_sweep report\n\n");
+    let mut focuses: Vec<String> = results.iter().map(|r| r.focus.clone()).collect();
+    focuses.sort();
+    focuses.dedup();
+    for focus in &focuses {
+        report.push_str(&format!("## focus group: {focus}\n\n"));
+        for workload in &workloads {
+            let mut group: Vec<&RunResult> = results
+                .iter()
+                .filter(|r| &r.focus == focus && &r.workload == workload)
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            // throughput groups rank by inference Mops/s desc; everything
+            // else by inference p99 asc. Failed runs sink to the bottom.
+            group.sort_by(|a, b| {
+                let key = |r: &RunResult| r.inference;
+                match (key(a), key(b)) {
+                    (Some(ma), Some(mb)) => {
+                        if focus == "throughput" {
+                            mb.3.partial_cmp(&ma.3).unwrap_or(std::cmp::Ordering::Equal)
+                        } else {
+                            ma.1.cmp(&mb.1)
+                        }
+                    }
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            });
+            report.push_str(&format!("### {workload}\n\n"));
+            for (rank, r) in group.iter().enumerate() {
+                report.push_str(&format!(
+                    "{}. `{}`\n   - inference: {}\n   - training:  {}\n",
+                    rank + 1,
+                    r.label,
+                    fmt_metrics(r.inference),
+                    fmt_metrics(r.training),
+                ));
+            }
+            report.push('\n');
+        }
+    }
+
+    let report_path = out_dir.join("tune-report.md");
+    if let Err(e) = fs::write(&report_path, &report) {
+        eprintln!("tune_sweep: cannot write {report_path:?}: {e}");
+        std::process::exit(2);
+    }
+    println!("{report}");
+    println!("wrote {}", report_path.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grid(json: &str) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn expand_grid_is_cartesian() {
+        let points = expand_grid(&grid(
+            r#"{"focus":["latency","throughput"],"ucb_c":[1.0,2.0]}"#,
+        ));
+        assert_eq!(points.len(), 4);
+        // Every combination appears exactly once.
+        let labels: Vec<String> = points.iter().map(label_for).collect();
+        assert!(labels.contains(&"focus=latency ucb_c=1.0".to_string()));
+        assert!(labels.contains(&"focus=throughput ucb_c=2.0".to_string()));
+    }
+
+    #[test]
+    fn expand_empty_grid_is_single_defaults_point() {
+        let points = expand_grid(&grid("{}"));
+        assert_eq!(points.len(), 1);
+        assert_eq!(label_for(&points[0]), "defaults");
+    }
+
+    #[test]
+    fn tune_file_body_is_flat_key_value() {
+        let points = expand_grid(&grid(r#"{"focus":["throughput"],"frag_weight":[0.1]}"#));
+        let body = tune_file_body(&points[0]);
+        assert!(body.contains("focus=throughput\n"));
+        assert!(body.contains("frag_weight=0.1\n"));
+        assert!(
+            !body.contains('"'),
+            "no JSON quoting may leak into the tune file"
+        );
+    }
+}

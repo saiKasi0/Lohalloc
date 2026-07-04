@@ -109,20 +109,51 @@ else
     echo "      true interposition (lohalloc/jemalloc/mimalloc via LD_PRELOAD) is Linux-only." >&2
 fi
 
-C_WORKLOADS=(slab arena buddy system adv-mixed)
-CPP_WORKLOADS=(slab arena buddy system adv-mixed cpp-vector cpp-string)
+# Thread counts swept for the mt-* workloads below; 1 is the scaling
+# denominator (S(t) = time(t1)/time(t)), 4/8 are where lock contention on
+# the still-serialized Buddy/Arena paths (see crates/lohalloc-alloc's
+# module docs) should show up first. Override with MT_THREADS="1 2 4 8" etc.
+MT_THREADS="${MT_THREADS:-1 4 8}"
+MT_WORKLOAD_KINDS=(slab mixed xfree)
+MT_WORKLOADS=()
+for n in $MT_THREADS; do
+    for kind in "${MT_WORKLOAD_KINDS[@]}"; do
+        MT_WORKLOADS+=("mt-${kind}-t${n}")
+    done
+done
+
+C_WORKLOADS=(slab arena buddy system adv-mixed "${MT_WORKLOADS[@]}")
+CPP_WORKLOADS=(slab arena buddy system adv-mixed cpp-vector cpp-string "${MT_WORKLOADS[@]}")
+
+# For an "mt-<kind>-tN" workload name on Linux, returns "taskset -c 0-(N-1) "
+# (trailing space, ready to prepend to a command string) so the workload's N
+# threads compete for exactly N CPUs instead of whatever the Docker
+# container happens to expose — otherwise a threads=1 vs threads=8 A/B on an
+# under-provisioned host measures host scheduling noise, not the
+# allocator's lock contention. Empty string for every non-mt workload or on
+# macOS (no taskset).
+taskset_prefix_for() {
+    local workload="$1"
+    if [ "$UNAME" = "Linux" ] && [[ "$workload" =~ -t([0-9]+)$ ]]; then
+        local n="${BASH_REMATCH[1]}"
+        echo "taskset -c 0-$((n - 1)) "
+    fi
+}
 
 run_timing() {
     local lang="$1" binary="$2" workload="$3" allocator="$4" preload="$5" mode="$6" extra_env="$7"
     local out="$RAW_DIR/native-${lang}-${allocator}-${workload}-${mode}.json"
     echo "==> [timing] $lang/$allocator/$workload ($mode)"
+    local pin
+    pin="$(taskset_prefix_for "$workload")"
     # LD_PRELOAD/extra_env must be part of the *command string* hyperfine
     # runs, not hyperfine's own environment — `env VAR=x hyperfine ...`
     # would preload our allocator into hyperfine's own (large, Rust) process
     # too, which reproducibly hung indefinitely during its own startup
     # (verified: hyperfine spawned zero child processes for 8+ minutes).
     # hyperfine's default shell wrapper applies env assignments in the
-    # command string only to that one child invocation.
+    # command string only to that one child invocation. `taskset` (when
+    # present) is just a plain prefix in that same string, same reasoning.
     # --warmup 8 (not hyperfine's more typical 2): a freshly started
     # container's first several mmap-heavy process launches pay a VM-level
     # memory-subsystem warm-up cost specific to a given allocation-size
@@ -136,7 +167,7 @@ run_timing() {
         --warmup 8 \
         --min-runs 10 \
         --export-json "$out" \
-        "env $extra_env $PRELOAD_VAR=$preload $binary $workload $OPS" >/dev/null
+        "env $extra_env $PRELOAD_VAR=$preload ${pin}$binary $workload $OPS" >/dev/null
 }
 
 # Runs `binary` under `valgrind --tool=cachegrind`, parses its stderr
@@ -152,8 +183,10 @@ run_cachegrind() {
     cg_out="$(mktemp)"
     echo "==> [cachegrind] $lang/$allocator/$workload ($mode)"
 
+    local pin
+    pin="$(taskset_prefix_for "$workload")"
     local raw
-    raw="$(env $extra_env "$PRELOAD_VAR"="$preload" valgrind \
+    raw="$(env $extra_env "$PRELOAD_VAR"="$preload" ${pin}valgrind \
         --tool=cachegrind --cachegrind-out-file="$cg_out" \
         "$binary" "$workload" "$OPS" 2>&1 >/dev/null || true)"
     rm -f "$cg_out"
@@ -251,7 +284,7 @@ done
 # ---- Rust: allocator chosen at build time, no preload -----------------------
 # One binary per allocator (native_workload_<alloc>), so these rows run
 # meaningfully on macOS too — nothing here depends on LD_PRELOAD.
-RUST_WORKLOADS=(slab arena buddy system adv-mixed)
+RUST_WORKLOADS=(slab arena buddy system adv-mixed "${MT_WORKLOADS[@]}")
 for allocator in "${RUST_ALLOCATORS[@]}"; do
     binary="$NATIVE_DIR/build/native_workload_$allocator"
     if [ ! -x "$binary" ]; then

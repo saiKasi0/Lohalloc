@@ -29,6 +29,30 @@
 //! the final comparison and returns `None` — required because the caller
 //! falls back to size-based routing on a miss.
 //!
+//! # Layout (Step 6 cache-density fusion)
+//!
+//! Cachegrind on the adv-mixed inference workload attributed 21% of the
+//! whole program's D1 read misses to `lookup` alone — the single largest
+//! attributable hotspot after the buddy backend itself. Root cause: the two
+//! backing arrays (`seeds: Vec<u32>`, `slots: Vec<Entry>`) were separate heap
+//! allocations (two TLB entries instead of one for tables small enough to
+//! otherwise fit a page), and `Entry` (`u64` + `u8` + `u8`) padded to 16
+//! bytes under default alignment — only 4 entries per 64B cache line. Under
+//! the whole allocator's working-set churn (buddy bitmaps, slab magazines,
+//! header writes all competing for L1), a table that gets evicted between
+//! lookups has to re-fetch proportionally more lines than its live entry
+//! count requires.
+//!
+//! Fix: both arrays now live in one `Box<[u8]>` — `seeds` (u32 LE) followed
+//! by packed slot entries (`hash: u64 LE` + `backend: u8` + `size_class: u8`,
+//! 10 bytes, no alignment padding) — one allocation, and 40% fewer bytes per
+//! slot than the old padded `Entry`. Accessors read via `from_le_bytes` on
+//! byte-slice copies rather than pointer casts, so this stays entirely safe
+//! code. The CHD construction algorithm itself (bucket placement,
+//! displacement search) is unchanged; only the final storage representation
+//! differs. Wire format is untouched — `serialize`/`deserialize` still
+//! produce/consume the same 12-byte-per-entry `.lohalloc` layout.
+//!
 //! # Serialization (`.lohalloc` model file)
 //!
 //! `serialize()` / `deserialize()` implement a compact binary format:
@@ -110,6 +134,27 @@ fn fastrange(x: u64, n: usize) -> usize {
     ((x as u128 * n as u128) >> 64) as usize
 }
 
+/// Packed on-disk-in-memory size of one slot entry: `hash: u64 LE` (8) +
+/// `backend: u8` (1) + `size_class: u8` (1). No alignment padding, unlike
+/// the old `Vec<Entry>` (16 bytes/entry under default `u64` alignment) —
+/// see the module doc's "Layout" section.
+const ENTRY_BYTES: usize = 10;
+
+/// Pack a bucket's displacement seeds and the placed slot entries into one
+/// contiguous buffer: `[seeds: u32 LE; m][entries: ENTRY_BYTES; n]`.
+fn pack(seeds: &[u32], slots: &[Entry]) -> Box<[u8]> {
+    let mut buf = Vec::with_capacity(seeds.len() * 4 + slots.len() * ENTRY_BYTES);
+    for &s in seeds {
+        buf.extend_from_slice(&s.to_le_bytes());
+    }
+    for e in slots {
+        buf.extend_from_slice(&e.hash.to_le_bytes());
+        buf.push(e.backend as u8);
+        buf.push(e.size_class);
+    }
+    buf.into_boxed_slice()
+}
+
 /// A frozen, read-only routing table. Built from `BanditPolicy::freeze()`.
 ///
 /// Internally a CHD minimal perfect hash: n keys in exactly n slots, plus a
@@ -123,11 +168,50 @@ fn fastrange(x: u64, n: usize) -> usize {
 pub struct PerfectHashTable {
     /// Seed folded into every hash; advanced when construction retries.
     global_seed: u64,
-    /// Per-bucket displacement seeds; empty only for the empty table.
-    seeds: Vec<u32>,
-    /// Exactly n slots, all occupied (minimal). Each stores the full key
-    /// hash so lookups of unknown hashes fail the compare and return `None`.
-    slots: Vec<Entry>,
+    /// Number of buckets (`m`); 0 only for the empty table.
+    num_buckets: usize,
+    /// Number of slots (`n`, exactly the entry count); 0 only for the
+    /// empty table.
+    num_slots: usize,
+    /// Seeds and slot entries fused into one allocation — see the module
+    /// doc's "Layout" section for why (one TLB entry instead of two, denser
+    /// packing per cache line).
+    buf: Box<[u8]>,
+}
+
+impl PerfectHashTable {
+    #[inline]
+    fn seed_at(&self, bucket: usize) -> u32 {
+        let off = bucket * 4;
+        u32::from_le_bytes(self.buf[off..off + 4].try_into().unwrap())
+    }
+
+    #[inline]
+    fn entry_offset(&self, slot: usize) -> usize {
+        self.num_buckets * 4 + slot * ENTRY_BYTES
+    }
+
+    #[inline]
+    fn entry_hash_at(&self, slot: usize) -> u64 {
+        let off = self.entry_offset(slot);
+        u64::from_le_bytes(self.buf[off..off + 8].try_into().unwrap())
+    }
+
+    #[inline]
+    fn entry_backend_at(&self, slot: usize) -> Backend {
+        let off = self.entry_offset(slot);
+        match self.buf[off + 8] {
+            0 => Backend::Slab,
+            1 => Backend::Buddy,
+            2 => Backend::System,
+            _ => Backend::Arena,
+        }
+    }
+
+    #[inline]
+    fn entry_size_class_at(&self, slot: usize) -> u8 {
+        self.buf[self.entry_offset(slot) + 9]
+    }
 }
 
 impl PerfectHashTable {
@@ -182,8 +266,9 @@ impl PerfectHashTable {
         if n == 0 {
             return Self {
                 global_seed: 0,
-                seeds: Vec::new(),
-                slots: Vec::new(),
+                num_buckets: 0,
+                num_slots: 0,
+                buf: Vec::new().into_boxed_slice(),
             };
         }
 
@@ -265,8 +350,9 @@ impl PerfectHashTable {
 
         Some(Self {
             global_seed: g,
-            seeds,
-            slots,
+            num_buckets: m,
+            num_slots: n,
+            buf: pack(&seeds, &slots),
         })
     }
 
@@ -276,24 +362,42 @@ impl PerfectHashTable {
     /// allocations. Returns `None` if the hash is not in the table (the
     /// caller should fall back to size-based routing in that case).
     pub fn lookup(&self, hash: u64) -> Option<Backend> {
-        if self.slots.is_empty() {
+        if self.num_slots == 0 {
             return None;
         }
-        let bucket = fastrange(mix(hash, self.global_seed), self.seeds.len());
-        let d = self.seeds[bucket] as u64;
-        let slot = fastrange(mix(hash, self.global_seed ^ d), self.slots.len());
-        let entry = &self.slots[slot];
-        (entry.hash == hash).then_some(entry.backend)
+        let bucket = fastrange(mix(hash, self.global_seed), self.num_buckets);
+        let d = self.seed_at(bucket) as u64;
+        let slot = fastrange(mix(hash, self.global_seed ^ d), self.num_slots);
+        (self.entry_hash_at(slot) == hash).then(|| self.entry_backend_at(slot))
     }
 
     /// Number of routing entries.
     pub fn len(&self) -> usize {
-        self.slots.len()
+        self.num_slots
     }
 
     /// True if the table is empty.
     pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        self.num_slots == 0
+    }
+
+    /// Every `(combined_key, size_class, backend)` entry, sorted by key —
+    /// diagnostic introspection for a model-dump tool, not used on any hot
+    /// path. `size_class` here is the bucket carried alongside the key
+    /// (see `Entry`'s doc): 0–11 are the Slab classes, 12/13 are Buddy,
+    /// 14 is System.
+    pub fn entries(&self) -> Vec<(u64, u8, Backend)> {
+        let mut out: Vec<(u64, u8, Backend)> = (0..self.num_slots)
+            .map(|slot| {
+                (
+                    self.entry_hash_at(slot),
+                    self.entry_size_class_at(slot),
+                    self.entry_backend_at(slot),
+                )
+            })
+            .collect();
+        out.sort_by_key(|(hash, _, _)| *hash);
+        out
     }
 
     /// Serialize the routing table to a `.lohalloc` binary byte vector.
@@ -302,8 +406,7 @@ impl PerfectHashTable {
     /// (independent of which construction seed the MPHF landed on) — MPHF
     /// metadata is rebuilt at `deserialize()` time, never serialized.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut entries = self.slots.clone();
-        entries.sort_by_key(|e| e.hash);
+        let entries = self.entries(); // already sorted by hash
 
         // 8 (magic) + 4 (version) + 4 (count) + entries * 12 + 8 (checksum)
         let mut buf = Vec::with_capacity(16 + entries.len() * 12 + 8);
@@ -318,12 +421,12 @@ impl PerfectHashTable {
 
         // Entries.
         let mut checksum: u64 = 0;
-        for entry in &entries {
-            buf.extend_from_slice(&entry.hash.to_le_bytes());
-            buf.push(entry.backend as u8);
-            buf.push(entry.size_class);
+        for (hash, size_class, backend) in &entries {
+            buf.extend_from_slice(&hash.to_le_bytes());
+            buf.push(*backend as u8);
+            buf.push(*size_class);
             buf.extend_from_slice(&[0u8; 2]); // padding
-            checksum ^= entry.hash;
+            checksum ^= hash;
         }
 
         // Checksum.
@@ -561,6 +664,25 @@ mod tests {
         for i in 0..1000u64 {
             assert_eq!(restored.lookup(i * 1000), original.lookup(i * 1000));
         }
+    }
+
+    #[test]
+    fn buf_is_one_allocation_with_no_padding() {
+        // Regression guard for the Step 6 layout fusion: seeds + entries
+        // must live in exactly one `buf` sized `m*4 + n*ENTRY_BYTES`, with
+        // no per-entry alignment padding (the old `Vec<Entry>` cost 16B/entry
+        // due to u64 alignment; the fused layout costs 10).
+        let pairs: Vec<(u64, u8, Backend)> = splitmix_stream(200)
+            .into_iter()
+            .enumerate()
+            .map(|(i, k)| (k, 0, test_backend_from_index(i as u64)))
+            .collect();
+        let table = PerfectHashTable::from_entries(pairs);
+        assert_eq!(
+            table.buf.len(),
+            table.num_buckets * 4 + table.num_slots * ENTRY_BYTES
+        );
+        assert_eq!(table.num_slots, 200);
     }
 
     /// Helper for tests: convert an index to a Backend (mirrors bandit order).

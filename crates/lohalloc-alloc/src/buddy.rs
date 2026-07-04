@@ -116,6 +116,31 @@ struct FreeNode {
 // A FreeNode must fit in the smallest block the buddy can hand out.
 const _: () = assert!(core::mem::size_of::<FreeNode>() <= MIN_BLOCK);
 
+/// Number of regions' bitmaps backed by one batch mmap (see
+/// `Buddy::alloc_bitmap`). Each region's bitmap is `BITMAP_WORDS * 8`
+/// bytes (a few tens of KiB); a workload whose live set spans many
+/// `REGION_BYTES` (4 MiB) regions — not a hypothetical, a 2000-op run of
+/// the buddy benchmark reaches ~59 regions — used to cost one separate
+/// `mmap`/TLB entry per region just for its bitmap. Batching them cuts
+/// that by `BITMAP_BATCH`×: 16 regions' worth (~1 MiB) per batch mmap.
+const BITMAP_BATCH: usize = 16;
+
+/// Backing memory for up to `BITMAP_BATCH` regions' bitmaps, allocated in
+/// one `mmap` rather than one per region. `base` is a stable address for
+/// the lifetime of the owning `Buddy` (a batch is never freed or grown
+/// once mapped — only new batches are appended), so handing out raw
+/// pointers into it to `Region`s is sound even though `regions: Vec<Region>`
+/// may itself move individual `Region` structs on reallocation: only the
+/// small struct moves, never this batch's own backing memory.
+struct BitmapBatch {
+    base: *mut u64,
+    /// How many of `BITMAP_BATCH` bitmap-sized slots have been handed out.
+    used: usize,
+    _mapping: system::Mapping,
+}
+
+unsafe impl Send for BitmapBatch {}
+
 /// A buddy region: a contiguous, page-backed run of `REGION_BYTES` bytes
 /// whose base is aligned to `REGION_BYTES` (so buddy arithmetic works
 /// cleanly), plus a free bitmap with one bit per (order, block position).
@@ -123,12 +148,12 @@ const _: () = assert!(core::mem::size_of::<FreeNode>() <= MIN_BLOCK);
 /// buddy's bit instead of searching the free list for its node.
 struct Region {
     base: *mut u8,
-    /// One bit per (order, block position); see `ORDER_BIT_OFFSET`. Heap
-    /// allocation happens inside `refill` while the buddy lock is held —
-    /// under a global-allocator install that nested allocation takes the
-    /// existing `IN_ALLOC` bypass (one extra mmap per 4 MiB region).
-    /// (No `bytes` field: every region is exactly `REGION_BYTES`.)
-    bitmap: Vec<u64>,
+    /// `BITMAP_WORDS` words carved from a `BitmapBatch` (see
+    /// `Buddy::alloc_bitmap`) — one bit per (order, block position), see
+    /// `ORDER_BIT_OFFSET`. Always zero-initialized (fresh `mmap` memory is
+    /// kernel-zeroed) at first use. (No `bytes` field: every region is
+    /// exactly `REGION_BYTES`.)
+    bitmap: *mut u64,
     _mapping: system::Mapping,
 }
 
@@ -147,13 +172,13 @@ impl Region {
     #[inline]
     fn set_free_bit(&mut self, addr: usize, order: usize) {
         let pos = self.bit_pos(addr, order);
-        self.bitmap[pos / 64] |= 1u64 << (pos % 64);
+        unsafe { *self.bitmap.add(pos / 64) |= 1u64 << (pos % 64) };
     }
 
     #[inline]
     fn clear_free_bit(&mut self, addr: usize, order: usize) {
         let pos = self.bit_pos(addr, order);
-        self.bitmap[pos / 64] &= !(1u64 << (pos % 64));
+        unsafe { *self.bitmap.add(pos / 64) &= !(1u64 << (pos % 64)) };
     }
 
     /// Is the block at (`addr`, `order`) free? Used by the merge path to
@@ -162,7 +187,14 @@ impl Region {
     #[inline]
     fn is_free_bit(&self, addr: usize, order: usize) -> bool {
         let pos = self.bit_pos(addr, order);
-        (self.bitmap[pos / 64] >> (pos % 64)) & 1 == 1
+        unsafe { (*self.bitmap.add(pos / 64) >> (pos % 64)) & 1 == 1 }
+    }
+
+    /// The full bitmap as a slice, for `check_invariants`' bit-counting
+    /// cross-check only.
+    #[cfg(test)]
+    fn bitmap_words(&self) -> &[u64] {
+        unsafe { core::slice::from_raw_parts(self.bitmap, BITMAP_WORDS) }
     }
 }
 
@@ -196,6 +228,9 @@ pub struct Buddy {
     /// search. Verified against the masked base on every use, so a stale
     /// value is a miss, never a wrong answer.
     last_region: usize,
+    /// Backing storage for regions' bitmaps, batched `BITMAP_BATCH` at a
+    /// time (see `BitmapBatch`'s doc) instead of one `mmap` per region.
+    bitmap_batches: Vec<BitmapBatch>,
 }
 
 impl Default for Buddy {
@@ -212,6 +247,7 @@ impl Buddy {
             cache_len: [0; NUM_ORDERS],
             regions: Vec::new(),
             last_region: 0,
+            bitmap_batches: Vec::new(),
         }
     }
 
@@ -251,6 +287,44 @@ impl Buddy {
     /// Number of backing regions (leak accounting in tests).
     pub fn region_count(&self) -> usize {
         self.regions.len()
+    }
+
+    /// Allocate up to `out.len()` blocks of `order`, for `buddy_mag`'s
+    /// batch refill (one lock acquisition amortized over the whole batch,
+    /// same shape as `Slab::alloc_batch`). Stops early — returning fewer
+    /// than requested — the first time `alloc_order` returns `None` (only
+    /// possible on genuine System exhaustion; a healthy `refill()` never
+    /// partially fails). Returns the number of pointers written to `out`.
+    pub(crate) fn alloc_order_batch(&mut self, order: usize, out: &mut [*mut u8]) -> usize {
+        debug_assert!(order <= MAX_ORDER);
+        let mut n = 0;
+        while n < out.len() {
+            match self.alloc_order(order) {
+                Some(block) => {
+                    out[n] = block;
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        n
+    }
+
+    /// Free a batch of same-`order` blocks in one lock acquisition, for
+    /// `buddy_mag`'s flush path. Each call is exactly `free_order` — no
+    /// batch-specific logic — so the existing merge-on-spill trigger
+    /// (cache row overflow) fires normally per block; there is no separate
+    /// "batch merge" path to keep in sync with the eager-sweep prohibition
+    /// documented at the top of this file.
+    ///
+    /// # Safety
+    /// Every pointer in `blocks` must have been returned by `alloc`/
+    /// `alloc_order` at this same `order`, and not double-freed.
+    pub(crate) unsafe fn dealloc_order_batch(&mut self, order: usize, blocks: &[*mut u8]) {
+        debug_assert!(order <= MAX_ORDER);
+        for &ptr in blocks {
+            unsafe { self.free_order(ptr, order) };
+        }
     }
 
     // ---- internals --------------------------------------------------------
@@ -503,8 +577,34 @@ impl Buddy {
     /// — the original scheme mapped one region *per* top-order block, which
     /// made buddy-heavy workloads syscall-bound (hyperfine showed 24 ms
     /// outliers from mmap storms).
+    /// Hands out `BITMAP_WORDS` zeroed words for a freshly refilled region,
+    /// allocating a new batch `mmap` only every `BITMAP_BATCH` regions
+    /// instead of on every single one (see `BitmapBatch`'s doc).
+    fn alloc_bitmap(&mut self) -> Option<*mut u64> {
+        let need_new_batch = match self.bitmap_batches.last() {
+            Some(b) => b.used >= BITMAP_BATCH,
+            None => true,
+        };
+        if need_new_batch {
+            let bytes = BITMAP_WORDS * BITMAP_BATCH * 8;
+            let mapping = system::alloc_pages(bytes, 8)?;
+            let base = mapping.as_ptr() as *mut u64;
+            self.bitmap_batches.push(BitmapBatch {
+                base,
+                used: 0,
+                _mapping: mapping,
+            });
+        }
+        // Just pushed if empty/exhausted, so this is always Some.
+        let batch = self.bitmap_batches.last_mut().unwrap();
+        let ptr = unsafe { batch.base.add(batch.used * BITMAP_WORDS) };
+        batch.used += 1;
+        Some(ptr)
+    }
+
     fn refill(&mut self) -> Option<()> {
         let region = system::alloc_pages(REGION_BYTES, REGION_BYTES)?;
+        let bitmap = self.alloc_bitmap()?;
         let base = region.as_ptr();
         // Keep `regions` sorted by base so lookups can binary-search. Refill
         // is rare (once per 4 MiB), so the O(n) insert shift is noise.
@@ -515,7 +615,7 @@ impl Buddy {
             idx,
             Region {
                 base,
-                bitmap: vec![0u64; BITMAP_WORDS],
+                bitmap,
                 _mapping: region,
             },
         );
@@ -607,7 +707,7 @@ impl Buddy {
             .regions
             .iter()
             .map(|r| {
-                r.bitmap
+                r.bitmap_words()
                     .iter()
                     .map(|w| w.count_ones() as usize)
                     .sum::<usize>()
@@ -775,6 +875,29 @@ mod tests {
     }
 
     #[test]
+    fn bitmap_batches_span_correctly_across_many_regions() {
+        // Regression coverage for the bitmap-batching change: BITMAP_BATCH
+        // regions share one batch mmap, so forcing more regions than one
+        // batch holds exercises the batch-rollover path in `alloc_bitmap`.
+        // A batch-offset bug would show up as `check_invariants` seeing
+        // bitmap bits from the wrong region (aliased across the batch).
+        let per_region = REGION_BYTES / lohalloc_core::BUDDY_MAX;
+        let top = lohalloc_core::BUDDY_MAX;
+        let mut b = Buddy::new();
+        let target_regions = BITMAP_BATCH * 2 + 3; // spans 3 separate batches
+        let mut live = Vec::new();
+        for _ in 0..(target_regions * per_region) {
+            live.push(b.alloc(top).expect("top-order alloc"));
+        }
+        assert_eq!(b.region_count(), target_regions);
+        b.check_invariants();
+        for p in live.drain(..) {
+            unsafe { b.dealloc(p, top) };
+        }
+        b.check_invariants();
+    }
+
+    #[test]
     fn coalesce_across_top_blocks_stops_at_max_order() {
         // Free two adjacent top-order blocks: coalescing must stop at
         // MAX_ORDER (they stay two 1 MiB free blocks, never a 2 MiB one),
@@ -911,6 +1034,42 @@ mod tests {
         for p in ptrs {
             unsafe { b.dealloc(p, 4096) };
         }
+        b.check_invariants();
+    }
+
+    #[test]
+    fn batch_alloc_dealloc_roundtrip_preserves_invariants() {
+        // `alloc_order_batch`/`dealloc_order_batch` (buddy_mag's refill/
+        // flush primitives) must behave exactly like the same number of
+        // individual `alloc_order`/`free_order` calls — same blocks
+        // reachable, invariants intact — since batching is purely a lock-
+        // amortization shape, not a different algorithm.
+        let mut b = Buddy::new();
+        let order = order_for(64 * 1024).unwrap();
+
+        let mut buf = [core::ptr::null_mut::<u8>(); 6];
+        let n = b.alloc_order_batch(order, &mut buf);
+        assert_eq!(n, 6, "a fresh Buddy should satisfy a small batch in full");
+        b.check_invariants();
+
+        // All six pointers must be distinct and individually freeable.
+        let mut seen = std::collections::HashSet::new();
+        for &p in &buf {
+            assert!(
+                seen.insert(p as usize),
+                "batch alloc returned a duplicate pointer"
+            );
+        }
+
+        unsafe { b.dealloc_order_batch(order, &buf) };
+        b.check_invariants();
+
+        // The freed batch must be fully reusable afterwards.
+        let mut buf2 = [core::ptr::null_mut::<u8>(); 6];
+        let n2 = b.alloc_order_batch(order, &mut buf2);
+        assert_eq!(n2, 6);
+        b.check_invariants();
+        unsafe { b.dealloc_order_batch(order, &buf2) };
         b.check_invariants();
     }
 

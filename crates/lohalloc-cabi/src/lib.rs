@@ -129,24 +129,42 @@ fn freeze_after_threshold() -> Option<u64> {
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .filter(|&n| n > 0)
+            // The env var wins; the tune file's `freeze_after` key is the
+            // fallback (`ensure_model_loaded` has already populated the
+            // config by the time any top-level malloc gets here).
+            .or(lohalloc_alloc::tune::config().freeze_after)
     })
 }
 
+/// How often (in successful top-level mallocs) the `freeze_mode=converged`
+/// path polls `Lohalloc::is_converged()`. Polling takes the `state` Mutex
+/// and walks every Signature's arms, so it must not run per-op; every 256
+/// ops keeps the freeze point within noise of the true convergence point
+/// while costing ~nothing between polls.
+const CONVERGENCE_POLL_EVERY: u64 = 256;
+
 /// Called after every successful "real" (non-delegated) allocation. Freezes
-/// exactly once when the configured threshold is crossed, then becomes a
-/// single relaxed load for the rest of the process lifetime.
+/// exactly once — at a fixed op count (`freeze_mode=ops`, the default) or
+/// at detected bandit convergence (`freeze_mode=converged`, with the op
+/// count as a hard cap if also set) — then becomes a single relaxed load
+/// for the rest of the process lifetime.
 #[inline]
 fn maybe_auto_freeze() {
     if FREEZE_FIRED.load(Ordering::Relaxed) {
         return;
     }
-    let Some(threshold) = freeze_after_threshold() else {
+    let threshold = freeze_after_threshold();
+    let converged_mode =
+        lohalloc_alloc::tune::config().freeze_mode == lohalloc_alloc::tune::FreezeMode::Converged;
+    if threshold.is_none() && !converged_mode {
         return;
-    };
+    }
     let count = MALLOC_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     // `>=` + `swap` (not `== threshold`): several threads can cross the
     // threshold simultaneously; exactly one wins the swap and freezes.
-    if count >= threshold && !FREEZE_FIRED.swap(true, Ordering::Relaxed) {
+    let ops_hit = threshold.is_some_and(|t| count >= t);
+    let converged = converged_mode && count % CONVERGENCE_POLL_EVERY == 0 && ALLOC.is_converged();
+    if (ops_hit || converged) && !FREEZE_FIRED.swap(true, Ordering::Relaxed) {
         ALLOC.freeze();
         // Safe here: we are inside `with_freeze_check`'s depth bump, so any
         // allocation the export triggers (env read, Vec, file I/O buffers)
@@ -198,44 +216,74 @@ fn maybe_export_model() {
 fn ensure_model_loaded() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
-        let Ok(path) = std::env::var("LOHALLOC_MODEL") else {
-            return;
-        };
-        if path.is_empty() {
-            return;
-        }
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                if ALLOC.load(&bytes) {
-                    FREEZE_FIRED.store(true, Ordering::Relaxed);
-                    // Debug probe: report at exit how many Inference
-                    // lookups missed the loaded model — ~0 proves the
-                    // model's (ASLR-normalized) keys matched this fresh
-                    // process's call sites end to end.
-                    if std::env::var("LOHALLOC_DEBUG").is_ok() {
-                        unsafe {
-                            libc::atexit(report_pht_misses_at_exit);
+        // The whole body runs under the bootstrap guard: `env::var`'s own
+        // first-ever internal setup and `fs::read`'s `Vec<u8>` growth would
+        // otherwise be the *first-ever* calls into `ALLOC.alloc()` for this
+        // process, landing wherever ordinary Training-mode routing sends
+        // them (often Slab) — silently populating the Slab with a real
+        // region *before* `load()` ever runs, which permanently (and
+        // invisibly) disables `load()`'s header-free fast path (its
+        // `Slab::region_count() == 0` safety check would then see a
+        // nonzero count and correctly, but unhelpfully, decline). See
+        // `Lohalloc::with_bootstrap_guard`'s doc.
+        Lohalloc::with_bootstrap_guard(|| {
+            // Install the training config (LOHALLOC_TUNE file + LOHALLOC_*
+            // env overrides) before any training traffic — this is the one
+            // guarded bootstrap point where its env/file reads are safe
+            // (see `tune::load_from_env`'s re-entrancy contract). Cheap
+            // when unconfigured: two absent env-var reads.
+            lohalloc_alloc::tune::load_from_env();
+            let Ok(path) = std::env::var("LOHALLOC_MODEL") else {
+                return;
+            };
+            if path.is_empty() {
+                return;
+            }
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    if ALLOC.load(&bytes) {
+                        FREEZE_FIRED.store(true, Ordering::Relaxed);
+                        // Debug probe: report at exit how many Inference
+                        // lookups missed the loaded model — ~0 proves the
+                        // model's (ASLR-normalized) keys matched this fresh
+                        // process's call sites end to end.
+                        if std::env::var("LOHALLOC_DEBUG").is_ok() {
+                            unsafe {
+                                libc::atexit(report_pht_misses_at_exit);
+                            }
                         }
+                    } else {
+                        eprintln!(
+                            "lohalloc: LOHALLOC_MODEL={path} is malformed — staying in training"
+                        );
                     }
-                } else {
-                    eprintln!("lohalloc: LOHALLOC_MODEL={path} is malformed — staying in training");
+                }
+                Err(e) => {
+                    eprintln!(
+                        "lohalloc: could not read LOHALLOC_MODEL={path}: {e} — staying in training"
+                    );
                 }
             }
-            Err(e) => {
-                eprintln!(
-                    "lohalloc: could not read LOHALLOC_MODEL={path}: {e} — staying in training"
-                );
-            }
-        }
+        });
     });
 }
 
 /// atexit hook installed by `ensure_model_loaded` under `LOHALLOC_DEBUG`.
 extern "C" fn report_pht_misses_at_exit() {
+    use lohalloc_core::Backend;
     eprintln!(
         "lohalloc: pht_misses={} (model-loaded run; ~0 means the model matched this process)",
         Lohalloc::pht_miss_count()
     );
+    eprintln!(
+        "lohalloc: routes slab={} buddy={} system={} arena={} fallthrough={}",
+        Lohalloc::route_count(Backend::Slab),
+        Lohalloc::route_count(Backend::Buddy),
+        Lohalloc::route_count(Backend::System),
+        Lohalloc::route_count(Backend::Arena),
+        Lohalloc::fallthrough_count(),
+    );
+    eprintln!("lohalloc: slab_headerless={}", ALLOC.is_slab_headerless());
 }
 
 /// Runs `f` (an `ALLOC.alloc(...)` call), then — only for a true top-level,
@@ -511,6 +559,15 @@ pub extern "C" fn lohalloc_is_inference() -> c_int {
 #[no_mangle]
 pub extern "C" fn lohalloc_pht_misses() -> u64 {
     Lohalloc::pht_miss_count()
+}
+
+/// True (`1`) if the process-wide allocator is currently serving Slab
+/// allocations header-free (only possible after `LOHALLOC_MODEL`/
+/// `lohalloc_load_model` on a still-empty Slab — see `Lohalloc::load()`'s
+/// doc). Debug/introspection only.
+#[no_mangle]
+pub extern "C" fn lohalloc_slab_headerless() -> c_int {
+    ALLOC.is_slab_headerless() as c_int
 }
 
 /// Load a `.lohalloc` model file, starting the process-wide allocator

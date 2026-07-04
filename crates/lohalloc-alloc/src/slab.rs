@@ -35,6 +35,16 @@ pub struct Slab {
 /// Number of slab size classes (compile-time constant so `new()` can be const).
 const NUM_CLASSES: usize = SLAB_SIZE_CLASSES.len();
 
+/// Fixed region size used for header-free segments (see
+/// `alloc_class_headerless`/`alloc_batch_headerless`): every headerless
+/// region is exactly this many bytes, aligned to this boundary, so `ptr &
+/// !(SEGMENT_SIZE - 1)` always recovers a real segment base for any live
+/// pointer inside it — the property `registry::SegmentRegistry`'s
+/// mask-based lookup depends on. Well above every slab class's stride
+/// (largest is 16 KiB), so even the largest class gets several blocks per
+/// segment.
+pub const SEGMENT_SIZE: usize = 64 * 1024;
+
 impl Default for Slab {
     fn default() -> Self {
         Self::new()
@@ -148,6 +158,127 @@ impl Slab {
         for &b in blocks {
             unsafe { self.dealloc_class(b, class) };
         }
+    }
+
+    /// Like `alloc_class`, but every refill this call triggers maps an
+    /// exact `SEGMENT_SIZE`-aligned/sized region (instead of the usual
+    /// stride-based sizing) and reports that region's base back to the
+    /// caller on the call that mapped it — the caller must register the
+    /// base in the ownership registry (`registry::SegmentRegistry`) before
+    /// any block from it can be validly recovered on the dealloc side.
+    ///
+    /// Blocks from a headerless-mode region are otherwise ordinary slab
+    /// blocks: they flow through the same free list, `dealloc_class`, and
+    /// magazine layer as header-carrying blocks. The two flavors are never
+    /// mixed within one class's free list in practice, because a
+    /// `Lohalloc` instance either serves every class headerless from its
+    /// very first allocation or not at all — see `lib.rs`'s
+    /// `slab_headerless`, set only by `load()` (never by a live-trained
+    /// `freeze()`), so a headerless-eligible instance's Slab starts, and
+    /// stays, completely empty of header-carrying blocks.
+    /// `try_register(base)` must attempt to record `base` in the caller's
+    /// segment ownership registry and report whether it succeeded — see
+    /// `refill_segment`'s doc for why a failed registration must prevent
+    /// this segment's blocks from ever reaching the free list.
+    pub fn alloc_class_headerless(
+        &mut self,
+        class: usize,
+        try_register: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<(*mut u8, Option<usize>)> {
+        debug_assert!(class < NUM_CLASSES);
+        if let Some(block) = self.free_heads[class].take() {
+            let node = unsafe { &mut *block };
+            self.free_heads[class] = node.next;
+            return Some((block as *mut u8, None));
+        }
+        let new_base = self.refill_segment(class, try_register)?;
+        let block = self.free_heads[class].take()?;
+        let node = unsafe { &mut *block };
+        self.free_heads[class] = node.next;
+        Some((block as *mut u8, Some(new_base)))
+    }
+
+    /// Batch counterpart of `alloc_class_headerless`, for the magazine
+    /// refill path: pops up to `out.len()` blocks, refilling with
+    /// `SEGMENT_SIZE`-aligned regions as needed via `try_register` (see
+    /// `refill_segment`'s doc). Returns how many blocks were written to
+    /// `out` — fewer than requested (possibly 0) if a refill's
+    /// registration fails and no more free blocks remain, exactly as if
+    /// the underlying `mmap` had failed; the caller falls through to the
+    /// next backend in the routing chain, same as any other Slab
+    /// exhaustion.
+    pub fn alloc_batch_headerless(
+        &mut self,
+        class: usize,
+        out: &mut [*mut u8],
+        try_register: &mut dyn FnMut(usize) -> bool,
+    ) -> usize {
+        debug_assert!(class < NUM_CLASSES);
+        let mut n = 0;
+        while n < out.len() {
+            match self.free_heads[class].take() {
+                Some(block) => {
+                    let node = unsafe { &mut *block };
+                    self.free_heads[class] = node.next;
+                    out[n] = block as *mut u8;
+                    n += 1;
+                }
+                None => match self.refill_segment(class, try_register) {
+                    Some(_) => {}
+                    None => break,
+                },
+            }
+        }
+        n
+    }
+
+    /// Maps one fresh `SEGMENT_SIZE`-aligned/sized region and threads all
+    /// its blocks onto `class`'s free list. Returns the region's base.
+    ///
+    /// Calls `try_register(base)` **before** threading any block onto the
+    /// free list or retaining the mapping: a headerless block that reaches
+    /// `dealloc` without its segment being registry-registered has no
+    /// header to fall back on (it was carved with none, by design) — the
+    /// old code registered *after* handing blocks out via a separately
+    /// collected `new_regions` list, so a saturated registry (a real,
+    /// reachable condition under sustained headerless churn — the fixed
+    /// `SegmentRegistry` capacity trades this off against the stack-
+    /// overflow risk of a larger embedded table, see `registry.rs`) still
+    /// silently served blocks nobody could safely free: `dealloc` read
+    /// `ptr - HEADER_SIZE` as a `Header` on the registry miss and either
+    /// mis-happened to look like a bad-magic block (silently leaked) or,
+    /// worse, read before the segment's mapped range entirely (blocks near
+    /// a segment's start) and segfaulted. If `try_register` fails, the
+    /// mapping is dropped immediately (unmapped, never pushed to
+    /// `self.regions`, never threaded onto any free list) and this refill
+    /// reports failure — identical to an `mmap` failure from the caller's
+    /// perspective, so the normal Slab-exhaustion fallthrough handles it.
+    fn refill_segment(
+        &mut self,
+        class: usize,
+        try_register: &mut dyn FnMut(usize) -> bool,
+    ) -> Option<usize> {
+        let region = system::alloc_pages(SEGMENT_SIZE, SEGMENT_SIZE)?;
+        let base = region.as_ptr();
+        if !try_register(base as usize) {
+            // `region` drops here, munmapping it — never threaded onto any
+            // free list, so no headerless block is ever handed out from it.
+            return None;
+        }
+        let stride = align_up(SLAB_SIZE_CLASSES[class], lohalloc_core::MIN_ALIGN);
+        let n = SEGMENT_SIZE / stride;
+
+        let mut next = self.free_heads[class];
+        for i in (0..n).rev() {
+            let block = unsafe { base.add(i * stride) } as *mut FreeNode;
+            unsafe {
+                (*block).next = next;
+            }
+            next = Some(block);
+        }
+        self.free_heads[class] = next;
+        self.regions.push(region);
+        Some(base as usize)
     }
 
     /// Map a fresh region sized to hold several `class_size` blocks and thread

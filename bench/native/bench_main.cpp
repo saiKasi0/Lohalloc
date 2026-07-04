@@ -48,28 +48,19 @@ void cpp_string_build(size_t ops) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
-                "usage: %s <slab|arena|buddy|system|adv-mixed|cpp-vector|cpp-string> [ops]\n",
+                "usage: %s <slab|arena|buddy|system|adv-mixed|mt-slab-tN|mt-mixed-tN|mt-xfree-tN"
+                "|cpp-vector|cpp-string> [ops]\n",
                 argv[0]);
         return 2;
     }
     const std::string workload = argv[1];
     size_t ops = argc >= 3 ? static_cast<size_t>(strtoull(argv[2], nullptr, 10)) : 50000;
 
-    if (workload == "slab") {
-        workload_slab_churn(ops);
-    } else if (workload == "arena") {
-        workload_arena_bursts(ops / 500 > 0 ? ops / 500 : 1, 500);
-    } else if (workload == "buddy") {
-        workload_buddy_interleaved(ops);
-    } else if (workload == "system") {
-        workload_system_large(ops / 20 > 0 ? ops / 20 : 1);
-    } else if (workload == "adv-mixed") {
-        workload_adversarial_mixed(ops);
-    } else if (workload == "cpp-vector") {
+    if (workload == "cpp-vector") {
         cpp_vector_churn(ops);
     } else if (workload == "cpp-string") {
         cpp_string_build(ops);
-    } else {
+    } else if (!dispatch_workload(workload.c_str(), ops)) {
         fprintf(stderr, "unknown workload '%s'\n", workload.c_str());
         return 2;
     }

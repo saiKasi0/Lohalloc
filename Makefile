@@ -35,7 +35,7 @@ endif
 # ---- Phony targets ----
 .PHONY: help all shim example-sink demo-sink binaries \
         server server-debug gui dev test e2e lint fmt clean \
-        bench-all bench-all-host bench-image bench-latency bench graphs \
+        bench-all bench-all-host bench-image bench-latency bench bench-tune graphs \
         bench-native bench-cache bench-native-host bench-cache-host bench-rust-bins bench-report
 
 help:
@@ -61,6 +61,7 @@ help:
 	@echo "  make bench-cache    — native cachegrind cache-miss pass (Docker)"
 	@echo "  make bench-report   — aggregate results/<timestamp>/raw into report + graphs (use RUN_DIR=...)"
 	@echo "  make graphs RUN_DIR=results/<ts>  — re-render graphs for an existing run"
+	@echo "  make bench-tune     — Step 8 tune-config ablation sweep (GRID=, TUNE_WORKLOADS=, TUNE_OUT=)"
 
 # ---- Builds ----
 shim:
@@ -175,6 +176,18 @@ bench-latency:
 				--workload "$$workload" --mode "$$mode" --ops 100000 --out "$$out" || exit 1; \
 		done; \
 	done
+
+# Step 8 ablation sweep: run the training->inference pipeline once per
+# tune-config grid point and rank by the metric each focus optimizes.
+# Override GRID / WORKLOADS / TUNE_OPS as needed. Same-session (all child
+# runs back-to-back on this host); results in $(TUNE_OUT)/tune-report.md.
+GRID ?= bench/tune-grid.json
+TUNE_WORKLOADS ?= slab,buddy,adv-mixed
+TUNE_OPS ?= 100000
+TUNE_OUT ?= results/tune-sweep
+bench-tune:
+	cargo run -p lohalloc-bench --bin tune_sweep --release -- \
+		--grid $(GRID) --workloads $(TUNE_WORKLOADS) --ops $(TUNE_OPS) --out $(TUNE_OUT)
 
 # Full Rust suite: criterion micro/hypothesis/comparison benches (the
 # --save-baseline runs feed criterion's own HTML diff, not the report graphs)

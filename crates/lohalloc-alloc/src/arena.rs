@@ -37,6 +37,8 @@
 //! correlated lifetimes (e.g. all allocations within a single request
 //! handler). Dealloc for Arena-tagged blocks stays a no-op in `lib.rs`.
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::system;
 use lohalloc_core::{align_up, round_up_pow2, MIN_ALIGN};
 
@@ -50,20 +52,29 @@ const DEFAULT_CHUNK_SIZE: usize = 1 << 20; // 1 MiB
 const MAX_CHUNKS: usize = 32;
 
 /// One mmap-backed bump chunk.
-struct Chunk {
+///
+/// `cursor` is an `AtomicUsize` (not a plain `usize`) so `lib.rs`'s
+/// lock-free fast path can bump it directly via CAS, without taking
+/// `Lohalloc`'s `arena` `Mutex` at all — see that module's
+/// `arena_alloc_fast`. The slow path here (under the Mutex, single-writer)
+/// still uses the same atomic via a plain load/store, which is just as
+/// cheap as a bare field access and keeps exactly one source of truth for
+/// "how full is this chunk" between the two paths.
+pub(crate) struct Chunk {
     /// The backing mapping. Kept alive so the memory stays mapped; its
     /// `Drop` releases the mapping when the arena is dropped.
     #[allow(dead_code)]
     mapping: system::Mapping,
     /// Aligned start of the chunk.
-    base: *mut u8,
+    pub(crate) base: *mut u8,
     /// Usable bytes from `base`.
-    capacity: usize,
+    pub(crate) capacity: usize,
     /// Next free byte. `base <= cursor <= base + capacity`.
-    cursor: usize,
+    pub(crate) cursor: AtomicUsize,
 }
 
 unsafe impl Send for Chunk {}
+unsafe impl Sync for Chunk {}
 
 impl Chunk {
     fn new(size: usize) -> Option<Self> {
@@ -81,21 +92,24 @@ impl Chunk {
             mapping,
             base,
             capacity,
-            cursor: base as usize,
+            cursor: AtomicUsize::new(base as usize),
         })
     }
 
+    /// Slow-path bump, called with `Lohalloc`'s `arena` Mutex held (so a
+    /// plain load/store on the atomic is fine — no concurrent writer).
     fn alloc(&mut self, size: usize, align: usize) -> Option<*mut u8> {
-        let aligned = align_up(self.cursor, align);
+        let cur = *self.cursor.get_mut();
+        let aligned = align_up(cur, align);
         if aligned.checked_add(size)? > (self.base as usize) + self.capacity {
             return None;
         }
-        self.cursor = aligned + size;
+        *self.cursor.get_mut() = aligned + size;
         Some(aligned as *mut u8)
     }
 
     fn used(&self) -> usize {
-        self.cursor - self.base as usize
+        self.cursor.load(Ordering::Relaxed) - self.base as usize
     }
 }
 
@@ -187,9 +201,16 @@ impl BumpArena {
     /// stay mapped (recycled on the next fill cycle).
     pub fn reset(&mut self) {
         for chunk in &mut self.chunks {
-            chunk.cursor = chunk.base as usize;
+            *chunk.cursor.get_mut() = chunk.base as usize;
         }
         self.current = 0;
+    }
+
+    /// The chunk currently being bumped — `lib.rs` reads this to (re)publish
+    /// the lock-free fast path's descriptor after taking the slow path
+    /// (initial arena creation, a chunk advance, or a `reset`).
+    pub(crate) fn current_chunk(&self) -> &Chunk {
+        &self.chunks[self.current]
     }
 
     /// Total usable capacity across all currently mapped chunks (bytes).

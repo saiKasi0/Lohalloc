@@ -23,4 +23,5 @@ name = "lohalloc_cabi"
 
 [dependencies]
 lohalloc-alloc.workspace = true
+lohalloc-core.workspace = true
 libc = "0.2"

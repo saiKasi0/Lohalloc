@@ -236,6 +236,68 @@ pub fn workload_adversarial_mixed<D: AllocDriver>(driver: &D, hash: u64, ops: us
     }
 }
 
+/// W-MT-SLAB: `threads` independent threads, each running a same-thread
+/// copy of [`workload_slab_churn`] (own live window, own allocs+frees).
+/// Isolates magazine/tcache scaling under concurrent but non-cross-thread
+/// traffic — no thread ever touches another thread's blocks. Mirrors
+/// `bench/native/workloads.c::workload_mt_slab_churn`.
+pub fn workload_mt_slab_churn<D: AllocDriver + Sync>(driver: &D, threads: usize, ops: usize) {
+    let threads = threads.max(1);
+    let per_thread = (ops / threads).max(1);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| workload_slab_churn(driver, 0, per_thread));
+        }
+    });
+}
+
+/// W-MT-MIXED: `threads` independent threads, each running a same-thread
+/// copy of [`workload_adversarial_mixed`]. Isolates medium/buddy-range lock
+/// contention under concurrent traffic. Mirrors
+/// `bench/native/workloads.c::workload_mt_adversarial_mixed`.
+pub fn workload_mt_adversarial_mixed<D: AllocDriver + Sync>(
+    driver: &D,
+    threads: usize,
+    ops: usize,
+) {
+    let threads = threads.max(1);
+    let per_thread = (ops / threads).max(1);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| workload_adversarial_mixed(driver, 0, per_thread));
+        }
+    });
+}
+
+/// W-MT-XFREE: `threads` threads paired into producer/consumer roles over a
+/// bounded channel — the producer allocates, the consumer frees a
+/// *different* thread's allocation. The hard cross-thread-free case: every
+/// freed block must migrate back through whatever thread-local structures
+/// the allocator uses on the alloc side. Mirrors
+/// `bench/native/workloads.c::workload_mt_xfree`'s mailbox-ring design (a
+/// bounded `sync_channel` is the Rust-idiomatic equivalent).
+pub fn workload_mt_xfree<D: AllocDriver + Sync>(driver: &D, threads: usize, ops: usize) {
+    let pairs = (threads / 2).max(1);
+    let ops_per_pair = (ops / pairs).max(1);
+    let layout = Layout::from_size_align(SMALL_FIXED_REQUEST, 16).unwrap();
+    std::thread::scope(|scope| {
+        for _ in 0..pairs {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(256);
+            scope.spawn(move || {
+                for _ in 0..ops_per_pair {
+                    let p = unsafe { driver.alloc(layout, 0) };
+                    tx.send(p as usize).expect("consumer thread panicked");
+                }
+            });
+            scope.spawn(move || {
+                for addr in rx {
+                    unsafe { driver.dealloc(addr as *mut u8, layout, 0) };
+                }
+            });
+        }
+    });
+}
+
 /// W-ADV-EXHAUST: long-lived small allocations, never freed by the
 /// generator — returned to the caller so it can free them after asserting
 /// on routing/exhaustion behavior. Used with a forced-Arena model to

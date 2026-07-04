@@ -156,14 +156,46 @@ impl AllocatorState {
     /// additional reward sample on the same arm so Arena's free-is-a-no-op
     /// advantage becomes visible to the bandit).
     ///
-    /// - **Training**: converts `latency_ns` to a bounded reward (see
-    ///   [`latency_to_reward`]) and updates the bandit's arm statistics.
+    /// - **Training**: converts `latency_ns` (plus, when `frag_weight > 0`,
+    ///   the allocation's internal-fragmentation percentage) to a shaped
+    ///   reward (see [`shaped_reward`]) and updates the bandit's arm
+    ///   statistics. `total_bytes` is the backend-facing allocation size
+    ///   (request + header padding) the fragmentation math needs; it is
+    ///   only inspected when the configured `frag_weight` is nonzero, so
+    ///   the default config pays nothing for it.
     /// - **Inference**: no-op (the routing table is immutable).
-    pub fn record_latency(&mut self, hash: u64, backend: Backend, size_class: u8, latency_ns: u64) {
+    pub fn record_latency(
+        &mut self,
+        hash: u64,
+        backend: Backend,
+        size_class: u8,
+        latency_ns: u64,
+        total_bytes: usize,
+    ) {
         if let Self::Training { bandit } = self {
             let sig = Signature::new(hash, size_class);
-            let reward = latency_to_reward(latency_ns);
+            let cfg = crate::tune::config();
+            let frag_pct = if cfg.frag_weight > 0.0 {
+                crate::frag_pct_for(backend, total_bytes)
+            } else {
+                0.0
+            };
+            let reward = shaped_reward(latency_ns, frag_pct, cfg);
             bandit.update(sig, backend, reward);
+        }
+    }
+
+    /// True when this state's routing has stabilized enough to freeze —
+    /// the `freeze_mode=converged` trigger, forwarded to
+    /// [`BanditPolicy::is_converged`] with the configured thresholds.
+    /// Inference mode is trivially "converged" (already frozen).
+    pub fn is_converged(&self) -> bool {
+        match self {
+            Self::Training { bandit } => {
+                let cfg = crate::tune::config();
+                bandit.is_converged(cfg.converge_stable_n)
+            }
+            Self::Inference { .. } => true,
         }
     }
 
@@ -180,7 +212,17 @@ impl AllocatorState {
     pub fn freeze(&mut self) {
         match self {
             Self::Training { bandit } => {
-                let entries = bandit.freeze();
+                let entries = bandit
+                    .freeze()
+                    .into_iter()
+                    .map(|(key, size_class, backend)| {
+                        (
+                            key,
+                            size_class,
+                            clamp_backend_for_size_class(size_class, backend),
+                        )
+                    })
+                    .collect();
                 let table = PerfectHashTable::from_entries(entries);
                 *self = Self::Inference {
                     routing_table: table,
@@ -257,30 +299,71 @@ impl AllocatorState {
 /// frozen routing table, or as a sanity fallback).
 pub(crate) fn default_backend_for_size(size: usize) -> Backend {
     let total_with_header = size + 48; // Header is 48 bytes.
-    if total_with_header <= lohalloc_core::SLAB_MAX {
+    let size_class = size_class_for(total_with_header);
+    default_backend_for_size_class(size_class)
+}
+
+/// The size-appropriate backend for a `size_class_for` bucket: Slab for the
+/// 12 slab classes (0–11), Buddy for the two Buddy-range buckets (12, 13),
+/// System only for the genuinely-large bucket (14, > 1 MiB). Shared by
+/// `default_backend_for_size` (raw-size fallback) and
+/// `clamp_backend_for_size_class` (freeze-time sanity check).
+pub(crate) fn default_backend_for_size_class(size_class: u8) -> Backend {
+    if size_class <= 11 {
         Backend::Slab
-    } else if total_with_header <= lohalloc_core::BUDDY_MAX {
+    } else if size_class <= 13 {
         Backend::Buddy
     } else {
         Backend::System
     }
 }
 
-/// Reference latency (nanoseconds) for the Layer 2 reward curve: fast paths
-/// (Slab/Arena/Buddy pops, all tens of nanoseconds) saturate near a reward of
-/// 1.0, while slow events (mmap, region refill, a failed recommendation
-/// falling through) pull the reward toward 0 — that gap is the
-/// differentiation signal the bandit needs to actually learn which backend
-/// is fast for a given call site, replacing the old static
-/// `BASELINE_REWARDS` cost model.
-const T_REF_NS: f64 = 50.0;
+/// Freeze-time sanity clamp: a Signature whose size class fits Slab or Buddy
+/// must never freeze to System. Without this, a bandit that locked onto
+/// System from early noise (a low `LOHALLOC_FREEZE_AFTER` cutoff, or a few
+/// unlucky early samples) produces a frozen entry that always succeeds
+/// (`try_backend(System)` never fails, so there is no fallthrough
+/// self-correction the way there is for a bad Slab/Arena recommendation) —
+/// every allocation at that Signature becomes an mmap/munmap instead of a
+/// Slab/Buddy pop, observed as a >5x inference-slower-than-training
+/// regression on cpp/buddy. This is a strict narrowing to what the
+/// fallthrough chain would already do for an out-of-range recommendation;
+/// it never changes behavior for a Signature that legitimately belongs on
+/// System (size_class 14).
+fn clamp_backend_for_size_class(size_class: u8, backend: Backend) -> Backend {
+    if backend == Backend::System && size_class <= 13 {
+        return default_backend_for_size_class(size_class);
+    }
+    backend
+}
 
-/// Map a measured latency to a bounded `(0, 1]` reward. Monotone decreasing
-/// and scale-tolerant across machines: doubling every latency in a run
-/// shifts individual rewards but preserves their relative ordering, which is
-/// all UCB1 needs to pick the empirically-faster arm.
-fn latency_to_reward(latency_ns: u64) -> f64 {
-    T_REF_NS / (T_REF_NS + latency_ns as f64)
+/// Map a measured latency (and optionally an internal-fragmentation
+/// percentage) to the bandit's reward under the given config.
+///
+/// The latency term `t_ref / (t_ref + latency)` is monotone decreasing and
+/// scale-tolerant across machines: doubling every latency in a run shifts
+/// individual rewards but preserves their relative ordering, which is all
+/// UCB1 needs to pick the empirically-faster arm. `t_ref_ns` (default 50,
+/// the former hard-coded `T_REF_NS`) sets the curve's knee: fast paths
+/// (Slab/Arena/Buddy pops, tens of ns) saturate near 1.0 while slow events
+/// (mmap, region refill, failed-recommendation fallthrough) pull toward 0.
+/// A *small* `t_ref` punishes tail latencies hard (latency focus); a
+/// *large* one flattens the curve toward mean-cost optimization
+/// (throughput focus) — this is what the `focus` presets in `tune.rs`
+/// tune.
+///
+/// The fragmentation term subtracts `frag_weight` per 100% internal
+/// fragmentation (`frag_pct` from [`crate::frag_pct_for`]), letting a
+/// throughput/memory-density-focused config prefer a backend that packs
+/// tighter when raw latencies are close. `frag_weight = 0` (the default)
+/// reproduces the pre-Step-8 reward bit-for-bit.
+pub(crate) fn shaped_reward(
+    latency_ns: u64,
+    frag_pct: f32,
+    cfg: &crate::tune::TrainingConfig,
+) -> f64 {
+    cfg.t_ref_ns / (cfg.t_ref_ns + latency_ns as f64)
+        - cfg.frag_weight * f64::from(frag_pct) / 100.0
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +382,54 @@ mod tests {
         assert_eq!(size_class_for(16), 1);
         assert_eq!(size_class_for(100), 4); // 128
         assert_eq!(size_class_for(16384), 11); // SLAB_MAX
+    }
+
+    #[test]
+    fn shaped_reward_default_matches_pre_step8_curve() {
+        // frag_weight = 0 (the default) must reproduce the historical
+        // `T_REF_NS / (T_REF_NS + latency)` reward bit-for-bit — including
+        // total insensitivity to the frag_pct argument.
+        let cfg = crate::tune::TrainingConfig::default();
+        for latency in [0u64, 10, 50, 1000, 1_000_000] {
+            let legacy = 50.0 / (50.0 + latency as f64);
+            assert_eq!(shaped_reward(latency, 0.0, &cfg), legacy);
+            assert_eq!(
+                shaped_reward(latency, 87.5, &cfg),
+                legacy,
+                "frag_pct must be inert at frag_weight = 0"
+            );
+        }
+    }
+
+    #[test]
+    fn shaped_reward_frag_weight_penalizes_fragmentation() {
+        let cfg = crate::tune::TrainingConfig {
+            frag_weight: 0.1,
+            ..crate::tune::TrainingConfig::default()
+        };
+        let tight = shaped_reward(100, 0.0, &cfg);
+        let wasteful = shaped_reward(100, 50.0, &cfg);
+        // Same latency, 50% internal fragmentation -> reward drops by
+        // exactly frag_weight * 0.5.
+        assert!((tight - wasteful - 0.05).abs() < 1e-12);
+        assert!(wasteful < tight);
+    }
+
+    #[test]
+    fn shaped_reward_t_ref_sets_curve_knee() {
+        // A larger t_ref flattens the curve: the same slow op is punished
+        // less (throughput focus tolerates occasional slow ops in exchange
+        // for better mean behavior); a small t_ref punishes it harder.
+        let latency = 500u64;
+        let sharp = crate::tune::TrainingConfig {
+            t_ref_ns: 50.0,
+            ..crate::tune::TrainingConfig::default()
+        };
+        let flat = crate::tune::TrainingConfig {
+            t_ref_ns: 200.0,
+            ..crate::tune::TrainingConfig::default()
+        };
+        assert!(shaped_reward(latency, 0.0, &flat) > shaped_reward(latency, 0.0, &sharp));
     }
 
     #[test]
@@ -329,7 +460,7 @@ mod tests {
                 ),
                 "route should return a valid backend"
             );
-            state.record_latency(42, backend, size_class_for(64), 10);
+            state.record_latency(42, backend, size_class_for(64), 10, 64);
         }
     }
 
@@ -339,7 +470,7 @@ mod tests {
         // Train a bit.
         for _ in 0..10 {
             let backend = state.route(100, 64);
-            state.record_latency(100, backend, size_class_for(64), 10);
+            state.record_latency(100, backend, size_class_for(64), 10, 64);
         }
         assert!(!state.is_inference());
         state.freeze();
@@ -353,10 +484,10 @@ mod tests {
         for _ in 0..100 {
             let backend = state.route(100, 64);
             if backend == Backend::Arena {
-                state.record_latency(100, backend, size_class_for(64), 10);
+                state.record_latency(100, backend, size_class_for(64), 10, 64);
             } else {
                 // Manually record Arena as winning.
-                state.record_latency(100, Backend::Arena, size_class_for(64), 10);
+                state.record_latency(100, Backend::Arena, size_class_for(64), 10, 64);
             }
         }
         state.freeze();
@@ -377,12 +508,12 @@ mod tests {
         let mut state = AllocatorState::new_training();
         for _ in 0..10 {
             let backend = state.route(50, 64);
-            state.record_latency(50, backend, size_class_for(64), 10);
+            state.record_latency(50, backend, size_class_for(64), 10, 64);
         }
         state.freeze();
 
         // record_latency() in Inference mode should be a no-op (not panic).
-        state.record_latency(50, Backend::Slab, size_class_for(64), 10);
+        state.record_latency(50, Backend::Slab, size_class_for(64), 10, 64);
         // If we get here, it didn't panic.
     }
 
@@ -392,7 +523,7 @@ mod tests {
         // Train only hash 100.
         for _ in 0..10 {
             let backend = state.route(100, 64);
-            state.record_latency(100, backend, size_class_for(64), 10);
+            state.record_latency(100, backend, size_class_for(64), 10, 64);
         }
         state.freeze();
 
@@ -412,16 +543,60 @@ mod tests {
     }
 
     #[test]
+    fn freeze_clamps_system_lock_for_buddy_range_size() {
+        // 20_000 bytes → size_class 12 (> 16 KiB, <= 64 KiB: Buddy range).
+        let size = 20_000usize;
+        let sc = size_class_for(size);
+        assert_eq!(sc, 12);
+
+        let mut state = AllocatorState::new_training();
+        for _ in 0..20 {
+            let _ = state.route(200, size);
+            // Force every observation's reward onto System regardless of
+            // what was actually recommended — same pattern as
+            // `inference_mode_routes_via_perfect_hash`'s forced-Arena case.
+            state.record_latency(200, Backend::System, sc, 10, size);
+        }
+        state.freeze();
+
+        let backend = state.route(200, size);
+        assert_ne!(
+            backend,
+            Backend::System,
+            "a Signature whose size class fits Buddy must never freeze to System"
+        );
+        assert_eq!(backend, Backend::Buddy);
+    }
+
+    #[test]
+    fn clamp_is_a_noop_for_genuinely_large_sizes() {
+        // size_class 14 (> 1 MiB) legitimately belongs on System — the
+        // clamp must never touch it.
+        let size = 2 * 1024 * 1024usize;
+        let sc = size_class_for(size);
+        assert_eq!(sc, 14);
+
+        let mut state = AllocatorState::new_training();
+        for _ in 0..20 {
+            let _ = state.route(201, size);
+            state.record_latency(201, Backend::System, sc, 10, size);
+        }
+        state.freeze();
+
+        assert_eq!(state.route(201, size), Backend::System);
+    }
+
+    #[test]
     fn export_load_roundtrip() {
         let mut state = AllocatorState::new_training();
         // Train a few signatures.
         for _ in 0..20 {
             let backend = state.route(1, 64);
-            state.record_latency(1, backend, size_class_for(64), 10);
+            state.record_latency(1, backend, size_class_for(64), 10, 64);
         }
         for _ in 0..20 {
             let backend = state.route(2, 256);
-            state.record_latency(2, backend, size_class_for(256), 10);
+            state.record_latency(2, backend, size_class_for(256), 10, 256);
         }
         state.freeze();
 
@@ -442,7 +617,7 @@ mod tests {
         let mut state = AllocatorState::new_training();
         for _ in 0..10 {
             let backend = state.route(42, 64);
-            state.record_latency(42, backend, size_class_for(64), 10);
+            state.record_latency(42, backend, size_class_for(64), 10, 64);
         }
         state.freeze();
         let bytes = state.export().unwrap();
@@ -485,12 +660,12 @@ mod tests {
         // Train hash 100 a few times.
         for _ in 0..5 {
             let b = state.route(100, 64);
-            state.record_latency(100, b, size_class_for(64), 10);
+            state.record_latency(100, b, size_class_for(64), 10, 64);
         }
         // Train hash 200 a few times.
         for _ in 0..5 {
             let b = state.route(200, 128);
-            state.record_latency(200, b, size_class_for(128), 10);
+            state.record_latency(200, b, size_class_for(128), 10, 128);
         }
         assert_eq!(state.signature_count(), 2);
 
@@ -506,7 +681,7 @@ mod tests {
         let mut state = AllocatorState::new_training();
         for _ in 0..10 {
             let b = state.route(42, 64);
-            state.record_latency(42, b, size_class_for(64), 10);
+            state.record_latency(42, b, size_class_for(64), 10, 64);
         }
         state.freeze();
         assert!(state.routing_snapshot().is_empty());
@@ -518,7 +693,7 @@ mod tests {
         let mut state = AllocatorState::new_training();
         for _ in 0..10 {
             let b = state.route(42, 64);
-            state.record_latency(42, b, size_class_for(64), 10);
+            state.record_latency(42, b, size_class_for(64), 10, 64);
         }
         assert!(!state.is_inference());
         assert_eq!(state.signature_count(), 1);

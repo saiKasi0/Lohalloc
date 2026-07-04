@@ -39,19 +39,22 @@
 pub mod arena;
 pub mod bandit;
 pub mod buddy;
+mod buddy_mag;
 mod clock;
 mod magazine;
 #[cfg(feature = "telemetry-observer")]
 pub mod observer;
 pub mod perfect_hash;
+mod registry;
 pub mod slab;
 pub mod state;
 pub mod system;
 pub mod topology;
+pub mod tune;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::Cell;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use lohalloc_core::{align_up, BUDDY_MAX, MIN_ALIGN, SLAB_MAX};
 use std::sync::Mutex;
 
@@ -135,12 +138,22 @@ fn header_pad(align: usize) -> usize {
 /// `telemetry-observer` is off — production builds pay nothing for it.
 #[cfg(feature = "telemetry-observer")]
 fn fragmentation_pct_for(backend: Backend, total: usize) -> f32 {
+    frag_pct_for(backend.to_core(), total)
+}
+
+/// The always-available core of the fragmentation math (un-gated in Step 8
+/// so `state::shaped_reward`'s optional `frag_weight` penalty can use it —
+/// production builds with the default `frag_weight = 0` never call it, and
+/// the observer-gated wrapper above keeps the telemetry path unchanged).
+/// Takes `lohalloc_core::Backend` because the reward path (`state.rs`)
+/// works in core types.
+pub(crate) fn frag_pct_for(backend: lohalloc_core::Backend, total: usize) -> f32 {
     let reserved = match backend {
-        Backend::Slab => lohalloc_core::slab_class_for(total)
+        lohalloc_core::Backend::Slab => lohalloc_core::slab_class_for(total)
             .map(|class| lohalloc_core::SLAB_SIZE_CLASSES[class]),
-        Backend::Buddy => buddy::order_for(total).map(buddy::block_size),
-        Backend::System => Some(align_up(total, system::page_size())),
-        Backend::Arena => None,
+        lohalloc_core::Backend::Buddy => buddy::order_for(total).map(buddy::block_size),
+        lohalloc_core::Backend::System => Some(align_up(total, system::page_size())),
+        lohalloc_core::Backend::Arena => None,
     };
     match reserved {
         Some(reserved) if reserved > total => (reserved - total) as f32 / reserved as f32 * 100.0,
@@ -267,7 +280,46 @@ pub struct Lohalloc {
     /// reader may still hold `&*table`; a full RCU scheme is overkill for
     /// a GUI dev button, and leakage is bounded by freeze/reset cycles).
     frozen_table: AtomicPtr<perfect_hash::PerfectHashTable>,
+    /// One-way latch: `true` only for an instance that was booted straight
+    /// into Inference via `load()` (never for one that trained live and
+    /// later called `freeze()`). Gates the header-free Slab fast path —
+    /// see `slab::alloc_class_headerless`'s doc for why this is restricted
+    /// to `load()` alone: a `load()`-booted instance's Slab starts (and,
+    /// since the flag never resets, stays) completely empty of
+    /// header-carrying blocks, so header and headerless blocks are never
+    /// mixed in one class's free list. A live-trained instance keeps
+    /// writing headers unconditionally (unchanged, zero risk to the
+    /// existing GUI/training reward-attribution path, which needs the
+    /// header's `hash`/`size_class_hint` on dealloc).
+    slab_headerless: AtomicBool,
+    /// Maps a header-free Slab segment's base address to its class, so
+    /// `dealloc`/cabi entry points can recover a headerless block's class
+    /// from its address alone. See `registry::SegmentRegistry`.
+    segment_registry: registry::SegmentRegistry,
+    /// Published descriptor of the arena chunk currently being bumped, for
+    /// `arena_alloc_fast`'s lock-free path — null until the arena is first
+    /// initialized. See `ArenaChunkDescriptor`'s doc.
+    arena_chunk: AtomicPtr<ArenaChunkDescriptor>,
 }
+
+/// Published snapshot of the arena chunk currently being bumped — see
+/// `Lohalloc::arena_alloc_fast`/`publish_arena_chunk`.
+///
+/// `cursor` is a raw pointer into a `arena::Chunk` living inside
+/// `Lohalloc.arena`'s `BumpArena.chunks` `Vec`. That's sound to dereference
+/// for as long as this `Lohalloc` instance lives: the `Vec` is
+/// pre-reserved to `MAX_CHUNKS` capacity at construction and never grows
+/// past it (`BumpArena::alloc` checks the cap before ever pushing), so a
+/// `Chunk`'s address — and thus its `cursor`'s address — never moves once
+/// mapped, even while other chunks get pushed alongside it.
+struct ArenaChunkDescriptor {
+    base: usize,
+    capacity: usize,
+    cursor: *const AtomicUsize,
+}
+
+unsafe impl Send for ArenaChunkDescriptor {}
+unsafe impl Sync for ArenaChunkDescriptor {}
 
 /// Count of Inference-mode lookups whose key was *not* in the frozen table
 /// (falling back to size-based routing). Only incremented on a miss — the
@@ -276,6 +328,24 @@ pub struct Lohalloc {
 /// process's call sites (ASLR-stable hashes): a model-loaded run whose
 /// workload was trained in an earlier process should see ~0 misses.
 static PHT_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// Per-backend count of Inference-mode allocations actually *served* by that
+/// backend (indexed by `Backend as usize`), plus a separate count of times
+/// the frozen table's (or the miss fallback's) recommendation failed and the
+/// request fell through to `route_by_size`. Debug-gated observability added
+/// to diagnose a frozen model routing a Signature to the wrong backend
+/// (e.g. locking onto System for a size that fits Buddy) — `try_backend`
+/// never fails for System, so a bad System recommendation has no
+/// self-correcting fallthrough the way a bad Slab/Arena one does, and these
+/// counters are what make that visible from outside. Zero cost on the hit
+/// path beyond one relaxed increment already on this path's cold call graph.
+static ROUTE_COUNTS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static FALLTHROUGH_COUNT: AtomicU64 = AtomicU64::new(0);
 
 impl Default for Lohalloc {
     fn default() -> Self {
@@ -299,6 +369,9 @@ impl Lohalloc {
             system_cache_hits: AtomicU64::new(0),
             magazine_id: AtomicU64::new(0),
             frozen_table: AtomicPtr::new(core::ptr::null_mut()),
+            slab_headerless: AtomicBool::new(false),
+            segment_registry: registry::SegmentRegistry::new(),
+            arena_chunk: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
@@ -408,6 +481,25 @@ impl Lohalloc {
         IN_ALLOC.set(depth);
         result
     }
+
+    /// Public wrapper around [`Self::with_realloc_guard`] for callers
+    /// *outside* this crate that need to read a `.lohalloc` model's bytes
+    /// (typically `std::fs::read`) before calling [`Self::load`].
+    ///
+    /// This matters specifically for `lohalloc-cabi`'s `ensure_model_loaded`
+    /// under `LD_PRELOAD`: it reads the model file *before* calling
+    /// `load()`, and that read's own internal allocations (`Vec<u8>`
+    /// growth) would otherwise be the *first-ever* calls into this
+    /// allocator for the process — landing wherever ordinary Training-mode
+    /// routing sends them (often Slab), silently creating a real backing
+    /// region before `load()`'s `slab_headerless` safety check
+    /// (`Slab::region_count() == 0`) ever runs, permanently and invisibly
+    /// disabling the header-free Slab fast path for the rest of the
+    /// process. Wrapping the read in this guard routes it to `mmap`
+    /// instead, keeping the Slab genuinely empty until `load()` decides.
+    pub fn with_bootstrap_guard<T>(f: impl FnOnce() -> T) -> T {
+        Self::with_realloc_guard(f)
+    }
 }
 
 // SAFETY: we uphold the `GlobalAlloc` contract:
@@ -451,6 +543,13 @@ unsafe impl GlobalAlloc for Lohalloc {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let _ = layout; // header is authoritative; layout unused for routing.
         if ptr.is_null() {
+            return;
+        }
+        // Header-free fast path: must run BEFORE any header read — a
+        // headerless block's `ptr - HEADER_SIZE` is not valid header
+        // memory (see `headerless_class_for`'s doc).
+        if let Some(class) = self.headerless_class_for(ptr) {
+            self.slab_dealloc_headerless(ptr, class);
             return;
         }
         // Read the header (unaligned) sitting immediately before the user ptr.
@@ -549,9 +648,7 @@ impl Lohalloc {
             }
             Some(Backend::Buddy) => {
                 let block = ptr.sub(pad);
-                if let Ok(mut buddy) = self.buddy.lock() {
-                    unsafe { buddy.dealloc(block, header.size) };
-                }
+                unsafe { self.buddy_dealloc_via_magazine(block, header.size) };
             }
             Some(Backend::System) => {
                 // Offer the mapping to the retention cache (populated pages
@@ -581,7 +678,13 @@ impl Lohalloc {
         {
             let dt = clock::now_ns().saturating_sub(t0);
             if let Ok(mut st) = self.state.lock() {
-                st.record_latency(header.hash, core_backend, header.size_class_hint, dt);
+                st.record_latency(
+                    header.hash,
+                    core_backend,
+                    header.size_class_hint,
+                    dt,
+                    header.size,
+                );
             }
         }
     }
@@ -642,10 +745,12 @@ impl Lohalloc {
                 }
             };
             if let Some(ptr) = self.try_backend(backend, total, align, pad, hash, size_class) {
+                ROUTE_COUNTS[backend as usize].fetch_add(1, Ordering::Relaxed);
                 return ptr;
             }
             // Fallthrough remembers the failed backend so it's never
             // re-locked/re-tried inside the size chain.
+            FALLTHROUGH_COUNT.fetch_add(1, Ordering::Relaxed);
             return self.route_by_size(total, align, pad, hash, size_class, Some(backend));
         }
 
@@ -682,7 +787,7 @@ impl Lohalloc {
         let latency_ns = clock::now_ns().saturating_sub(t0);
 
         if let (Some(backend), Ok(mut st)) = (recommended, self.state.lock()) {
-            st.record_latency(hash, backend, size_class, latency_ns);
+            st.record_latency(hash, backend, size_class, latency_ns, total);
         }
 
         ptr
@@ -717,6 +822,203 @@ impl Lohalloc {
         Some(buf[0])
     }
 
+    /// Serve a raw, header-free Slab block for `size` bytes (the caller
+    /// must ensure `slab_headerless` is set and `align <= MIN_ALIGN` —
+    /// there is no pad here to absorb a larger alignment). Same
+    /// magazine-first shape as `slab_block_via_magazine`, but classifies by
+    /// the *raw* request size (no header/pad added). On a magazine miss,
+    /// `Slab::refill_segment` calls back into `self.segment_registry.insert`
+    /// *before* threading a freshly mapped segment onto any free list — see
+    /// its doc for why registration and free-list population must be
+    /// atomic (a previous version registered only after handing blocks out,
+    /// which meant a saturated registry silently served headerless blocks
+    /// with no way to safely free them).
+    fn slab_block_headerless_via_magazine(&self, size: usize) -> Option<*mut u8> {
+        let class = lohalloc_core::slab_class_for(size)?;
+        let owner = self.magazine_owner();
+        if let Some(block) = magazine::pop(owner, class) {
+            return Some(block);
+        }
+        let mut buf = [core::ptr::null_mut::<u8>(); 16];
+        let want = magazine::refill_count(class).min(buf.len());
+        let n = {
+            let mut slab = self.slab.lock().ok()?;
+            let mut try_register = |base: usize| self.segment_registry.insert(base, class as u8);
+            slab.alloc_batch_headerless(class, &mut buf[..want], &mut try_register)
+        };
+        if n == 0 {
+            return None;
+        }
+        for &p in buf.iter().take(n).skip(1) {
+            let pushed = magazine::push(owner, class, p);
+            debug_assert!(pushed);
+        }
+        Some(buf[0])
+    }
+
+    /// Return a raw, header-free Slab block of `class` to circulation.
+    /// Ordinary slab blocks once the class is known — reuses the existing
+    /// (header-agnostic) `Slab::dealloc_class`/`dealloc_batch` and the
+    /// existing magazine layer unchanged.
+    fn slab_dealloc_headerless(&self, block: *mut u8, class: u8) {
+        let class = class as usize;
+        let owner = self.magazine_owner();
+        if magazine::push(owner, class, block) {
+            return;
+        }
+        let mut buf = [core::ptr::null_mut::<u8>(); 16];
+        let flush = magazine::refill_count(class).min(buf.len());
+        let n = magazine::take(owner, class, &mut buf[..flush]);
+        if let Ok(mut slab) = self.slab.lock() {
+            unsafe {
+                slab.dealloc_batch(class, &buf[..n]);
+                slab.dealloc_class(block, class);
+            }
+        }
+    }
+
+    /// If `ptr` falls within a segment registered by the header-free Slab
+    /// path, returns its slab class — letting every dealloc-side entry
+    /// point (`GlobalAlloc::dealloc`, and the fused cabi helpers below)
+    /// dispatch a headerless block *without ever reading `ptr -
+    /// HEADER_SIZE`*, which is not valid header memory for these blocks
+    /// (it may be another live allocation's tail, or unmapped guard space
+    /// near a segment boundary). Cheap when inactive: one relaxed load and
+    /// return, no registry probe at all, for any instance that never
+    /// called `load()` with an empty Slab (see `slab_headerless`'s doc).
+    #[inline]
+    fn headerless_class_for(&self, ptr: *mut u8) -> Option<u8> {
+        if !self.slab_headerless.load(Ordering::Relaxed) {
+            return None;
+        }
+        let base = (ptr as usize) & !(slab::SEGMENT_SIZE - 1);
+        self.segment_registry.lookup(base)
+    }
+
+    /// Lock-free arena bump: loads the published chunk descriptor and CASes
+    /// its cursor forward. Returns `None` — falling through to the
+    /// `Mutex`-guarded slow path — when there's no descriptor yet (arena
+    /// never initialized), or the request doesn't fit in the current
+    /// chunk. Never chains chunks itself; only the slow path maps/advances.
+    fn arena_alloc_fast(&self, size: usize, align: usize) -> Option<*mut u8> {
+        let desc_ptr = self.arena_chunk.load(Ordering::Acquire);
+        if desc_ptr.is_null() {
+            return None;
+        }
+        // SAFETY: see `ArenaChunkDescriptor`'s doc — the pointed-to chunk
+        // and its cursor never move or get freed while this `Lohalloc`
+        // instance is alive.
+        let desc = unsafe { &*desc_ptr };
+        let cursor = unsafe { &*desc.cursor };
+        let align = align.max(MIN_ALIGN);
+        loop {
+            let cur = cursor.load(Ordering::Relaxed);
+            let aligned = align_up(cur, align);
+            let new_cur = aligned.checked_add(size)?;
+            if new_cur > desc.base + desc.capacity {
+                return None; // chunk full or doesn't fit — slow path decides
+            }
+            // A racing thread may have already advanced `cur` since our
+            // load; `compare_exchange_weak` retries from the fresh value
+            // rather than overwriting someone else's bump.
+            if cursor
+                .compare_exchange_weak(cur, new_cur, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(aligned as *mut u8);
+            }
+        }
+    }
+
+    /// (Re)publish `arena`'s current chunk as the fast path's descriptor.
+    /// Must be called (under `self.arena`'s lock) after anything that can
+    /// change which chunk is "current": the arena's initial creation, a
+    /// chunk advance inside `BumpArena::alloc`, or `reset()`. Redundant
+    /// calls (current chunk unchanged) are harmless — just a small extra
+    /// leak (bounded by `MAX_CHUNKS` per arena lifetime, see
+    /// `ArenaChunkDescriptor`'s doc).
+    fn publish_arena_chunk(&self, arena: &arena::BumpArena) {
+        let chunk = arena.current_chunk();
+        let desc = Box::leak(Box::new(ArenaChunkDescriptor {
+            base: chunk.base as usize,
+            capacity: chunk.capacity,
+            cursor: &chunk.cursor as *const AtomicUsize,
+        }));
+        self.arena_chunk.store(desc, Ordering::Release);
+    }
+
+    /// Serve a raw Buddy block for `total` bytes. For orders 10..=14 (16
+    /// KiB..256 KiB — the range diagnosed as ~75% of buddy/adv-mixed
+    /// traffic), goes via this thread's magazine (no lock on a hit),
+    /// batch-refilling under the central buddy lock on a miss — the exact
+    /// same shape as `slab_block_via_magazine`. Orders outside that range
+    /// (512 KiB, 1 MiB) go straight to `Mutex<Buddy>`: rare enough in every
+    /// measured workload that magazining them would only add strand risk.
+    fn buddy_block_via_magazine(&self, total: usize) -> Option<*mut u8> {
+        let order = buddy::order_for(total)?;
+        let Some(idx) = buddy_mag::index_for(order) else {
+            let mut buddy = self.buddy.lock().ok()?;
+            return buddy.alloc(total);
+        };
+        let owner = self.magazine_owner();
+        if let Some(block) = buddy_mag::pop(owner, idx) {
+            return Some(block);
+        }
+        // Magazine miss: batch-refill under the central lock.
+        let mut buf = [core::ptr::null_mut::<u8>(); 8]; // >= max refill_count
+        let want = buddy_mag::refill_count(idx).min(buf.len());
+        let n = {
+            let mut buddy = self.buddy.lock().ok()?;
+            buddy.alloc_order_batch(order, &mut buf[..want])
+        };
+        if n == 0 {
+            return None;
+        }
+        for &p in buf.iter().take(n).skip(1) {
+            // The magazine was just empty, so the extras always fit.
+            let pushed = buddy_mag::push(owner, idx, p);
+            debug_assert!(pushed);
+        }
+        Some(buf[0])
+    }
+
+    /// Return a raw Buddy block to circulation. Mirrors
+    /// `buddy_block_via_magazine`'s order-range split: magazined orders push
+    /// to this thread's magazine (no lock on a hit), flushing half back to
+    /// the central buddy in one locked batch when full; other orders free
+    /// directly.
+    ///
+    /// # Safety
+    /// `block`/`size` must be a still-live pair previously returned by the
+    /// Buddy allocation path (same contract as `Buddy::dealloc`).
+    unsafe fn buddy_dealloc_via_magazine(&self, block: *mut u8, size: usize) {
+        let Some(order) = buddy::order_for(size) else {
+            debug_assert!(false, "buddy dealloc size out of range");
+            return;
+        };
+        let Some(idx) = buddy_mag::index_for(order) else {
+            if let Ok(mut buddy) = self.buddy.lock() {
+                unsafe { buddy.dealloc(block, size) };
+            }
+            return;
+        };
+        let owner = self.magazine_owner();
+        if buddy_mag::push(owner, idx, block) {
+            return;
+        }
+        // Magazine full: flush half of it plus this block back to the
+        // central buddy in one locked batch.
+        let mut buf = [core::ptr::null_mut::<u8>(); 8];
+        let flush = buddy_mag::refill_count(idx).min(buf.len());
+        let n = buddy_mag::take(owner, idx, &mut buf[..flush]);
+        if let Ok(mut buddy) = self.buddy.lock() {
+            unsafe {
+                buddy.dealloc_order_batch(order, &buf[..n]);
+                buddy.dealloc_order_batch(order, core::slice::from_ref(&block));
+            }
+        }
+    }
+
     /// on success, `None` on failure (e.g. Arena full, Slab exhausted).
     fn try_backend(
         &self,
@@ -730,6 +1032,15 @@ impl Lohalloc {
         let local_backend = Backend::from_core(backend);
         match backend {
             lohalloc_core::Backend::Slab if total <= SLAB_MAX => {
+                // Header-free fast path: only for a `load()`-booted instance
+                // (see `slab_headerless`'s doc) and only when the block's
+                // guaranteed 16-byte alignment covers what was asked for —
+                // a bigger alignment needs `pad` to absorb the difference,
+                // which only the header-carrying path provides.
+                if self.slab_headerless.load(Ordering::Relaxed) && align <= MIN_ALIGN {
+                    let size = total - pad;
+                    return self.slab_block_headerless_via_magazine(size);
+                }
                 self.slab_block_via_magazine(total).map(|block| {
                     self.write_header(
                         block,
@@ -745,8 +1056,50 @@ impl Lohalloc {
                 })
             }
             lohalloc_core::Backend::Buddy if total <= BUDDY_MAX => {
-                if let Ok(mut buddy) = self.buddy.lock() {
-                    buddy.alloc(total).map(|block| {
+                self.buddy_block_via_magazine(total).map(|block| {
+                    self.write_header(
+                        block,
+                        pad,
+                        local_backend,
+                        total,
+                        0,
+                        0,
+                        hash,
+                        size_class_hint,
+                        align,
+                    )
+                })
+            }
+            lohalloc_core::Backend::Arena => {
+                // Lock-free fast path: bump the published current chunk's
+                // cursor directly, no Mutex. Falls through to the slow
+                // path below on a miss (arena not yet initialized, or the
+                // current chunk is full/doesn't fit this request).
+                if let Some(block) = self.arena_alloc_fast(total, align) {
+                    return Some(self.write_header(
+                        block,
+                        pad,
+                        local_backend,
+                        total,
+                        0,
+                        0,
+                        hash,
+                        size_class_hint,
+                        align,
+                    ));
+                }
+                // Slow path: lazily initialize / advance / map under the
+                // lock, then (re)publish whichever chunk is now current —
+                // covers first-time init and every chunk advance, which is
+                // the only way `arena_chunk` can go stale.
+                let Ok(mut arena_guard) = self.arena.lock() else {
+                    return None;
+                };
+                if arena_guard.is_none() {
+                    *arena_guard = arena::BumpArena::new();
+                }
+                let result = arena_guard.as_mut().and_then(|arena| {
+                    arena.alloc(total, align).map(|block| {
                         self.write_header(
                             block,
                             pad,
@@ -759,36 +1112,11 @@ impl Lohalloc {
                             align,
                         )
                     })
-                } else {
-                    None
+                });
+                if let Some(arena) = arena_guard.as_ref() {
+                    self.publish_arena_chunk(arena);
                 }
-            }
-            lohalloc_core::Backend::Arena => {
-                // Arena allocation (lazily initialized).
-                if let Ok(mut arena_guard) = self.arena.lock() {
-                    if arena_guard.is_none() {
-                        *arena_guard = arena::BumpArena::new();
-                    }
-                    if let Some(ref mut arena) = *arena_guard {
-                        arena.alloc(total, align).map(|block| {
-                            self.write_header(
-                                block,
-                                pad,
-                                local_backend,
-                                total,
-                                0,
-                                0,
-                                hash,
-                                size_class_hint,
-                                align,
-                            )
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+                result
             }
             lohalloc_core::Backend::System => {
                 let ptr = self.system_alloc_with_header(total, align, hash, size_class_hint);
@@ -822,7 +1150,12 @@ impl Lohalloc {
     ) -> *mut u8 {
         // 1. Slab: small, naturally-aligned requests (magazine-first).
         if total <= SLAB_MAX && skip != Some(lohalloc_core::Backend::Slab) {
-            if let Some(block) = self.slab_block_via_magazine(total) {
+            if self.slab_headerless.load(Ordering::Relaxed) && align <= MIN_ALIGN {
+                let size = total - pad;
+                if let Some(block) = self.slab_block_headerless_via_magazine(size) {
+                    return block;
+                }
+            } else if let Some(block) = self.slab_block_via_magazine(total) {
                 return self.write_header(
                     block,
                     pad,
@@ -837,22 +1170,20 @@ impl Lohalloc {
             }
         }
 
-        // 2. Buddy: medium, variable-size.
+        // 2. Buddy: medium, variable-size (magazine-first).
         if total <= BUDDY_MAX && skip != Some(lohalloc_core::Backend::Buddy) {
-            if let Ok(mut buddy) = self.buddy.lock() {
-                if let Some(block) = buddy.alloc(total) {
-                    return self.write_header(
-                        block,
-                        pad,
-                        Backend::Buddy,
-                        total,
-                        0,
-                        0,
-                        hash,
-                        size_class_hint,
-                        align,
-                    );
-                }
+            if let Some(block) = self.buddy_block_via_magazine(total) {
+                return self.write_header(
+                    block,
+                    pad,
+                    Backend::Buddy,
+                    total,
+                    0,
+                    0,
+                    hash,
+                    size_class_hint,
+                    align,
+                );
             }
         }
 
@@ -987,6 +1318,13 @@ impl Lohalloc {
             if let Some(ref mut arena) = *arena_guard {
                 arena.reset();
             }
+            // Republish: `reset()` rewinds `current` to chunk 0, which may
+            // differ from whatever chunk `arena_chunk` currently points
+            // at — the fast path must not keep bumping a chunk `reset`
+            // considers stale.
+            if let Some(arena) = arena_guard.as_ref() {
+                self.publish_arena_chunk(arena);
+            }
         }
     }
 
@@ -1005,21 +1343,25 @@ impl Lohalloc {
             if arena_guard.is_none() {
                 *arena_guard = arena::BumpArena::new();
             }
-            if let Some(ref mut arena) = *arena_guard {
-                if let Some(block) = arena.alloc(total, align) {
-                    let hash = topology::fast_stack_hash();
-                    return self.write_header(
-                        block,
-                        pad,
-                        Backend::Arena,
-                        total,
-                        0,
-                        0,
-                        hash,
-                        SIZE_CLASS_UNTRACKED,
-                        align,
-                    );
-                }
+            let block = arena_guard
+                .as_mut()
+                .and_then(|arena| arena.alloc(total, align));
+            if let Some(arena) = arena_guard.as_ref() {
+                self.publish_arena_chunk(arena);
+            }
+            if let Some(block) = block {
+                let hash = topology::fast_stack_hash();
+                return self.write_header(
+                    block,
+                    pad,
+                    Backend::Arena,
+                    total,
+                    0,
+                    0,
+                    hash,
+                    SIZE_CLASS_UNTRACKED,
+                    align,
+                );
             }
         }
         // Arena full or init failed → fall through to System.
@@ -1048,6 +1390,26 @@ impl Lohalloc {
             }
         });
         self.frozen.store(true, Ordering::Release);
+    }
+
+    /// True once the training bandit's routing has stabilized enough that
+    /// freezing would lock in a settled model — the `freeze_mode=converged`
+    /// trigger (see `tune::FreezeMode` and `BanditPolicy::is_converged`).
+    /// Always true once frozen; false while genuinely still learning or if
+    /// nothing was learned yet. The caller decides when to poll (e.g.
+    /// `lohalloc-cabi` samples every few hundred allocations) and calls
+    /// [`freeze`](Self::freeze) itself — the allocator never freezes
+    /// spontaneously.
+    pub fn is_converged(&self) -> bool {
+        if self.frozen.load(Ordering::Relaxed) {
+            return true;
+        }
+        Self::with_realloc_guard(|| {
+            self.state
+                .lock()
+                .map(|state| state.is_converged())
+                .unwrap_or(false)
+        })
     }
 
     /// Publish a lock-free copy of the state's frozen routing table for the
@@ -1132,6 +1494,22 @@ impl Lohalloc {
                     *state = s;
                     self.publish_frozen_table(&state);
                     self.frozen.store(true, Ordering::Release);
+                    // Header-free Slab is only safe if this instance's Slab
+                    // has never served a block yet (region_count() == 0) —
+                    // otherwise a class's free list could already hold
+                    // header-carrying blocks, and a later headerless refill
+                    // would mix flavors in that same list (see
+                    // `slab_headerless`'s doc). In the real usage pattern
+                    // (`lohalloc-cabi`'s `ensure_model_loaded`, always the
+                    // very first thing that touches a fresh instance) this
+                    // check always passes; it's a safety net for any other
+                    // caller, not a hot-path cost — `load()` is a rare,
+                    // one-time call.
+                    if let Ok(slab) = self.slab.lock() {
+                        if slab.region_count() == 0 {
+                            self.slab_headerless.store(true, Ordering::Release);
+                        }
+                    }
                     return true;
                 }
             }
@@ -1148,12 +1526,32 @@ impl Lohalloc {
         }
     }
 
+    /// True if this instance is currently serving Slab allocations
+    /// header-free (only ever set by `load()` on a still-empty Slab — see
+    /// `slab_headerless`'s doc). Test/introspection only.
+    pub fn is_slab_headerless(&self) -> bool {
+        self.slab_headerless.load(Ordering::Relaxed)
+    }
+
     /// Process-wide count of Inference-mode routing lookups that missed the
     /// frozen table (and fell back to size-based routing). ~0 on a
     /// model-loaded run means the model's keys matched this process's call
     /// sites — the end-to-end proof that hashes are stable across runs.
     pub fn pht_miss_count() -> u64 {
         PHT_MISSES.load(Ordering::Relaxed)
+    }
+
+    /// Process-wide count of Inference-mode allocations actually served by
+    /// `backend` (frozen fast path only). See `ROUTE_COUNTS`'s doc.
+    pub fn route_count(backend: lohalloc_core::Backend) -> u64 {
+        ROUTE_COUNTS[backend as usize].load(Ordering::Relaxed)
+    }
+
+    /// Process-wide count of Inference-mode allocations whose recommended
+    /// backend failed and fell through to size-based routing. See
+    /// `FALLTHROUGH_COUNT`'s doc.
+    pub fn fallthrough_count() -> u64 {
+        FALLTHROUGH_COUNT.load(Ordering::Relaxed)
     }
 
     // -----------------------------------------------------------------
@@ -1292,6 +1690,9 @@ impl Lohalloc {
         if ptr.is_null() {
             return None;
         }
+        if self.headerless_class_for(ptr).is_some() {
+            return Some(lohalloc_core::Backend::Slab);
+        }
         let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
         Backend::from_u8(header.backend).map(|b| match b {
             Backend::Slab => lohalloc_core::Backend::Slab,
@@ -1315,6 +1716,9 @@ impl Lohalloc {
     pub unsafe fn usable_size(&self, ptr: *mut u8) -> usize {
         if ptr.is_null() {
             return 0;
+        }
+        if let Some(class) = self.headerless_class_for(ptr) {
+            return lohalloc_core::SLAB_SIZE_CLASSES[class as usize];
         }
         let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
         if header.magic != MAGIC {
@@ -1360,6 +1764,9 @@ impl Lohalloc {
         if ptr.is_null() {
             return false;
         }
+        if self.headerless_class_for(ptr).is_some() {
+            return true;
+        }
         let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
         header.magic == MAGIC
     }
@@ -1375,6 +1782,10 @@ impl Lohalloc {
     pub unsafe fn try_dealloc_raw(&self, ptr: *mut u8) -> bool {
         if ptr.is_null() {
             return false;
+        }
+        if let Some(class) = self.headerless_class_for(ptr) {
+            self.slab_dealloc_headerless(ptr, class);
+            return true;
         }
         let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
         if header.magic != MAGIC {
@@ -1393,6 +1804,9 @@ impl Lohalloc {
         if ptr.is_null() {
             return None;
         }
+        if let Some(class) = self.headerless_class_for(ptr) {
+            return Some(lohalloc_core::SLAB_SIZE_CLASSES[class as usize]);
+        }
         let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
         if header.magic != MAGIC {
             return None;
@@ -1407,11 +1821,16 @@ impl Lohalloc {
     ///
     /// # Safety
     /// Same contract as [`Self::owns`]; the returned closure-free "token"
-    /// is just the header copy — `ptr` must stay live until the paired
+    /// is just the header copy (or, for a headerless block, its class) —
+    /// `ptr` must stay live until the paired
     /// [`Self::dealloc_with_header_token`] call.
     pub unsafe fn usable_size_for_realloc(&self, ptr: *mut u8) -> Option<(usize, ReallocToken)> {
         if ptr.is_null() {
             return None;
+        }
+        if let Some(class) = self.headerless_class_for(ptr) {
+            let usable = lohalloc_core::SLAB_SIZE_CLASSES[class as usize];
+            return Some((usable, ReallocToken(ReallocTokenInner::Headerless(class))));
         }
         let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
         if header.magic != MAGIC {
@@ -1419,23 +1838,31 @@ impl Lohalloc {
         }
         let pad = header_pad(1usize << header.align_log2);
         let usable = header.size.saturating_sub(pad);
-        Some((usable, ReallocToken { header }))
+        Some((usable, ReallocToken(ReallocTokenInner::Header(header))))
     }
 
-    /// Free `ptr` using the header captured by
+    /// Free `ptr` using the header (or headerless class) captured by
     /// [`Self::usable_size_for_realloc`] — zero additional header reads.
     ///
     /// # Safety
     /// `ptr` must be the same live allocation the token was created from.
     pub unsafe fn dealloc_with_header_token(&self, ptr: *mut u8, token: ReallocToken) {
-        unsafe { self.dealloc_with_header(ptr, token.header) };
+        match token.0 {
+            ReallocTokenInner::Header(header) => unsafe { self.dealloc_with_header(ptr, header) },
+            ReallocTokenInner::Headerless(class) => self.slab_dealloc_headerless(ptr, class),
+        }
     }
 }
 
-/// Opaque header snapshot for the fused cabi `realloc` path — see
-/// [`Lohalloc::usable_size_for_realloc`].
-pub struct ReallocToken {
-    header: Header,
+/// Opaque snapshot for the fused cabi `realloc` path — see
+/// [`Lohalloc::usable_size_for_realloc`]. Either a full header copy (the
+/// ordinary path) or just a slab class (a headerless block has no header
+/// to copy).
+pub struct ReallocToken(ReallocTokenInner);
+
+enum ReallocTokenInner {
+    Header(Header),
+    Headerless(u8),
 }
 
 // ---------------------------------------------------------------------------
@@ -1503,6 +1930,297 @@ mod integration_tests {
         unsafe { alloc.dealloc_with_hash(ptr, layout) };
     }
 
+    /// Builds a `.lohalloc` model routing `hash` (at `size`'s size class) to
+    /// `Backend::Slab` — the shared fixture for the headerless-slab tests
+    /// below, which all need a load()-booted instance whose routing table
+    /// actually recommends Slab for the sizes they exercise.
+    fn slab_only_model(hash: u64, size: usize) -> Vec<u8> {
+        let sc = state::size_class_for(size);
+        let key = state::combine_hash_size_class(hash, sc);
+        perfect_hash::PerfectHashTable::from_entries(vec![(key, sc, lohalloc_core::Backend::Slab)])
+            .serialize()
+    }
+
+    #[test]
+    fn load_on_fresh_instance_enables_headerless_slab() {
+        let hash = 0x4EAD_0001u64;
+        let size = 96usize;
+        let alloc = Lohalloc::new();
+        assert!(!alloc.is_slab_headerless(), "must start disabled");
+        assert!(alloc.load(&slab_only_model(hash, size)));
+        assert!(
+            alloc.is_slab_headerless(),
+            "load() on a still-empty Slab must enable the headerless path"
+        );
+
+        let layout = Layout::from_size_align(size, 16).unwrap();
+        let ptr = unsafe { alloc.alloc_with_hash(layout, hash) };
+        assert!(!ptr.is_null());
+        assert!(
+            unsafe { alloc.owns(ptr) },
+            "owns() must recognize a headerless block via the registry"
+        );
+        assert_eq!(
+            unsafe { alloc.backend_for_ptr(ptr) },
+            Some(lohalloc_core::Backend::Slab)
+        );
+        assert!(
+            unsafe { alloc.usable_size(ptr) } >= size,
+            "usable_size must cover at least the requested size"
+        );
+        // The memory must be genuinely usable (not aliasing a header or
+        // adjacent block) — write and read back the full usable region.
+        let usable = unsafe { alloc.usable_size(ptr) };
+        unsafe {
+            core::ptr::write_bytes(ptr, 0xAB, usable);
+            for i in 0..usable {
+                assert_eq!(*ptr.add(i), 0xAB, "byte {i} corrupted");
+            }
+        }
+        unsafe { alloc.dealloc_with_hash(ptr, layout) };
+
+        // And the block must be reusable afterwards (freed correctly, not
+        // leaked or double-registered).
+        let ptr2 = unsafe { alloc.alloc_with_hash(layout, hash) };
+        assert!(!ptr2.is_null());
+        unsafe { alloc.dealloc_with_hash(ptr2, layout) };
+    }
+
+    #[test]
+    fn load_after_prior_slab_activity_stays_header_based() {
+        // A live-trained instance (or one that otherwise already served a
+        // slab block) must NOT flip to headerless on a later `load()` —
+        // doing so would risk mixing header and headerless blocks in the
+        // same class's free list. Training-mode allocation always writes
+        // headers; that must remain true for every allocation this
+        // instance serves afterward too, even post-load().
+        let training_hash = 0x4EAD_0002u64;
+        let size = 64usize;
+        let alloc = Lohalloc::new();
+        let layout = Layout::from_size_align(size, 16).unwrap();
+
+        // Training-mode traffic populates at least one Slab region.
+        for _ in 0..20 {
+            let ptr = unsafe { alloc.alloc_with_hash(layout, training_hash) };
+            assert!(!ptr.is_null());
+            unsafe { alloc.dealloc_with_hash(ptr, layout) };
+        }
+        assert!(alloc.backend_counters().slab_region_count > 0);
+
+        assert!(alloc.load(&slab_only_model(0x4EAD_0003u64, size)));
+        assert!(
+            !alloc.is_slab_headerless(),
+            "load() must not enable headerless mode once the Slab has already served a block"
+        );
+
+        // Allocations must still work correctly (header-based).
+        let ptr = unsafe { alloc.alloc_with_hash(layout, 0x4EAD_0003u64) };
+        assert!(!ptr.is_null());
+        assert_eq!(
+            unsafe { alloc.backend_for_ptr(ptr) },
+            Some(lohalloc_core::Backend::Slab)
+        );
+        unsafe { alloc.dealloc_with_hash(ptr, layout) };
+    }
+
+    #[test]
+    fn headerless_registry_saturation_falls_back_safely() {
+        // Regression test: force enough *concurrently live* blocks of the
+        // largest Slab class (16384B => SEGMENT_SIZE/stride = 4 blocks per
+        // segment) to exceed SegmentRegistry's fixed CAPACITY (1024
+        // segments). The old `refill_segment` threaded a new segment's
+        // blocks onto the free list unconditionally and registered it
+        // *afterward*; once the registry saturated, those blocks were
+        // still handed out via the headerless path but had no header to
+        // fall back on, so `dealloc`'s registry-miss path read `ptr -
+        // HEADER_SIZE` as if it were a `Header` — misreading adjacent
+        // block data at best, segfaulting on an out-of-segment read at
+        // worst (a block near a segment's start). The fix makes
+        // registration and free-list population atomic: a failed
+        // `try_register` now unmaps the segment immediately and reports
+        // refill failure, so Slab falls through to Buddy exactly like any
+        // other exhaustion. 4200 blocks comfortably exceeds
+        // CAPACITY * 4 = 4096 (~64 MiB backing memory, not a slow test).
+        let hash = 0x4EAD_0009u64;
+        let size = 16384usize;
+        let alloc = Lohalloc::new();
+        assert!(alloc.load(&slab_only_model(hash, size)));
+        assert!(alloc.is_slab_headerless());
+
+        let layout = Layout::from_size_align(size, 16).unwrap();
+        let mut live = Vec::new();
+        for _ in 0..4200 {
+            let ptr = unsafe { alloc.alloc_with_hash(layout, hash) };
+            assert!(
+                !ptr.is_null(),
+                "allocation must fall through to Buddy once the registry saturates, not fail"
+            );
+            live.push(ptr);
+        }
+        // Freeing every block — including the ones served after
+        // saturation — must not corrupt state or crash.
+        for ptr in live {
+            unsafe { alloc.dealloc_with_hash(ptr, layout) };
+        }
+    }
+
+    #[test]
+    fn headerless_registry_is_per_instance() {
+        // A headerless block from one instance must never be mistaken for
+        // one belonging to a completely separate, untouched instance —
+        // the registry is a field on `Lohalloc`, not a global.
+        let hash = 0x4EAD_0004u64;
+        let size = 128usize;
+        let a = Lohalloc::new();
+        assert!(a.load(&slab_only_model(hash, size)));
+        let layout = Layout::from_size_align(size, 16).unwrap();
+        let ptr = unsafe { a.alloc_with_hash(layout, hash) };
+        assert!(!ptr.is_null());
+
+        let b = Lohalloc::new(); // never loaded, never touched
+        assert!(
+            !unsafe { b.owns(ptr) },
+            "instance B must not recognize instance A's headerless block"
+        );
+
+        unsafe { a.dealloc_with_hash(ptr, layout) };
+    }
+
+    #[test]
+    fn headerless_realloc_token_roundtrip() {
+        // Mirrors the fused cabi `realloc` path: usable_size_for_realloc
+        // (registry-hit branch) -> copy -> dealloc_with_header_token.
+        let hash = 0x4EAD_0005u64;
+        let size = 40usize;
+        let alloc = Lohalloc::new();
+        assert!(alloc.load(&slab_only_model(hash, size)));
+
+        let layout = Layout::from_size_align(size, 16).unwrap();
+        let ptr = unsafe { alloc.alloc_with_hash(layout, hash) };
+        assert!(!ptr.is_null());
+        unsafe { core::ptr::write_bytes(ptr, 0x42, size) };
+
+        let (old_usable, token) = unsafe { alloc.usable_size_for_realloc(ptr) }
+            .expect("registry-hit path must return Some for a headerless block");
+        assert!(old_usable >= size);
+
+        // Simulate realloc's copy-then-free-old sequence.
+        let new_ptr = unsafe { alloc.alloc_with_hash(layout, hash) };
+        assert!(!new_ptr.is_null());
+        unsafe {
+            core::ptr::copy_nonoverlapping(ptr, new_ptr, old_usable.min(size));
+            alloc.dealloc_with_header_token(ptr, token);
+        }
+        for i in 0..size {
+            assert_eq!(
+                unsafe { *new_ptr.add(i) },
+                0x42,
+                "byte {i} lost across realloc"
+            );
+        }
+        unsafe { alloc.dealloc_with_hash(new_ptr, layout) };
+    }
+
+    #[test]
+    fn headerless_slab_multithreaded_stress() {
+        // 8 threads alloc/free concurrently on one load()-booted instance —
+        // the hard case for the "register before releasing the slab lock"
+        // invariant (`slab_block_headerless_via_magazine`'s doc): a fresh
+        // segment handed to one thread must already be registered before
+        // any thread (including a different one it's handed to) can free a
+        // block from it.
+        use std::sync::Arc;
+
+        let hash = 0x4EAD_0006u64;
+        let size = 48usize;
+        let alloc = Arc::new(Lohalloc::new());
+        assert!(alloc.load(&slab_only_model(hash, size)));
+        assert!(alloc.is_slab_headerless());
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let a = Arc::clone(&alloc);
+            handles.push(std::thread::spawn(move || {
+                let layout = Layout::from_size_align(size, 16).unwrap();
+                for _ in 0..2_000 {
+                    let ptr = unsafe { a.alloc_with_hash(layout, hash) };
+                    assert!(!ptr.is_null());
+                    assert!(unsafe { a.owns(ptr) });
+                    unsafe { a.dealloc_with_hash(ptr, layout) };
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+    }
+
+    #[test]
+    fn route_counters_track_frozen_fast_path() {
+        // Counters are process-wide statics shared across the whole test
+        // binary, so parallel tests may also bump them — assert on the
+        // delta this test itself causes, not an absolute value.
+        let hash = 0x1234_5678_u64;
+        let size = 64usize;
+        let sc = state::size_class_for(size);
+        let key = state::combine_hash_size_class(hash, sc);
+        let table = perfect_hash::PerfectHashTable::from_entries(vec![(
+            key,
+            sc,
+            lohalloc_core::Backend::Buddy,
+        )]);
+        let alloc = Lohalloc::new();
+        assert!(alloc.load(&table.serialize()));
+
+        let before = Lohalloc::route_count(lohalloc_core::Backend::Buddy);
+        let layout = Layout::from_size_align(size, 16).unwrap();
+        for _ in 0..5 {
+            let ptr = unsafe { alloc.alloc_with_hash(layout, hash) };
+            assert!(!ptr.is_null());
+            unsafe { alloc.dealloc_with_hash(ptr, layout) };
+        }
+        let after = Lohalloc::route_count(lohalloc_core::Backend::Buddy);
+        assert!(
+            after - before >= 5,
+            "route_count(Buddy) should advance by at least 5 (before={before}, after={after})"
+        );
+    }
+
+    #[test]
+    fn fallthrough_counter_advances_on_size_guard_failure() {
+        // Force Slab for a size that fails Slab's `total <= SLAB_MAX` guard
+        // in `try_backend` — a deterministic, always-failing recommendation
+        // that must fall through to `route_by_size` (and still serve
+        // correctly, via Buddy).
+        let hash = 0xABCD_EF01_u64;
+        let size = 20_000usize;
+        let sc = state::size_class_for(size);
+        let key = state::combine_hash_size_class(hash, sc);
+        let table = perfect_hash::PerfectHashTable::from_entries(vec![(
+            key,
+            sc,
+            lohalloc_core::Backend::Slab,
+        )]);
+        let alloc = Lohalloc::new();
+        assert!(alloc.load(&table.serialize()));
+
+        let before = Lohalloc::fallthrough_count();
+        let layout = Layout::from_size_align(size, 16).unwrap();
+        let ptr = unsafe { alloc.alloc_with_hash(layout, hash) };
+        assert!(!ptr.is_null());
+        assert_eq!(
+            unsafe { alloc.backend_for_ptr(ptr) },
+            Some(lohalloc_core::Backend::Buddy),
+            "fallthrough must serve via the size chain (Buddy for this size)"
+        );
+        unsafe { alloc.dealloc_with_hash(ptr, layout) };
+        let after = Lohalloc::fallthrough_count();
+        assert!(
+            after - before >= 1,
+            "fallthrough_count should advance when the frozen recommendation's size guard fails"
+        );
+    }
+
     #[test]
     fn forced_arena_chains_then_falls_through_at_cap() {
         // A frozen model routing a hot site to Arena used to degrade
@@ -1549,6 +2267,117 @@ mod integration_tests {
         );
         for p in ptrs {
             unsafe { alloc.dealloc_with_hash(p, layout) };
+        }
+    }
+
+    #[test]
+    fn arena_reset_republishes_fast_path_after_chunk_advance() {
+        // Advance the arena past its first 1 MiB chunk (forcing the slow
+        // path to map chunk 1 and republish the fast path's descriptor to
+        // point at it), then reset — republishing on reset must switch the
+        // fast path back to chunk 0's cursor, not leave it bumping the
+        // (now logically stale, from `reset()`'s point of view) chunk 1.
+        let hash = 0xA4E4_0002u64;
+        let size = 4096usize;
+        let sc = state::size_class_for(size);
+        let key = state::combine_hash_size_class(hash, sc);
+        let table = perfect_hash::PerfectHashTable::from_entries(vec![(
+            key,
+            sc,
+            lohalloc_core::Backend::Arena,
+        )]);
+        let alloc = Lohalloc::new();
+        assert!(alloc.load(&table.serialize()));
+        let layout = Layout::from_size_align(size, 16).unwrap();
+
+        // Default chunks are 1 MiB and 1 MiB-aligned (see arena.rs's module
+        // doc), so masking a pointer down recovers its chunk base
+        // regardless of the relative order the OS happened to map chunks
+        // in — unlike comparing raw addresses, this is platform-agnostic.
+        const CHUNK_MASK: usize = !((1usize << 20) - 1);
+        let chunk_base_of = |p: *mut u8| (p as usize) & CHUNK_MASK;
+
+        // ~400 * ~4 KiB (+header) comfortably exceeds one 1 MiB chunk.
+        let mut ptrs = Vec::new();
+        for _ in 0..400 {
+            let p = unsafe { alloc.alloc_with_hash(layout, hash) };
+            assert!(!p.is_null());
+            ptrs.push(p);
+        }
+        let first_chunk_base = chunk_base_of(ptrs[0]);
+        let last_chunk_base = chunk_base_of(*ptrs.last().unwrap());
+        assert_ne!(
+            first_chunk_base, last_chunk_base,
+            "test setup must advance to a second chunk before reset"
+        );
+
+        alloc.reset_arena();
+
+        let p_after_reset = unsafe { alloc.alloc_with_hash(layout, hash) };
+        assert!(!p_after_reset.is_null());
+        assert_eq!(
+            chunk_base_of(p_after_reset),
+            first_chunk_base,
+            "after reset, the fast path must resume bumping chunk 0"
+        );
+
+        for p in ptrs {
+            unsafe { alloc.dealloc_with_hash(p, layout) };
+        }
+        unsafe { alloc.dealloc_with_hash(p_after_reset, layout) };
+    }
+
+    #[test]
+    fn arena_fast_path_multithreaded_disjointness() {
+        // 8 threads racing the lock-free `arena_alloc_fast` CAS loop
+        // concurrently — every returned region must be genuinely disjoint.
+        // A broken CAS (e.g. an ordinary load+store race) would hand two
+        // threads overlapping memory here.
+        use std::sync::{Arc, Mutex};
+
+        let hash = 0xA4E4_0003u64;
+        let size = 64usize;
+        let sc = state::size_class_for(size);
+        let key = state::combine_hash_size_class(hash, sc);
+        let table = perfect_hash::PerfectHashTable::from_entries(vec![(
+            key,
+            sc,
+            lohalloc_core::Backend::Arena,
+        )]);
+        let alloc = Arc::new(Lohalloc::new());
+        assert!(alloc.load(&table.serialize()));
+        let layout = Layout::from_size_align(size, 16).unwrap();
+
+        let ranges: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let a = Arc::clone(&alloc);
+            let r = Arc::clone(&ranges);
+            handles.push(std::thread::spawn(move || {
+                let mut local = Vec::with_capacity(500);
+                for _ in 0..500 {
+                    let p = unsafe { a.alloc_with_hash(layout, hash) };
+                    assert!(!p.is_null());
+                    local.push((p as usize, size));
+                }
+                r.lock().unwrap().extend(local);
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        let mut all = ranges.lock().unwrap().clone();
+        all.sort_unstable();
+        for w in all.windows(2) {
+            let (start_a, len_a) = w[0];
+            let (start_b, _) = w[1];
+            assert!(
+                start_a + len_a <= start_b,
+                "overlapping arena allocations: [{start_a}, {}) and one starting at {start_b}",
+                start_a + len_a
+            );
         }
     }
 
@@ -1690,6 +2519,123 @@ mod integration_tests {
             "slab regions must stay bounded under magazine churn, got {}",
             counters.slab_region_count
         );
+    }
+
+    #[test]
+    fn buddy_magazine_churn_keeps_regions_bounded() {
+        // Same shape as `magazine_churn_keeps_slab_regions_bounded`, but at
+        // a magazined buddy size (64 KiB) — churn through the magazine
+        // layer must recycle blocks instead of mapping a fresh region every
+        // round.
+        let alloc = Lohalloc::new();
+        let layout = Layout::from_size_align(64 * 1024, 16).unwrap();
+        let mut live = Vec::new();
+        for _round in 0..40 {
+            for _ in 0..16 {
+                let p = unsafe { alloc.alloc(layout) };
+                assert!(!p.is_null());
+                live.push(p);
+            }
+            for p in live.drain(..) {
+                unsafe { alloc.dealloc(p, layout) };
+            }
+        }
+        let counters = alloc.backend_counters();
+        assert!(
+            counters.buddy_region_count < 8,
+            "buddy regions must stay bounded under magazine churn, got {}",
+            counters.buddy_region_count
+        );
+    }
+
+    #[test]
+    fn buddy_magazine_cross_thread_alloc_free_roundtrip() {
+        // Blocks allocated on one thread and freed on another must migrate
+        // cleanly through the buddy magazine layer (mirrors the slab
+        // magazine's cross-thread test) and remain reusable afterwards.
+        use std::sync::mpsc;
+        use std::sync::Arc;
+
+        let alloc = Arc::new(Lohalloc::new());
+        let layout = Layout::from_size_align(64 * 1024, 16).unwrap();
+        let (tx, rx) = mpsc::channel::<usize>();
+
+        let producer = {
+            let a = Arc::clone(&alloc);
+            std::thread::spawn(move || {
+                for _ in 0..2_000 {
+                    let p = unsafe { a.alloc(layout) };
+                    assert!(!p.is_null());
+                    tx.send(p as usize).unwrap();
+                }
+            })
+        };
+        let consumer = {
+            let a = Arc::clone(&alloc);
+            std::thread::spawn(move || {
+                for addr in rx {
+                    unsafe { a.dealloc(addr as *mut u8, layout) };
+                }
+            })
+        };
+        producer.join().unwrap();
+        consumer.join().unwrap();
+
+        for _ in 0..200 {
+            let p = unsafe { alloc.alloc(layout) };
+            assert!(!p.is_null());
+            unsafe { alloc.dealloc(p, layout) };
+        }
+    }
+
+    #[test]
+    fn buddy_magazine_multithreaded_stress_preserves_invariants() {
+        // 8 threads churning magazined buddy sizes concurrently — the hard
+        // case for merge-on-spill interacting with the magazine layer.
+        // Every block a thread pops must be servable and every block it
+        // pushes back must round-trip; if magazine bookkeeping ever handed
+        // out a live (still-magazined) pointer twice, or corrupted the
+        // central buddy's bitmap/lists, this either double-serves an
+        // address (caught by `HashSet::insert` below) or hangs/asserts in
+        // debug builds via `Buddy::check_invariants`-guarded paths.
+        use std::sync::Arc;
+
+        let alloc = Arc::new(Lohalloc::new());
+        let sizes = [20 * 1024usize, 50 * 1024, 100 * 1024, 200 * 1024];
+
+        let mut handles = Vec::new();
+        for t in 0..8 {
+            let a = Arc::clone(&alloc);
+            handles.push(std::thread::spawn(move || {
+                let mut live: Vec<(*mut u8, Layout)> = Vec::new();
+                for i in 0..2_000 {
+                    let size = sizes[(t + i) % sizes.len()];
+                    let layout = Layout::from_size_align(size, 16).unwrap();
+                    let p = unsafe { a.alloc(layout) };
+                    assert!(!p.is_null());
+                    live.push((p, layout));
+                    // Free every other block immediately (churn) so both
+                    // the magazine's pop and push paths get exercised.
+                    if i % 2 == 1 {
+                        if let Some((p, layout)) = live.pop() {
+                            unsafe { a.dealloc(p, layout) };
+                        }
+                    }
+                }
+                for (p, layout) in live {
+                    unsafe { a.dealloc(p, layout) };
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        // The allocator must still serve correctly after the stress run.
+        let layout = Layout::from_size_align(64 * 1024, 16).unwrap();
+        let p = unsafe { alloc.alloc(layout) };
+        assert!(!p.is_null());
+        unsafe { alloc.dealloc(p, layout) };
     }
 
     #[test]

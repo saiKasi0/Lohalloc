@@ -1,0 +1,5 @@
+{
+  "focus": ["latency", "throughput", "balanced"],
+  "ucb_c": [1.4, 2.0],
+  "hysteresis": [0.05, 0.15]
+}
