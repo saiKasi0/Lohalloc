@@ -125,6 +125,38 @@ done
 C_WORKLOADS=(slab arena buddy system adv-mixed "${MT_WORKLOADS[@]}")
 CPP_WORKLOADS=(slab arena buddy system adv-mixed cpp-vector cpp-string "${MT_WORKLOADS[@]}")
 
+# ---- Targeted-subset overrides (diagnosis / sweep drivers) -------------------
+# WORKLOADS="buddy adv-mixed"   replaces every language's workload list
+#                               (cpp-only names like cpp-string need LANGS=cpp
+#                               too — the C binary rejects them).
+# LANGS="c cpp"                 which of "c cpp rust" run (default: all).
+# ONLY_ALLOCATORS="lohalloc"    restrict the allocator matrix (both the
+#                               preload map and the rust build-time list).
+# These exist so one-off investigations (e.g. a cachegrind calibration A/B on
+# two workloads) and the tune_sweep native driver don't pay for the full
+# ~45-minute matrix.
+LANGS="${LANGS:-c cpp rust}"
+if [ -n "${WORKLOADS:-}" ]; then
+    read -r -a C_WORKLOADS <<<"$WORKLOADS"
+    read -r -a CPP_WORKLOADS <<<"$WORKLOADS"
+fi
+if [ -n "${ONLY_ALLOCATORS:-}" ]; then
+    for key in "${!ALLOCATORS[@]}"; do
+        case " $ONLY_ALLOCATORS " in
+            *" $key "*) ;;
+            *) unset "ALLOCATORS[$key]" ;;
+        esac
+    done
+    read -r -a RUST_ALLOCATORS <<<"$ONLY_ALLOCATORS"
+fi
+
+lang_enabled() {
+    case " $LANGS " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # For an "mt-<kind>-tN" workload name on Linux, returns "taskset -c 0-(N-1) "
 # (trailing space, ready to prepend to a command string) so the workload's N
 # threads compete for exactly N CPUs instead of whatever the Docker
@@ -178,17 +210,30 @@ run_timing() {
 # counters — see the Phase 6 plan's cache-metrics section.
 run_cachegrind() {
     local lang="$1" binary="$2" workload="$3" allocator="$4" preload="$5" mode="$6" extra_env="$7"
-    local out="$RAW_DIR/cachegrind-${lang}-${allocator}-${workload}-${mode}.json"
+    cachegrind_pass "$@" "$OPS" ""
+    # ops=1 calibration pass: identical binary, env, preload and (for
+    # inference) model file — so its counts are startup + ~1 op. cachegrind
+    # counts the WHOLE process, and at the measured OPS=2000 a mode's fixed
+    # startup cost (inference: model-file read + PHT build + registry setup)
+    # is a material share of the per-op division. The aggregator subtracts
+    # this row's counts from the main row's before dividing ->
+    # d1_misses_per_op_net, the startup-immune view.
+    cachegrind_pass "$@" 1 "-cal"
+}
+
+cachegrind_pass() {
+    local lang="$1" binary="$2" workload="$3" allocator="$4" preload="$5" mode="$6" extra_env="$7" ops="$8" suffix="$9"
+    local out="$RAW_DIR/cachegrind-${lang}-${allocator}-${workload}-${mode}${suffix}.json"
     local cg_out
     cg_out="$(mktemp)"
-    echo "==> [cachegrind] $lang/$allocator/$workload ($mode)"
+    echo "==> [cachegrind] $lang/$allocator/$workload ($mode${suffix}, ops=$ops)"
 
     local pin
     pin="$(taskset_prefix_for "$workload")"
     local raw
     raw="$(env $extra_env "$PRELOAD_VAR"="$preload" ${pin}valgrind \
         --tool=cachegrind --cachegrind-out-file="$cg_out" \
-        "$binary" "$workload" "$OPS" 2>&1 >/dev/null || true)"
+        "$binary" "$workload" "$ops" 2>&1 >/dev/null || true)"
     rm -f "$cg_out"
 
     extract() {
@@ -207,13 +252,16 @@ run_cachegrind() {
     ll_misses="$(extract '^==.*LL misses:')"
     d_refs="${d_refs:-0}"; d1_misses="${d1_misses:-0}"; lld_misses="${lld_misses:-0}"; ll_misses="${ll_misses:-0}"
 
+    local calibration=false
+    [ -n "$suffix" ] && calibration=true
     cat >"$out" <<EOF
 {
   "lang": "$lang",
   "allocator": "$allocator",
   "workload": "$workload",
   "mode": "$mode",
-  "ops": $OPS,
+  "ops": $ops,
+  "calibration": $calibration,
   "d_refs": $d_refs,
   "d1_misses": $d1_misses,
   "lld_misses": $lld_misses,
@@ -252,22 +300,33 @@ TRAIN_FREEZE_AFTER="${TRAIN_FREEZE_AFTER:-1000}"
 #      startup: pure frozen-path routing, zero training ops. Requires
 #      ASLR-stable (module-relative) stack hashes; verify with
 #      lohalloc_pht_misses() ~ 0 (LOHALLOC_DEBUG=1 prints it).
+# TUNE_FILE (optional): a flat key=value tune config (see
+# crates/lohalloc-alloc/src/tune.rs) applied to every leg of the triple via
+# LOHALLOC_TUNE — this is how tune_sweep --native ablates the *production*
+# LD_PRELOAD path (lohalloc-cabi loads the full config, reward shaping
+# included, inside its bootstrap guard; global-allocator Rust builds honor
+# only the freeze knobs). Inference gets it too: harmless there (a loaded
+# model skips training), and keeping the env identical across legs means
+# the calibration/timing deltas measure the config, not the environment.
 run_lohalloc_triple() {
     local lang="$1" binary="$2" workload="$3" preload="$4"
-    run_one "$lang" "$binary" "$workload" "lohalloc" "$preload" "training" ""
+    local tune_env=""
+    [ -n "${TUNE_FILE:-}" ] && tune_env="LOHALLOC_TUNE=$TUNE_FILE"
+    run_one "$lang" "$binary" "$workload" "lohalloc" "$preload" "training" "$tune_env"
     local model="$MODEL_DIR/model-${lang}-${workload}.lohalloc"
     echo "==> [train+export] $lang/$workload -> $model (train ops=$TRAIN_OPS)"
-    env LOHALLOC_FREEZE_AFTER="$TRAIN_FREEZE_AFTER" LOHALLOC_EXPORT_MODEL="$model" \
+    env $tune_env LOHALLOC_FREEZE_AFTER="$TRAIN_FREEZE_AFTER" LOHALLOC_EXPORT_MODEL="$model" \
         "$PRELOAD_VAR=$preload" "$binary" "$workload" "$TRAIN_OPS" >/dev/null
     if [ ! -f "$model" ]; then
         echo "FATAL: model export failed for $lang/$workload" >&2
         exit 1
     fi
-    run_one "$lang" "$binary" "$workload" "lohalloc" "$preload" "inference" "LOHALLOC_MODEL=$model"
+    run_one "$lang" "$binary" "$workload" "lohalloc" "$preload" "inference" "LOHALLOC_MODEL=$model${tune_env:+ $tune_env}"
 }
 
 for lang_binary in "c:$NATIVE_DIR/build/bench_main_c:${C_WORKLOADS[*]}" "cpp:$NATIVE_DIR/build/bench_main_cpp:${CPP_WORKLOADS[*]}"; do
     IFS=: read -r lang binary workloads_str <<<"$lang_binary"
+    lang_enabled "$lang" || continue
     read -r -a workloads <<<"$workloads_str"
     for allocator in "${!ALLOCATORS[@]}"; do
         preload="${ALLOCATORS[$allocator]}"
@@ -285,7 +344,10 @@ done
 # One binary per allocator (native_workload_<alloc>), so these rows run
 # meaningfully on macOS too — nothing here depends on LD_PRELOAD.
 RUST_WORKLOADS=(slab arena buddy system adv-mixed "${MT_WORKLOADS[@]}")
-for allocator in "${RUST_ALLOCATORS[@]}"; do
+if [ -n "${WORKLOADS:-}" ]; then
+    read -r -a RUST_WORKLOADS <<<"$WORKLOADS"
+fi
+lang_enabled rust && for allocator in "${RUST_ALLOCATORS[@]}"; do
     binary="$NATIVE_DIR/build/native_workload_$allocator"
     if [ ! -x "$binary" ]; then
         echo "NOTE: $binary missing — skipping rust/$allocator rows" >&2

@@ -68,8 +68,10 @@ def _color_for(series, idx):
     return FALLBACK_CYCLE[idx % len(FALLBACK_CYCLE)]
 
 
-def grouped_bar(out_path, title, ylabel, categories, series_values):
-    """categories: ordered x labels. series_values: {series_name: {cat: value}}."""
+def grouped_bar(out_path, title, ylabel, categories, series_values, series_errors=None):
+    """categories: ordered x labels. series_values: {series_name: {cat: value}}.
+    series_errors (optional): same shape — per-bar stddev, rendered as an
+    error bar so run-to-run noise is visible next to the mean."""
     if not categories or not series_values:
         return False
     series_names = sorted(series_values.keys())
@@ -87,6 +89,11 @@ def grouped_bar(out_path, title, ylabel, categories, series_values):
             x + (si - (n_series - 1) / 2) * bar_width for x in x_base
         ]
         heights = [series_values[name].get(cat, 0.0) for cat in categories]
+        yerr = None
+        if series_errors and name in series_errors:
+            errs = [series_errors[name].get(cat, 0.0) for cat in categories]
+            if any(e > 0 for e in errs):
+                yerr = errs
         ax.bar(
             offsets,
             heights,
@@ -95,6 +102,8 @@ def grouped_bar(out_path, title, ylabel, categories, series_values):
             color=_color_for(name, si),
             edgecolor=CANVAS,
             linewidth=0.5,
+            yerr=yerr,
+            error_kw={"ecolor": INK_MUTED, "elinewidth": 0.8, "capsize": 2},
         )
 
     ax.set_xticks(x_base)
@@ -160,14 +169,19 @@ def main():
 
     wrote_any = False
 
-    # 1. Native timing, per language.
+    # 1. Native timing, per language — with hyperfine's run-to-run stddev as
+    # error bars, so "inference vs training" deltas smaller than the noise
+    # floor are visibly not signal.
+    stddev_by_lang = collect(rows, "native-timing", "stddev_ns")
     for lang, (cats, sv) in collect(rows, "native-timing", "mean_ns").items():
+        errors = stddev_by_lang.get(lang, (None, None))[1]
         wrote_any |= grouped_bar(
             out_dir / f"native-timing-{lang}.png",
             f"Native mean latency — {lang}",
             "ns / invocation",
             cats,
             sv,
+            series_errors=errors,
         )
 
     # 1b. Native throughput (same timing data, ops/sec view).
@@ -200,11 +214,17 @@ def main():
 
     # 2b. Absolute D1 misses per workload op — the denominator-immune view
     # (see aggregate.rs's module doc for why the rate alone misleads on
-    # training-vs-inference comparisons).
-    for lang, (cats, sv) in collect(rows, "cachegrind", "d1_misses_per_op").items():
+    # training-vs-inference comparisons). Prefer the startup-subtracted
+    # `_net` values (ops=1 calibration) when the run captured them; older
+    # runs fall back to gross per-op.
+    perop_net = collect(rows, "cachegrind", "d1_misses_per_op_net")
+    perop_key, perop_suffix = (
+        ("d1_misses_per_op_net", " (net of startup)") if perop_net else ("d1_misses_per_op", "")
+    )
+    for lang, (cats, sv) in collect(rows, "cachegrind", perop_key).items():
         wrote_any |= grouped_bar(
             out_dir / f"cache-d1-perop-{lang}.png",
-            f"D1 misses per op — {lang}",
+            f"D1 misses per op{perop_suffix} — {lang}",
             "D1 misses / op",
             cats,
             sv,

@@ -117,9 +117,11 @@ const KEYS: [&str; 12] = [
 /// else keeps its current value, and explicit `t_ref_ns`/`frag_weight`
 /// keys applied *after* the preset override it (see `apply_layer`).
 ///
-/// The preset values are initial placeholders to be replaced by
-/// `tune_sweep` winners (see the plan's Step 8) — `latency` is pinned to
-/// the historical defaults and must stay behavior-identical.
+/// `latency` is pinned to the historical defaults and must stay
+/// behavior-identical. These `(t_ref_ns, frag_weight)` pairs were the
+/// original Step 8 design (not swept — `tune_sweep`'s grid varies
+/// `ucb_c`/`hysteresis` per focus instead, see `bench/lohalloc-tune.*`
+/// for the 2026-07-04 measured results checked into those files).
 fn apply_focus(cfg: &mut TrainingConfig, value: &str) {
     match value {
         "latency" => {

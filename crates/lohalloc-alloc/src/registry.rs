@@ -79,6 +79,22 @@ impl SegmentRegistry {
     /// practice; the CAS below is defense-in-depth, not load-bearing for
     /// correctness under that lock).
     ///
+    /// # Publish order (load-bearing — a SIGSEGV on ARM64 taught us this)
+    ///
+    /// `vals[idx]` is written **before** `keys[idx]` is published via the
+    /// `Release` CAS, never after. A concurrent `lookup` only synchronizes
+    /// on `keys[idx]` (`Acquire`) — release/acquire on one atomic makes
+    /// everything sequenced *before* the release visible to the acquire,
+    /// but says nothing about a write to a *different* atomic (`vals`)
+    /// sequenced *after* it. Publishing key-then-val left a window on weak
+    /// memory-ordering hardware (reproduced on Apple Silicon; masked on
+    /// x86-64's stronger TSO, which is why this only ever crashed on
+    /// macOS/ARM64) where a lookup could observe the new key but still
+    /// read the slot's old/zero `val` — silently handing a headerless
+    /// dealloc the wrong slab class, corrupting free-list linkage a few
+    /// operations later. Fixed by writing the payload first so the
+    /// key's `Release` store is guaranteed to flush it.
+    ///
     /// Returns `true` if `base` is registered (either just now, or already
     /// present), `false` if the table is saturated. **The caller must not
     /// serve any headerless (no-header) block from `base` on a `false`
@@ -91,14 +107,24 @@ impl SegmentRegistry {
         debug_assert!(base != 0, "segment base must be nonzero");
         let mut idx = Self::slot_for(base);
         for _ in 0..CAPACITY {
-            match self.keys[idx].compare_exchange(0, base, Ordering::Release, Ordering::Relaxed) {
-                Ok(_) => {
-                    self.vals[idx].store(class, Ordering::Release);
-                    return true;
-                }
-                Err(existing) if existing == base => return true, // already registered
-                Err(_) => idx = (idx + 1) & (CAPACITY - 1),
+            let existing = self.keys[idx].load(Ordering::Acquire);
+            if existing == base {
+                return true; // already registered
             }
+            if existing == 0 {
+                // Payload before publish (see the ordering note above) —
+                // single-writer per the module doc, so no other writer can
+                // claim this slot with a different key between here and
+                // the CAS below.
+                self.vals[idx].store(class, Ordering::Relaxed);
+                match self.keys[idx].compare_exchange(0, base, Ordering::Release, Ordering::Relaxed)
+                {
+                    Ok(_) => return true,
+                    Err(actual) if actual == base => return true,
+                    Err(_) => {} // lost a theoretical race; fall through and advance
+                }
+            }
+            idx = (idx + 1) & (CAPACITY - 1);
         }
         false // Saturated.
     }
@@ -192,5 +218,55 @@ mod tests {
         // this key spacing, and irrelevant to what's being tested: that
         // the loop terminates).
         let _ = r.lookup(0xDEAD_0000);
+    }
+
+    #[test]
+    fn concurrent_readers_never_observe_a_visible_key_with_wrong_val() {
+        // Regression test for the ARM64 SIGSEGV: many reader threads poll
+        // `lookup` while one writer thread inserts fresh, distinct entries.
+        // A reader that sees a key it doesn't recognize yet is fine (None);
+        // one that sees the key MUST see the correct val — the whole bug
+        // was a reader observing the key before the val had propagated.
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let registry = Arc::new(SegmentRegistry::new());
+        let done = Arc::new(AtomicBool::new(false));
+        const N: usize = 700; // well under CAPACITY, no saturation noise
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                let done = Arc::clone(&done);
+                std::thread::spawn(move || {
+                    while !done.load(Ordering::Relaxed) {
+                        for i in 0..N {
+                            let base = 0x2000_0000 + i * 0x1_0000;
+                            if let Some(val) = registry.lookup(base) {
+                                assert_eq!(
+                                    val,
+                                    (i % 251) as u8,
+                                    "segment {i} visible with wrong class -> stale/zero val race"
+                                );
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for i in 0..N {
+            let base = 0x2000_0000 + i * 0x1_0000;
+            assert!(registry.insert(base, (i % 251) as u8));
+        }
+        done.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+        // Final sanity: every entry resolves correctly once insertion is done.
+        for i in 0..N {
+            let base = 0x2000_0000 + i * 0x1_0000;
+            assert_eq!(registry.lookup(base), Some((i % 251) as u8));
+        }
     }
 }

@@ -3,8 +3,44 @@
 # A middle knee and a light fragmentation penalty — trades a little tail
 # latency for better mean cost and memory density.
 #
-# Placeholder values pending a `make bench-tune` sweep — see the plan's
-# Step 8. Replace with the sweep's balanced-group winner.
+# ## Sweep methodology (2026-07-04)
+#
+# Ran `make bench-tune` (in-process, mac-native — bare metal, not Docker;
+# see COPILOT.md's Docker-vs-bare-metal verdict for why) and
+# `make bench-tune-native` (Docker, the actual production LD_PRELOAD path
+# via lohalloc-cabi, where this config's full effect — reward shaping
+# included — applies) against `bench/tune-grid.json`'s 12-point grid
+# (focus x ucb_c{1.4,2.0} x hysteresis{0.05,0.15}) plus an injected
+# defaults baseline, on slab/buddy/adv-mixed. The native sweep's hyperfine
+# wall-clock numbers (ms-scale, continuous — verified, not bucketed) are
+# what these preset files are based on; the in-process sweep's per-op
+# nanosecond p50/p99 comparisons were cross-checked but are NOT relied on
+# for fast workloads (slab, arena) — this machine's `Instant` clock has a
+# measured ~41.7ns tick floor (ARM generic timer, confirmed via a direct
+# 200k-sample delta histogram: peaks at 0/41/42ns and small multiples), so
+# per-op timings near or below that resolve into a handful of discrete
+# buckets rather than a continuous signal. `latency_profile`'s per-op
+# metrics remain meaningful for slower workloads (buddy, system,
+# adv-mixed, hundreds-to-thousands of ns) where this isn't a factor.
+#
+# Each config point is a single training run — the sweep does not repeat
+# points, and real-latency bandit training is inherently noisy (documented
+# throughout this repo); the "defaults" baseline itself is one such sample
+# and its buddy row (94.14ms ± 47.26ms) was a high-variance outlier vs.
+# nearly every other config's buddy row (~74-77ms) — read the ~20% buddy
+# "win" below as "most configs beat one unlucky defaults sample" rather
+# than an uncontested tuning win.
+#
+# ## This config (focus=balanced, hysteresis=0.05, ucb_c=2.0) vs. defaults
+#
+#   slab:       -2.0%   buddy:      -20.9%   adv-mixed:   -8.2%
+#
+# The only swept combination that improved all three workloads
+# simultaneously (vs. e.g. focus=balanced/hysteresis=0.15, which won
+# bigger on adv-mixed (-21.3%) but cost slab +17.8%) — the most
+# defensibly "balanced" result in the whole grid. ucb_c showed no robust
+# benefit from moving off 2.0 (mixed/noisy across workloads) and is left
+# unchanged.
 focus=balanced
 ucb_c=2.0
-hysteresis=0.15
+hysteresis=0.05

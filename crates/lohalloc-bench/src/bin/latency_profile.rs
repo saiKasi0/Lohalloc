@@ -37,6 +37,36 @@ struct LatencyReport {
     dealloc_p50_ns: u64,
     dealloc_p99_ns: u64,
     dealloc_mean_ns: f64,
+    /// Measured wall-clock throughput of the measured phase (million
+    /// alloc ops / second): total elapsed around the workload run ÷ alloc
+    /// count. Unlike `1e3 / alloc_mean_ns` (per-op timer sums, which
+    /// exclude the workload's own bookkeeping between ops) this is what a
+    /// throughput-focused tune config should actually be judged by.
+    measured_mops: f64,
+    /// Peak RSS of this process in bytes (`getrusage`; macOS reports
+    /// bytes, Linux KiB — normalized here). The memory-side metric for
+    /// judging `frag_weight`/throughput configs: a config that wins
+    /// latency by fragmenting pays here.
+    peak_rss_bytes: u64,
+}
+
+/// Peak RSS in bytes, cross-platform (`ru_maxrss` is KiB on Linux, bytes
+/// on macOS). 0 if the syscall fails — the report stays usable.
+fn peak_rss_bytes() -> u64 {
+    // SAFETY: getrusage writes into the zeroed struct we hand it; no
+    // pointers retained.
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0 {
+            return 0;
+        }
+        let raw = ru.ru_maxrss.max(0) as u64;
+        if cfg!(target_os = "macos") {
+            raw
+        } else {
+            raw * 1024
+        }
+    }
 }
 
 struct Args {
@@ -112,6 +142,31 @@ fn run_workload<D: AllocDriver>(workload: &str, driver: &D, hash: u64, ops: usiz
     }
 }
 
+/// Render the resolved [`TrainingConfig`] in the same flat `key=value`
+/// format tune files use — one line per knob, deterministic order.
+fn dump_config(cfg: &lohalloc_alloc::tune::TrainingConfig) -> String {
+    let freeze_mode = match cfg.freeze_mode {
+        lohalloc_alloc::tune::FreezeMode::Ops => "ops",
+        lohalloc_alloc::tune::FreezeMode::Converged => "converged",
+    };
+    let mut out = String::new();
+    out.push_str(&format!("ucb_c={}\n", cfg.ucb_c));
+    out.push_str(&format!("hysteresis={}\n", cfg.hysteresis));
+    for (i, name) in ["slab", "buddy", "system", "arena"].iter().enumerate() {
+        out.push_str(&format!("baseline_{name}={}\n", cfg.baseline_rewards[i]));
+    }
+    out.push_str(&format!("t_ref_ns={}\n", cfg.t_ref_ns));
+    out.push_str(&format!("frag_weight={}\n", cfg.frag_weight));
+    out.push_str(&format!("freeze_mode={freeze_mode}\n"));
+    out.push_str(&format!("converge_stable_n={}\n", cfg.converge_stable_n));
+    // Omitted when unset so the dump is itself a parseable tune file
+    // (tune.rs has no "none" spelling for freeze_after).
+    if let Some(v) = cfg.freeze_after {
+        out.push_str(&format!("freeze_after={v}\n"));
+    }
+    out
+}
+
 fn percentiles(hist: &Histogram<u64>) -> (u64, u64, u64, u64, f64) {
     (
         hist.value_at_quantile(0.50),
@@ -126,13 +181,22 @@ fn main() {
     // Install the tune config (LOHALLOC_TUNE + LOHALLOC_* env overrides) so
     // sweep-driven runs (`tune_sweep`) shape the private instance's training
     // — safe to do plainly in an ordinary binary (no interposition).
-    lohalloc_alloc::tune::load_from_env();
+    let cfg = lohalloc_alloc::tune::load_from_env();
+    // `--dump-config`: print the *resolved* config as the same flat
+    // key=value format tune files use, then exit. This is the e2e probe for
+    // the defaults -> LOHALLOC_TUNE file -> LOHALLOC_<KEY> env precedence
+    // chain across a real process boundary (tests/tune_e2e.rs).
+    if env::args().any(|a| a == "--dump-config") {
+        print!("{}", dump_config(cfg));
+        return;
+    }
     let args = parse_args();
     let hash = hash_for(&args.workload);
 
     let harness;
     let alloc_samples: Vec<u64>;
     let dealloc_samples: Vec<u64>;
+    let measured_elapsed: std::time::Duration;
 
     if let Some(backend_name) = args.mode.strip_prefix("forced:") {
         let backend = match backend_name {
@@ -146,7 +210,9 @@ fn main() {
             alloc: lohalloc_forced_single(hash, size_for_workload(&args.workload), backend),
         };
         let timing = TimingDriver::new(&harness);
+        let t0 = std::time::Instant::now();
         run_workload(&args.workload, &timing, hash, args.ops);
+        measured_elapsed = t0.elapsed();
         alloc_samples = timing.alloc_samples();
         dealloc_samples = timing.dealloc_samples();
     } else {
@@ -165,7 +231,9 @@ fn main() {
             ),
         }
         let timing = TimingDriver::new(&harness);
+        let t0 = std::time::Instant::now();
         run_workload(&args.workload, &timing, hash, args.ops);
+        measured_elapsed = t0.elapsed();
         alloc_samples = timing.alloc_samples();
         dealloc_samples = timing.dealloc_samples();
     }
@@ -196,6 +264,15 @@ fn main() {
         dealloc_p50_ns: d50,
         dealloc_p99_ns: d99,
         dealloc_mean_ns: dmean,
+        measured_mops: {
+            let secs = measured_elapsed.as_secs_f64();
+            if secs > 0.0 {
+                alloc_samples.len() as f64 / secs / 1e6
+            } else {
+                0.0
+            }
+        },
+        peak_rss_bytes: peak_rss_bytes(),
     };
 
     let json = serde_json::to_string_pretty(&report).unwrap();

@@ -232,6 +232,17 @@ pub struct Lohalloc {
     slab: Mutex<slab::Slab>,
     buddy: Mutex<buddy::Buddy>,
     arena: Mutex<Option<arena::BumpArena>>,
+    /// Fast-fail latch: set when the arena hits its `MAX_CHUNKS` cap and
+    /// fails a chunk-fitting request, cleared only by `reset_arena()`. A
+    /// bump arena never frees per-allocation, so once capped it fails
+    /// *every* subsequent alloc — without this latch, a frozen model that
+    /// routed churny call sites to Arena pays a doomed Mutex slow-path
+    /// attempt on every allocation after exhaustion, forever (measured on
+    /// cpp-string under LD_PRELOAD: inference 1.76× slower than its own
+    /// training, fallthrough=200k/350k allocs — training self-corrects via
+    /// the bandit; frozen routing cannot). One relaxed load, paid only on
+    /// arena-recommended allocations.
+    arena_exhausted: AtomicBool,
     /// The Decision Engine (Phase 3). Routes allocations via MAB in Training
     /// mode and via a frozen `PerfectHashTable` in Inference mode.
     state: Mutex<state::AllocatorState>,
@@ -361,6 +372,7 @@ impl Lohalloc {
             // Arena is lazily initialized on first use (requires mmap, which
             // is not const-evaluable).
             arena: Mutex::new(None),
+            arena_exhausted: AtomicBool::new(false),
             // Decision Engine starts in Training mode.
             state: Mutex::new(state::AllocatorState::new_training_const()),
             frozen: AtomicBool::new(false),
@@ -1071,6 +1083,13 @@ impl Lohalloc {
                 })
             }
             lohalloc_core::Backend::Arena => {
+                // Exhaustion latch first (see the field doc): a capped-out
+                // bump arena can never serve again until reset, so fail
+                // straight to the caller's fallthrough instead of re-paying
+                // the doomed fast-path bump + Mutex slow path per alloc.
+                if self.arena_exhausted.load(Ordering::Relaxed) {
+                    return None;
+                }
                 // Lock-free fast path: bump the published current chunk's
                 // cursor directly, no Mutex. Falls through to the slow
                 // path below on a miss (arena not yet initialized, or the
@@ -1115,6 +1134,12 @@ impl Lohalloc {
                 });
                 if let Some(arena) = arena_guard.as_ref() {
                     self.publish_arena_chunk(arena);
+                    // Latch permanent exhaustion (cap reached on a request
+                    // that would have fit an empty chunk) so every later
+                    // arena-routed alloc fast-fails at the arm's head.
+                    if result.is_none() && arena.exhausted_after_failed(total, align) {
+                        self.arena_exhausted.store(true, Ordering::Relaxed);
+                    }
                 }
                 result
             }
@@ -1325,6 +1350,10 @@ impl Lohalloc {
             if let Some(arena) = arena_guard.as_ref() {
                 self.publish_arena_chunk(arena);
             }
+            // A rewound arena has capacity again — unlatch the fast-fail.
+            // Ordered inside the Mutex so it can't race a concurrent
+            // exhaustion re-latch from the alloc slow path (also lock-held).
+            self.arena_exhausted.store(false, Ordering::Relaxed);
         }
     }
 
@@ -2271,6 +2300,71 @@ mod integration_tests {
     }
 
     #[test]
+    fn arena_exhaustion_latch_fast_fails_and_reset_unlatches() {
+        // The cpp-string LD_PRELOAD anomaly (inference 1.76× slower than
+        // its own training, fallthrough=200k/350k allocs): a frozen model
+        // routed churny call sites to Arena; once the 32 MiB cap filled,
+        // every alloc paid a doomed fast-path bump + Mutex slow path before
+        // falling through — forever, since frozen routing can't
+        // self-correct like the bandit does. The latch turns every
+        // post-exhaustion arena recommendation into one relaxed load, and
+        // reset_arena() re-opens the arena.
+        let hash = 0xA4E4_0003u64;
+        let size = 64 * 1024usize; // large blocks reach the cap quickly
+        let sc = state::size_class_for(size);
+        let key = state::combine_hash_size_class(hash, sc);
+        let table = perfect_hash::PerfectHashTable::from_entries(vec![(
+            key,
+            sc,
+            lohalloc_core::Backend::Arena,
+        )]);
+        let alloc = Lohalloc::new();
+        assert!(alloc.load(&table.serialize()));
+        let layout = Layout::from_size_align(size, 16).unwrap();
+
+        // ~64 MiB of requests against a 32 MiB cap: every alloc must still
+        // succeed (post-cap ones via the size-chain fallthrough).
+        let mut ptrs = Vec::new();
+        for i in 0..1000 {
+            let p = unsafe { alloc.alloc_with_hash(layout, hash) };
+            assert!(!p.is_null(), "alloc {i} must succeed even after the cap");
+            ptrs.push(p);
+        }
+        assert!(
+            alloc.arena_exhausted.load(Ordering::Relaxed),
+            "cap exhaustion must set the fast-fail latch"
+        );
+        assert_eq!(
+            unsafe { alloc.backend_for_ptr(ptrs[0]) },
+            Some(lohalloc_core::Backend::Arena),
+            "pre-cap allocs are arena-served"
+        );
+        assert_ne!(
+            unsafe { alloc.backend_for_ptr(*ptrs.last().unwrap()) },
+            Some(lohalloc_core::Backend::Arena),
+            "post-cap allocs are served by the fallthrough chain"
+        );
+        for p in ptrs {
+            unsafe { alloc.dealloc_with_hash(p, layout) };
+        }
+
+        // Reset rewinds the arena -> the latch must clear and the same
+        // frozen recommendation must be arena-served again.
+        alloc.reset_arena();
+        assert!(
+            !alloc.arena_exhausted.load(Ordering::Relaxed),
+            "reset_arena must clear the latch"
+        );
+        let p = unsafe { alloc.alloc_with_hash(layout, hash) };
+        assert_eq!(
+            unsafe { alloc.backend_for_ptr(p) },
+            Some(lohalloc_core::Backend::Arena),
+            "a reset arena serves the frozen recommendation again"
+        );
+        unsafe { alloc.dealloc_with_hash(p, layout) };
+    }
+
+    #[test]
     fn arena_reset_republishes_fast_path_after_chunk_advance() {
         // Advance the arena past its first 1 MiB chunk (forcing the slow
         // path to map chunk 1 and republish the fast path's descriptor to
@@ -2376,6 +2470,83 @@ mod integration_tests {
             assert!(
                 start_a + len_a <= start_b,
                 "overlapping arena allocations: [{start_a}, {}) and one starting at {start_b}",
+                start_a + len_a
+            );
+        }
+    }
+
+    #[test]
+    fn arena_chunk_advance_races_fast_path_without_corruption() {
+        // Regression test for a ThreadSanitizer-confirmed data race: the
+        // slow path (under `Lohalloc`'s `arena` Mutex) used to retry alloc
+        // on the *current* chunk via `Chunk::alloc`'s plain
+        // `self.cursor.get_mut()` — reasoning that the Mutex ruled out
+        // concurrent access. It didn't: `arena_alloc_fast` reads that same
+        // chunk's cursor lock-free (via the published `arena_chunk`
+        // descriptor) and never takes the Mutex at all, so a fast-path
+        // reader could race the slow path's plain read-modify-write on the
+        // exact same `AtomicUsize` — reproduced as a real SIGSEGV on
+        // Apple Silicon (native LD_PRELOAD mt-slab-t8 inference) and
+        // caught immediately by `cargo +nightly build -Zbuild-std
+        // --target aarch64-apple-darwin -p lohalloc-bench --bin
+        // native_workload --no-default-features --features alloc-lohalloc`
+        // with `RUSTFLAGS="-Z sanitizer=thread"`, then run under
+        // `TSAN_OPTIONS=halt_on_error=1`. Fixed by making `Chunk::alloc`
+        // use the same atomic compare-exchange loop as `arena_alloc_fast`
+        // — see its doc.
+        //
+        // This test can't force the race deterministically outside TSAN,
+        // but many threads racing through *many* small chunks (forcing
+        // constant chunk-advance slow-path traffic concurrently with
+        // fast-path hits) is exactly the scenario that raced — a broken
+        // fix would very likely show up here as overlapping/out-of-bounds
+        // pointers, and always shows up under a TSAN rebuild of this same
+        // shape.
+        use std::sync::{Arc, Mutex};
+
+        let hash = 0xA4E4_0004u64;
+        let size = 64usize;
+        let sc = state::size_class_for(size);
+        let key = state::combine_hash_size_class(hash, sc);
+        let table = perfect_hash::PerfectHashTable::from_entries(vec![(
+            key,
+            sc,
+            lohalloc_core::Backend::Arena,
+        )]);
+        let alloc = Arc::new(Lohalloc::new());
+        assert!(alloc.load(&table.serialize()));
+        let layout = Layout::from_size_align(size, 16).unwrap();
+
+        let ranges: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let a = Arc::clone(&alloc);
+            let r = Arc::clone(&ranges);
+            handles.push(std::thread::spawn(move || {
+                // 8 threads x 3000 x 64B ≈ 1.5MiB — several chunk advances
+                // past the default 1MiB chunk, contended across threads.
+                let mut local = Vec::with_capacity(3000);
+                for _ in 0..3000 {
+                    let p = unsafe { a.alloc_with_hash(layout, hash) };
+                    assert!(!p.is_null());
+                    local.push((p as usize, size));
+                }
+                r.lock().unwrap().extend(local);
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        let mut all = ranges.lock().unwrap().clone();
+        all.sort_unstable();
+        for w in all.windows(2) {
+            let (start_a, len_a) = w[0];
+            let (start_b, _) = w[1];
+            assert!(
+                start_a + len_a <= start_b,
+                "overlapping arena allocations across a chunk advance: \
+                 [{start_a}, {}) and one starting at {start_b}",
                 start_a + len_a
             );
         }

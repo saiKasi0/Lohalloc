@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Render a Phase 6 bench-report.json into PNG graphs.
 #
-#   bench/graphs/generate.sh <report.json> <out_dir>
+#   bench/graphs/generate.sh <report.json> <out_dir> [plotter.py]
+#
+# The optional third arg picks the plotting script (default plot_report.py;
+# tune_sweep passes plot_tune.py for its own report shape).
 #
 # Manages a self-contained Python venv at bench/graphs/.venv (matplotlib only,
 # no pandas/seaborn) so the aggregator can shell out to it without touching the
@@ -29,5 +32,6 @@ if [ ! -x "$VENV/bin/python" ]; then
     "$VENV/bin/pip" install --quiet -r "$SCRIPT_DIR/requirements.txt"
 fi
 
+PLOTTER="${3:-plot_report.py}"
 mkdir -p "$OUT_DIR"
-exec "$VENV/bin/python" "$SCRIPT_DIR/plot_report.py" "$REPORT_JSON" "$OUT_DIR"
+exec "$VENV/bin/python" "$SCRIPT_DIR/$PLOTTER" "$REPORT_JSON" "$OUT_DIR"

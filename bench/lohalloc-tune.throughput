@@ -4,8 +4,16 @@
 # for better mean cost) and adds a fragmentation penalty so the bandit
 # prefers backends that pack tighter when raw latencies are close.
 #
-# Placeholder values pending a `make bench-tune` sweep — see the plan's
-# Step 8. Replace with the sweep's throughput-group winner.
+# Measured 2026-07-04 via `make bench-tune-native` (Docker, production
+# LD_PRELOAD path, 12-point grid + defaults baseline, slab/buddy/adv-mixed;
+# see bench/lohalloc-tune.balanced for the full methodology note).
+# hysteresis=0.05 vs the 0.15 default, both at this focus + ucb_c=2.0:
+#   slab:      +17.0% (0.05) vs  -2.1% (0.15)  — 0.15 wins here
+#   buddy:     -20.1% (0.05) vs -21.3% (0.15)  — roughly tied
+#   adv-mixed: -17.3% (0.05) vs +43.1% (0.15)  — 0.05 avoids a large regression
+# 0.05 chosen: it avoids adv-mixed's 43% regression at the cost of a
+# smaller, real cost on slab. ucb_c showed no robust benefit from moving
+# off 2.0 (mixed/noisy across workloads) and is left unchanged.
 focus=throughput
 ucb_c=2.0
-hysteresis=0.15
+hysteresis=0.05

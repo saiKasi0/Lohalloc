@@ -96,16 +96,37 @@ impl Chunk {
         })
     }
 
-    /// Slow-path bump, called with `Lohalloc`'s `arena` Mutex held (so a
-    /// plain load/store on the atomic is fine — no concurrent writer).
+    /// Slow-path bump, called with `Lohalloc`'s `arena` Mutex held against
+    /// concurrent *slow-path* callers — but **not** against
+    /// `Lohalloc::arena_alloc_fast`, which reads this same chunk's `cursor`
+    /// lock-free via the published `arena_chunk` descriptor and never
+    /// touches the Mutex at all. Retrying alloc on the *current* chunk here
+    /// (before deciding to advance) can therefore race a concurrent
+    /// fast-path reader on the exact same `AtomicUsize` — a real,
+    /// ThreadSanitizer-confirmed data race (an earlier version used
+    /// `self.cursor.get_mut()`, a plain, non-atomic read-modify-write,
+    /// reasoning that the Mutex ruled out concurrent access; it only ruled
+    /// out concurrent *slow-path* access). Every access must therefore go
+    /// through the same atomic compare-exchange loop `arena_alloc_fast`
+    /// uses, matching it exactly — bump-once-under-lock is not a
+    /// correctness-relevant hot path, so paying a CAS here is free.
     fn alloc(&mut self, size: usize, align: usize) -> Option<*mut u8> {
-        let cur = *self.cursor.get_mut();
-        let aligned = align_up(cur, align);
-        if aligned.checked_add(size)? > (self.base as usize) + self.capacity {
-            return None;
+        let align = align.max(MIN_ALIGN);
+        loop {
+            let cur = self.cursor.load(Ordering::Relaxed);
+            let aligned = align_up(cur, align);
+            let new_cur = aligned.checked_add(size)?;
+            if new_cur > (self.base as usize) + self.capacity {
+                return None;
+            }
+            if self
+                .cursor
+                .compare_exchange_weak(cur, new_cur, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(aligned as *mut u8);
+            }
         }
-        *self.cursor.get_mut() = aligned + size;
-        Some(aligned as *mut u8)
     }
 
     fn used(&self) -> usize {
@@ -211,6 +232,21 @@ impl BumpArena {
     /// (initial arena creation, a chunk advance, or a `reset`).
     pub(crate) fn current_chunk(&self) -> &Chunk {
         &self.chunks[self.current]
+    }
+
+    /// After a failed [`alloc`](Self::alloc): `true` when the failure means
+    /// the arena is *permanently* out of memory for chunk-fitting requests
+    /// (the [`MAX_CHUNKS`] cap is reached and this request would have fit an
+    /// empty chunk), as opposed to a one-off oversized request that could
+    /// never fit any chunk. `lib.rs` uses this to set its `arena_exhausted`
+    /// fast-fail flag — a bump arena never recovers from cap exhaustion
+    /// except via [`reset`](Self::reset). Deliberately conservative about
+    /// tail space: a smaller later request might still squeeze into the last
+    /// chunk's remaining bytes, but that transient (< one chunk) is not
+    /// worth re-attempting the Mutex slow path on every allocation forever.
+    pub(crate) fn exhausted_after_failed(&self, size: usize, align: usize) -> bool {
+        self.chunks.len() == MAX_CHUNKS
+            && size.saturating_add(align.max(MIN_ALIGN)) <= self.chunk_size
     }
 
     /// Total usable capacity across all currently mapped chunks (bytes).

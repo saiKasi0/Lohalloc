@@ -7,7 +7,17 @@
 # Optimizes for low tail latency: a small reward-curve knee punishes slow
 # ops hard, and no fragmentation penalty (raw speed only).
 #
-# Placeholder pending a `make bench-tune` sweep — see the plan's Step 8.
+# Measured 2026-07-04 via `make bench-tune-native` (Docker, production
+# LD_PRELOAD path, 12-point grid + defaults baseline, slab/buddy/adv-mixed;
+# see bench/lohalloc-tune.balanced for the full methodology note). Result
+# for THIS focus specifically: hysteresis=0.05 was NOT a win here — both
+# 0.05 and 0.15 regressed adv-mixed by a similar amount vs the single
+# defaults sample (+47.4% at 0.05/ucb_c=2.0, +40.1% at 0.15/ucb_c=2.0;
+# the two other hysteresis=0.05 points either also regressed or landed on
+# a config whose buddy run was a wild outlier, mean 297ms vs ~75-95ms
+# everywhere else — discounted as noise). No swept combination gave a
+# clean win under this reward curve, so this preset is left exactly as
+# the historical default, preserving its documented "= no change" intent.
 focus=latency
 ucb_c=2.0
 hysteresis=0.15

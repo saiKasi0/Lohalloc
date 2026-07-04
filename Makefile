@@ -35,7 +35,7 @@ endif
 # ---- Phony targets ----
 .PHONY: help all shim example-sink demo-sink binaries \
         server server-debug gui dev test e2e lint fmt clean \
-        bench-all bench-all-host bench-image bench-latency bench bench-tune graphs \
+        bench-all bench-all-host bench-mac bench-image bench-latency bench bench-tune bench-tune-native graphs \
         bench-native bench-cache bench-native-host bench-cache-host bench-rust-bins bench-report
 
 help:
@@ -55,13 +55,16 @@ help:
 	@echo "  make fmt            — cargo fmt --all"
 	@echo "  make clean          — cargo clean + remove shim/build/"
 	@echo "  make bench-all      — ONE command: run every benchmark + build ALL graphs into results/<timestamp>/ (Docker)"
+	@echo "  make bench-all TUNE=1 — same, plus the tune-config ablation sweep into results/<ts>/tune/"
 	@echo "  make bench-all-host — same, but native passes run on the host (no Docker)"
+	@echo "  make bench-mac      — macOS-native run (no Docker/VM noise): rust rows + latency profiles + report"
 	@echo "  make bench          — full Rust criterion suite + latency profiles + report (Phase 6)"
 	@echo "  make bench-native   — native C/C++/Rust cross-allocator timing (Docker, Linux LD_PRELOAD)"
 	@echo "  make bench-cache    — native cachegrind cache-miss pass (Docker)"
 	@echo "  make bench-report   — aggregate results/<timestamp>/raw into report + graphs (use RUN_DIR=...)"
 	@echo "  make graphs RUN_DIR=results/<ts>  — re-render graphs for an existing run"
 	@echo "  make bench-tune     — Step 8 tune-config ablation sweep (GRID=, TUNE_WORKLOADS=, TUNE_OUT=)"
+	@echo "  make bench-tune-native — same sweep + production LD_PRELOAD triples per config (Docker on macOS)"
 
 # ---- Builds ----
 shim:
@@ -146,6 +149,10 @@ bench-all: bench-image
 		--entrypoint bash lohalloc-bench bench/run_native.sh --cachegrind
 	@echo "==> [4/4] Aggregate + render graphs"
 	@$(MAKE) --no-print-directory bench-report RUN_DIR=$(RUN_DIR)
+ifeq ($(TUNE),1)
+	@echo "==> [tune] In-process ablation sweep -> $(RUN_DIR)/tune"
+	@$(MAKE) --no-print-directory bench-tune TUNE_OUT=$(RUN_DIR)/tune
+endif
 	@echo "==> Done. Report + graphs in $(RUN_DIR)"
 
 # No-Docker variant of bench-all (native passes run on the host directly) —
@@ -156,6 +163,36 @@ bench-all-host:
 	@$(MAKE) --no-print-directory bench-latency RUN_DIR=$(RUN_DIR)
 	@$(MAKE) --no-print-directory bench-native-host RUN_DIR=$(RUN_DIR)
 	@$(MAKE) --no-print-directory bench-cache-host RUN_DIR=$(RUN_DIR)
+	@$(MAKE) --no-print-directory bench-report RUN_DIR=$(RUN_DIR)
+	@echo "==> Done. Report + graphs in $(RUN_DIR)"
+
+# macOS-native benchmark run (no Docker) — the Docker/VM-noise control run.
+# Docker Desktop on macOS runs Linux in a VM whose scheduling/memory noise
+# is large enough to flip small training-vs-inference deltas (see the
+# "within noise" verdicts in bench-report.md); this target produces the
+# same-format report from bare-metal numbers. Runs everything that is
+# *meaningful* on Darwin: the Rust per-op latency profiles and the Rust
+# native rows (allocator chosen at build time via alloc-* features — no
+# preload involved), plus the C/C++ "system" baseline rows. Interposed
+# C/C++ rows are structurally impossible on macOS (DYLD_INSERT_LIBRARIES
+# does not rebind libsystem_malloc — bench/run_native.sh's module doc) and
+# valgrind/cachegrind does not support modern macOS at all.
+# run_native.sh needs bash 4+ (associative arrays): use brew's bash when
+# present, else fall back and let the script print its own clear error.
+BREW_BASH := $(shell command -v /opt/homebrew/bin/bash /usr/local/bin/bash 2>/dev/null | head -1)
+MAC_BASH := $(if $(BREW_BASH),$(BREW_BASH),bash)
+bench-mac:
+	@command -v hyperfine >/dev/null 2>&1 || { echo "==> hyperfine missing — installing via cargo"; cargo install hyperfine --locked; }
+	@echo "==> Benchmark run directory: $(RUN_DIR)"
+	@mkdir -p $(RUN_DIR)/raw
+	@echo "==> [1/3] Rust per-op latency profiles"
+	@$(MAKE) --no-print-directory bench-latency RUN_DIR=$(RUN_DIR)
+	@echo "==> [2/3] Native timing (rust rows + C/C++ system baseline)"
+	@$(MAKE) --no-print-directory bench-rust-bins
+	cargo build -p lohalloc-cabi --release
+	make -C bench/native
+	RAW_DIR="$(CURDIR)/$(RUN_DIR)/raw" $(MAC_BASH) bench/run_native.sh
+	@echo "==> [3/3] Aggregate + render graphs"
 	@$(MAKE) --no-print-directory bench-report RUN_DIR=$(RUN_DIR)
 	@echo "==> Done. Report + graphs in $(RUN_DIR)"
 
@@ -188,6 +225,16 @@ TUNE_OUT ?= results/tune-sweep
 bench-tune:
 	cargo run -p lohalloc-bench --bin tune_sweep --release -- \
 		--grid $(GRID) --workloads $(TUNE_WORKLOADS) --ops $(TUNE_OPS) --out $(TUNE_OUT)
+
+# Same sweep, plus the production-path ablation: per config point the C
+# bench_main triple runs under lohalloc-cabi LD_PRELOAD with
+# LOHALLOC_TUNE=<config> (full config applies there, reward shaping
+# included). Non-Linux hosts drive it through the prebuilt Docker image —
+# hence the bench-image dependency; on Linux tune_sweep runs the script
+# directly.
+bench-tune-native: bench-image
+	cargo run -p lohalloc-bench --bin tune_sweep --release -- \
+		--grid $(GRID) --workloads $(TUNE_WORKLOADS) --ops $(TUNE_OPS) --out $(TUNE_OUT) --native
 
 # Full Rust suite: criterion micro/hypothesis/comparison benches (the
 # --save-baseline runs feed criterion's own HTML diff, not the report graphs)

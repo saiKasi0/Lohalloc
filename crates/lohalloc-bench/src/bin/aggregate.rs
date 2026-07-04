@@ -68,6 +68,13 @@ struct Row {
     mode: String,
     /// Mean wall-clock time per invocation, nanoseconds (native-timing only).
     mean_ns: Option<f64>,
+    /// Run-to-run standard deviation of the wall-clock time, nanoseconds
+    /// (native-timing only; from hyperfine's own `stddev`). This is the
+    /// noise floor for any comparison between two rows of the same
+    /// (lang, workload) — a delta smaller than the two rows' combined
+    /// stddev is not signal. Docker-on-macOS VM runs routinely show
+    /// stddevs large enough to flip the sign of small deltas.
+    stddev_ns: Option<f64>,
     /// Workload throughput in million ops / second (native-timing only;
     /// ops recovered from the hyperfine command tail — see
     /// [`ops_from_command`]). Includes process startup in the denominator,
@@ -83,6 +90,14 @@ struct Row {
     d1_misses_per_op: Option<f64>,
     /// LL misses per workload op (cachegrind only).
     ll_misses_per_op: Option<f64>,
+    /// D1 misses per op with the mode's fixed startup cost subtracted
+    /// (cachegrind only; requires an ops=1 `-cal` calibration row from
+    /// `run_native.sh --cachegrind`). Gross per-op still charges inference
+    /// its one-time model-load/PHT-build startup against only OPS ops —
+    /// net is the startup-immune view; clamped at 0.
+    d1_misses_per_op_net: Option<f64>,
+    /// LL misses per op, startup-subtracted (see `d1_misses_per_op_net`).
+    ll_misses_per_op_net: Option<f64>,
     /// p50 alloc latency, nanoseconds (rust-latency only).
     alloc_p50_ns: Option<f64>,
     /// Mean alloc latency, nanoseconds (rust-latency only).
@@ -114,11 +129,14 @@ fn empty_row(
         workload,
         mode,
         mean_ns: None,
+        stddev_ns: None,
         throughput_mops: None,
         d1_miss_rate: None,
         ll_miss_rate: None,
         d1_misses_per_op: None,
         ll_misses_per_op: None,
+        d1_misses_per_op_net: None,
+        ll_misses_per_op_net: None,
         alloc_p50_ns: None,
         alloc_mean_ns: None,
         alloc_p99_ns: None,
@@ -135,6 +153,10 @@ struct HyperfineExport {
 #[derive(Deserialize)]
 struct HyperfineResult {
     mean: f64, // seconds
+    /// Run-to-run standard deviation in seconds. hyperfine has always
+    /// exported it, but keep it optional so hand-assembled raw files parse.
+    #[serde(default)]
+    stddev: Option<f64>,
     /// The benchmarked command line — hyperfine always exports it. Every
     /// command in this harness ends `... <workload> <OPS>`, so the ops
     /// count is recoverable from the trailing token (no sidecar files, no
@@ -160,6 +182,12 @@ struct CachegrindResult {
     /// and hand-assembled directories both keep parsing.
     #[serde(default)]
     ops: Option<u64>,
+    /// `true` on the ops=1 startup-calibration companion row (`-cal`
+    /// files). Calibration rows never become report rows themselves — they
+    /// are subtracted from their main row to produce the `_net` per-op
+    /// metrics. Default `false` so pre-calibration raw files keep parsing.
+    #[serde(default)]
+    calibration: bool,
     d_refs: u64,
     d1_misses: u64,
     ll_misses: u64,
@@ -198,6 +226,11 @@ fn parse_native_filename(stem: &str) -> Option<(String, String, String, String)>
 
 fn load_rows(dir: &Path) -> Vec<Row> {
     let mut rows = Vec::new();
+    // Cachegrind rows are two-phase: main rows and their ops=1 calibration
+    // companions are collected here, then paired by (lang, allocator,
+    // workload, mode) after the directory scan to fill the `_net` fields.
+    let mut cg_main: Vec<CachegrindResult> = Vec::new();
+    let mut cg_cal: BTreeMap<(String, String, String, String), (u64, u64)> = BTreeMap::new();
     let Ok(entries) = fs::read_dir(dir) else {
         eprintln!("results directory {dir:?} not found or unreadable");
         return rows;
@@ -223,6 +256,7 @@ fn load_rows(dir: &Path) -> Vec<Row> {
                     if let Some(r) = export.results.first() {
                         let mut row = empty_row("native-timing", lang, allocator, workload, mode);
                         row.mean_ns = Some(r.mean * 1e9);
+                        row.stddev_ns = r.stddev.map(|s| s * 1e9);
                         row.throughput_mops = r
                             .command
                             .as_deref()
@@ -236,19 +270,13 @@ fn load_rows(dir: &Path) -> Vec<Row> {
             }
         } else if stem.starts_with("cachegrind-") {
             match serde_json::from_str::<CachegrindResult>(&text) {
-                Ok(cg) => {
-                    let mut row =
-                        empty_row("cachegrind", cg.lang, cg.allocator, cg.workload, cg.mode);
-                    if cg.d_refs > 0 {
-                        row.d1_miss_rate = Some(cg.d1_misses as f64 / cg.d_refs as f64);
-                        row.ll_miss_rate = Some(cg.ll_misses as f64 / cg.d_refs as f64);
-                    }
-                    if let Some(ops) = cg.ops.filter(|&o| o > 0) {
-                        row.d1_misses_per_op = Some(cg.d1_misses as f64 / ops as f64);
-                        row.ll_misses_per_op = Some(cg.ll_misses as f64 / ops as f64);
-                    }
-                    rows.push(row);
+                Ok(cg) if cg.calibration => {
+                    cg_cal.insert(
+                        (cg.lang, cg.allocator, cg.workload, cg.mode),
+                        (cg.d1_misses, cg.ll_misses),
+                    );
                 }
+                Ok(cg) => cg_main.push(cg),
                 Err(e) => eprintln!("failed to parse {path:?} as cachegrind result: {e}"),
             }
         } else if stem.starts_with("rust_") || stem.starts_with("rust-") {
@@ -275,7 +303,44 @@ fn load_rows(dir: &Path) -> Vec<Row> {
         // Unrecognized JSON files (e.g. criterion's own estimates.json, if
         // pointed at that directory) are silently skipped.
     }
+
+    for cg in cg_main {
+        let cal = cg_cal
+            .get(&(
+                cg.lang.clone(),
+                cg.allocator.clone(),
+                cg.workload.clone(),
+                cg.mode.clone(),
+            ))
+            .copied();
+        rows.push(cachegrind_row(cg, cal));
+    }
     rows
+}
+
+/// Turn one main cachegrind result (plus its optional ops=1 calibration
+/// counts `(d1_misses, ll_misses)`) into a report row. Net per-op metrics
+/// subtract the calibration counts — the mode's fixed startup cost — before
+/// dividing, clamped at 0 (a cal run nominally does 1 op more than nothing,
+/// and cachegrind's simulation is deterministic enough that main < cal only
+/// happens on effectively-zero workloads).
+fn cachegrind_row(cg: CachegrindResult, cal: Option<(u64, u64)>) -> Row {
+    let mut row = empty_row("cachegrind", cg.lang, cg.allocator, cg.workload, cg.mode);
+    if cg.d_refs > 0 {
+        row.d1_miss_rate = Some(cg.d1_misses as f64 / cg.d_refs as f64);
+        row.ll_miss_rate = Some(cg.ll_misses as f64 / cg.d_refs as f64);
+    }
+    if let Some(ops) = cg.ops.filter(|&o| o > 0) {
+        row.d1_misses_per_op = Some(cg.d1_misses as f64 / ops as f64);
+        row.ll_misses_per_op = Some(cg.ll_misses as f64 / ops as f64);
+        if let Some((cal_d1, cal_ll)) = cal {
+            row.d1_misses_per_op_net =
+                Some(cg.d1_misses.saturating_sub(cal_d1) as f64 / ops as f64);
+            row.ll_misses_per_op_net =
+                Some(cg.ll_misses.saturating_sub(cal_ll) as f64 / ops as f64);
+        }
+    }
+    row
 }
 
 /// The regression gate: for every (lang, workload) where both a
@@ -320,6 +385,65 @@ fn evaluate_gate(rows: &[Row]) -> Vec<(String, bool, String)> {
     results
 }
 
+/// One (lang, workload) lohalloc training↔inference comparison from the
+/// native-timing rows. `within_noise` is true when the delta is smaller
+/// than the two runs' combined stddev (hyperfine's own run-to-run spread)
+/// — in that case the *direction* of the delta is not signal and must not
+/// be read as "inference got slower/faster".
+struct TrainVsInference {
+    lang: String,
+    workload: String,
+    train_mean_ns: f64,
+    inf_mean_ns: f64,
+    /// `None` when either row predates stddev capture — then no noise
+    /// verdict is possible and the delta is reported bare.
+    combined_stddev_ns: Option<f64>,
+    within_noise: bool,
+}
+
+fn train_vs_inference(rows: &[Row]) -> Vec<TrainVsInference> {
+    let mut train: BTreeMap<(String, String), (f64, Option<f64>)> = BTreeMap::new();
+    let mut inf: BTreeMap<(String, String), (f64, Option<f64>)> = BTreeMap::new();
+    for row in rows {
+        if row.source != "native-timing" || row.allocator != "lohalloc" {
+            continue;
+        }
+        let Some(mean) = row.mean_ns else { continue };
+        let key = (row.lang.clone(), row.workload.clone());
+        match row.mode.as_str() {
+            "training" => {
+                train.insert(key, (mean, row.stddev_ns));
+            }
+            "inference" => {
+                inf.insert(key, (mean, row.stddev_ns));
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    for (key, &(train_mean_ns, train_sd)) in &train {
+        let Some(&(inf_mean_ns, inf_sd)) = inf.get(key) else {
+            continue;
+        };
+        let combined_stddev_ns = match (train_sd, inf_sd) {
+            (Some(a), Some(b)) => Some(a + b),
+            _ => None,
+        };
+        let within_noise =
+            combined_stddev_ns.is_some_and(|sd| (train_mean_ns - inf_mean_ns).abs() <= sd);
+        out.push(TrainVsInference {
+            lang: key.0.clone(),
+            workload: key.1.clone(),
+            train_mean_ns,
+            inf_mean_ns,
+            combined_stddev_ns,
+            within_noise,
+        });
+    }
+    out
+}
+
 fn write_markdown(
     rows: &[Row],
     gate: &[(String, bool, String)],
@@ -341,40 +465,86 @@ fn write_markdown(
 
     out.push_str("## Native timing (hyperfine)\n\n");
     out.push_str(
-        "| lang | allocator | workload | mode | mean (ns) | throughput (Mops/s) |\n|---|---|---|---|---|---|\n",
+        "| lang | allocator | workload | mode | mean ± stddev (ns) | throughput (Mops/s) |\n|---|---|---|---|---|---|\n",
     );
     for row in rows.iter().filter(|r| r.source == "native-timing") {
+        let mean = row.mean_ns.unwrap_or(0.0);
+        let mean_col = match row.stddev_ns {
+            Some(sd) => format!("{mean:.0} ± {sd:.0}"),
+            None => format!("{mean:.0}"),
+        };
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {:.0} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} |\n",
             row.lang,
             row.allocator,
             row.workload,
             row.mode,
-            row.mean_ns.unwrap_or(0.0),
+            mean_col,
             row.throughput_mops
                 .map_or_else(|| "-".to_string(), |t| format!("{t:.2}")),
         ));
     }
 
+    let tvi = train_vs_inference(rows);
+    if !tvi.is_empty() {
+        out.push_str("\n### lohalloc training vs inference (native)\n\n");
+        out.push_str(
+            "Deltas no larger than the two rows' combined run-to-run stddev are \
+             marked `~ within noise` — their direction is measurement spread, \
+             not signal. Only `SLOWER` rows are worth investigating.\n\n",
+        );
+        out.push_str(
+            "| lang | workload | training (ns) | inference (ns) | inf/train | verdict |\n|---|---|---|---|---|---|\n",
+        );
+        for c in &tvi {
+            let ratio = c.inf_mean_ns / c.train_mean_ns;
+            let verdict = if c.within_noise {
+                "~ within noise".to_string()
+            } else {
+                let suffix = match c.combined_stddev_ns {
+                    Some(sd) if sd > 0.0 => format!(
+                        " (delta {:.1}x combined stddev)",
+                        (c.inf_mean_ns - c.train_mean_ns).abs() / sd
+                    ),
+                    _ => " (no stddev — unverified)".to_string(),
+                };
+                if ratio > 1.0 {
+                    format!("SLOWER{suffix}")
+                } else {
+                    format!("faster{suffix}")
+                }
+            };
+            out.push_str(&format!(
+                "| {} | {} | {:.0} | {:.0} | {ratio:.3} | {verdict} |\n",
+                c.lang, c.workload, c.train_mean_ns, c.inf_mean_ns,
+            ));
+        }
+    }
+
     out.push_str("\n## Cache metrics (cachegrind, simulated)\n\n");
     out.push_str(
         "Rates dilute when a mode does more per-op bookkeeping (training) — \
-         per-op misses are the denominator-immune view; see the module doc.\n\n",
+         per-op misses are the denominator-immune view; see the module doc. \
+         `net` columns additionally subtract the mode's fixed startup cost \
+         (measured by an ops=1 calibration run) before dividing — gross \
+         per-op charges inference its one-time model-load/PHT-build against \
+         only OPS ops, which inflates it at small op counts.\n\n",
     );
-    out.push_str("| lang | allocator | workload | mode | D1 miss rate | LL miss rate | D1 misses/op | LL misses/op |\n|---|---|---|---|---|---|---|---|\n");
+    out.push_str("| lang | allocator | workload | mode | D1 miss rate | LL miss rate | D1 misses/op | LL misses/op | D1/op net | LL/op net |\n|---|---|---|---|---|---|---|---|---|---|\n");
+    let fmt2 = |v: Option<f64>| v.map_or_else(|| "-".to_string(), |v| format!("{v:.2}"));
     for row in rows.iter().filter(|r| r.source == "cachegrind") {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {:.4} | {:.4} | {} | {} |\n",
+            "| {} | {} | {} | {} | {:.4} | {:.4} | {} | {} | {} | {} |\n",
             row.lang,
             row.allocator,
             row.workload,
             row.mode,
             row.d1_miss_rate.unwrap_or(0.0),
             row.ll_miss_rate.unwrap_or(0.0),
-            row.d1_misses_per_op
-                .map_or_else(|| "-".to_string(), |v| format!("{v:.2}")),
-            row.ll_misses_per_op
-                .map_or_else(|| "-".to_string(), |v| format!("{v:.2}")),
+            fmt2(row.d1_misses_per_op),
+            fmt2(row.ll_misses_per_op),
+            fmt2(row.d1_misses_per_op_net),
+            fmt2(row.ll_misses_per_op_net),
         ));
     }
 
@@ -564,6 +734,135 @@ mod tests {
             inf_per_op < train_per_op,
             "per-op view: inference actually better ({inf_per_op:.2} < {train_per_op:.2})"
         );
+    }
+
+    fn native_row(
+        lang: &str,
+        workload: &str,
+        mode: &str,
+        mean_ns: f64,
+        stddev_ns: Option<f64>,
+    ) -> Row {
+        let mut row = empty_row(
+            "native-timing",
+            lang.to_string(),
+            "lohalloc".to_string(),
+            workload.to_string(),
+            mode.to_string(),
+        );
+        row.mean_ns = Some(mean_ns);
+        row.stddev_ns = stddev_ns;
+        row
+    }
+
+    #[test]
+    fn stddev_parses_from_hyperfine_export() {
+        let json = r#"{"results":[{"mean":0.002,"stddev":0.0001,"command":"bin slab 50000"}]}"#;
+        let export: HyperfineExport = serde_json::from_str(json).unwrap();
+        assert_eq!(export.results[0].stddev, Some(0.0001));
+        // Old / hand-assembled files without stddev still parse.
+        let json = r#"{"results":[{"mean":0.002}]}"#;
+        let export: HyperfineExport = serde_json::from_str(json).unwrap();
+        assert_eq!(export.results[0].stddev, None);
+    }
+
+    #[test]
+    fn train_vs_inference_flags_within_noise_deltas() {
+        // Delta 5ms, combined stddev 3+4=7ms -> within noise even though
+        // inference is nominally slower.
+        let rows = vec![
+            native_row("cpp", "adv-mixed", "training", 100e6, Some(3e6)),
+            native_row("cpp", "adv-mixed", "inference", 105e6, Some(4e6)),
+            // Delta 40ms >> combined stddev 2ms -> real slowdown.
+            native_row("cpp", "cpp-string", "training", 60e6, Some(1e6)),
+            native_row("cpp", "cpp-string", "inference", 100e6, Some(1e6)),
+            // Missing stddev on one side -> no noise verdict possible.
+            native_row("c", "slab", "training", 7e6, None),
+            native_row("c", "slab", "inference", 2e6, Some(0.1e6)),
+        ];
+        let tvi = train_vs_inference(&rows);
+        assert_eq!(tvi.len(), 3);
+
+        let by_key = |lang: &str, wl: &str| {
+            tvi.iter()
+                .find(|c| c.lang == lang && c.workload == wl)
+                .unwrap()
+        };
+        assert!(by_key("cpp", "adv-mixed").within_noise);
+        let string_row = by_key("cpp", "cpp-string");
+        assert!(!string_row.within_noise);
+        assert!(string_row.inf_mean_ns > string_row.train_mean_ns);
+        let slab_row = by_key("c", "slab");
+        assert!(slab_row.combined_stddev_ns.is_none());
+        assert!(!slab_row.within_noise);
+    }
+
+    #[test]
+    fn train_vs_inference_ignores_baselines_and_unpaired_rows() {
+        let mut jemalloc = native_row("c", "slab", "baseline", 1e6, Some(0.1e6));
+        jemalloc.allocator = "jemalloc".to_string();
+        let rows = vec![
+            jemalloc,
+            // training with no matching inference row: skipped.
+            native_row("c", "buddy", "training", 95e6, Some(1e6)),
+        ];
+        assert!(train_vs_inference(&rows).is_empty());
+    }
+
+    fn cg(ops: u64, d1: u64, ll: u64) -> CachegrindResult {
+        CachegrindResult {
+            lang: "c".into(),
+            allocator: "lohalloc".into(),
+            workload: "buddy".into(),
+            mode: "inference".into(),
+            ops: Some(ops),
+            calibration: false,
+            d_refs: 1_000_000,
+            d1_misses: d1,
+            ll_misses: ll,
+        }
+    }
+
+    #[test]
+    fn cachegrind_net_subtracts_startup_calibration() {
+        // 16_000 gross misses over 2000 ops = 8.0/op, of which 6_000 are
+        // one-time startup (model load + PHT build) -> net 5.0/op.
+        let row = cachegrind_row(cg(2000, 16_000, 2_000), Some((6_000, 1_000)));
+        assert_eq!(row.d1_misses_per_op, Some(8.0));
+        assert_eq!(row.d1_misses_per_op_net, Some(5.0));
+        assert_eq!(row.ll_misses_per_op_net, Some(0.5));
+    }
+
+    #[test]
+    fn cachegrind_net_absent_without_calibration_row() {
+        // Pre-calibration raw dirs keep working: gross only, no net.
+        let row = cachegrind_row(cg(2000, 16_000, 2_000), None);
+        assert_eq!(row.d1_misses_per_op, Some(8.0));
+        assert_eq!(row.d1_misses_per_op_net, None);
+        assert_eq!(row.ll_misses_per_op_net, None);
+    }
+
+    #[test]
+    fn cachegrind_net_clamps_at_zero() {
+        // A near-empty workload (system at tiny ops) can measure main < cal
+        // within simulation jitter — clamp, never go negative.
+        let row = cachegrind_row(cg(100, 500, 50), Some((600, 80)));
+        assert_eq!(row.d1_misses_per_op_net, Some(0.0));
+        assert_eq!(row.ll_misses_per_op_net, Some(0.0));
+    }
+
+    #[test]
+    fn calibration_flag_parses_and_defaults_false() {
+        let with_flag = r#"{"lang":"c","allocator":"lohalloc","workload":"buddy",
+            "mode":"inference","ops":1,"calibration":true,
+            "d_refs":10,"d1_misses":5,"ll_misses":1}"#;
+        let cg: CachegrindResult = serde_json::from_str(with_flag).unwrap();
+        assert!(cg.calibration);
+        let without = r#"{"lang":"c","allocator":"lohalloc","workload":"buddy",
+            "mode":"inference","ops":2000,
+            "d_refs":10,"d1_misses":5,"ll_misses":1}"#;
+        let cg: CachegrindResult = serde_json::from_str(without).unwrap();
+        assert!(!cg.calibration);
     }
 
     #[test]
