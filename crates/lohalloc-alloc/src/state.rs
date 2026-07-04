@@ -448,6 +448,36 @@ mod tests {
     }
 
     #[test]
+    fn converged_freeze_chain_fires_on_a_decisive_workload() {
+        // Drives the exact production convergence path — route() ->
+        // record_latency() -> is_converged() — deterministically: a single
+        // call site where Slab is ~2000x faster than any other backend. The
+        // huge reward gap makes the UCB intervals separate (see
+        // `BanditPolicy::is_converged`), so `AllocatorState::is_converged`
+        // (which `Lohalloc::is_converged` and the cabi/native converged-mode
+        // freeze poll forward to) must flip true. This is the deterministic
+        // counterpart to the near-tied real microbenchmarks (slab/arena),
+        // where Slab≈Arena legitimately never separates and convergence
+        // correctly never fires.
+        let mut state = AllocatorState::new_training();
+        let hash = 0xC0FFEE;
+        let size = 64usize;
+        let sc = size_class_for(size);
+        assert!(!state.is_converged(), "empty bandit is not converged");
+
+        for _ in 0..3000 {
+            let backend = state.route(hash, size);
+            // Slab wins decisively; everything else is punished hard.
+            let latency = if backend == Backend::Slab { 1 } else { 200_000 };
+            state.record_latency(hash, backend, sc, latency, size);
+        }
+        assert!(
+            state.is_converged(),
+            "a decisively Slab-favorable workload must converge"
+        );
+    }
+
+    #[test]
     fn training_mode_routes_via_bandit() {
         let mut state = AllocatorState::new_training();
         // Route a few times — should return valid backends.
