@@ -275,14 +275,21 @@ extern "C" fn report_pht_misses_at_exit() {
         "lohalloc: pht_misses={} (model-loaded run; ~0 means the model matched this process)",
         Lohalloc::pht_miss_count()
     );
-    eprintln!(
-        "lohalloc: routes slab={} buddy={} system={} arena={} fallthrough={}",
-        Lohalloc::route_count(Backend::Slab),
-        Lohalloc::route_count(Backend::Buddy),
-        Lohalloc::route_count(Backend::System),
-        Lohalloc::route_count(Backend::Arena),
-        Lohalloc::fallthrough_count(),
-    );
+    if Lohalloc::route_metrics_enabled() {
+        eprintln!(
+            "lohalloc: routes slab={} buddy={} system={} arena={} fallthrough={}",
+            Lohalloc::route_count(Backend::Slab),
+            Lohalloc::route_count(Backend::Buddy),
+            Lohalloc::route_count(Backend::System),
+            Lohalloc::route_count(Backend::Arena),
+            Lohalloc::fallthrough_count(),
+        );
+    } else {
+        eprintln!(
+            "lohalloc: route counters disabled (build lohalloc-cabi with \
+             --features lohalloc-alloc/route-metrics to see per-backend routes)"
+        );
+    }
     eprintln!("lohalloc: slab_headerless={}", ALLOC.is_slab_headerless());
 }
 
@@ -304,8 +311,26 @@ extern "C" fn report_pht_misses_at_exit() {
 /// by calling exported symbols directly via `dlsym`, which doesn't trigger
 /// std's own internal allocations the same way).
 fn with_freeze_check(f: impl FnOnce() -> *mut c_void) -> *mut c_void {
-    let depth = IN_ALLOC_FN.with(|c| c.get());
-    IN_ALLOC_FN.with(|c| c.set(depth + 1));
+    // Steady-state fast path (Ladder 4 C6). The re-entrancy depth guard
+    // exists solely to make `ensure_model_loaded` and `maybe_auto_freeze`
+    // top-level-only. Once `FREEZE_FIRED` is set, `ensure_model_loaded` has
+    // completed (the model-loaded path sets the flag inside its own
+    // `OnceLock`; the auto-freeze path only runs after `ensure_model_loaded`
+    // in the same call) and `maybe_auto_freeze` is a no-op forever after —
+    // so nothing needs protecting and the whole guard collapses to a bare
+    // call behind one relaxed load. This is the common case for every
+    // inference/frozen benchmark row, replacing three TLS `.with()` accesses
+    // (plus a `OnceLock` load) per malloc with a single atomic load.
+    if FREEZE_FIRED.load(Ordering::Relaxed) {
+        return f();
+    }
+    // Pre-freeze path: one combined TLS access to read-and-bump the depth
+    // (was two separate `.with()` calls).
+    let depth = IN_ALLOC_FN.with(|c| {
+        let d = c.get();
+        c.set(d + 1);
+        d
+    });
     // Model load must happen before the first top-level allocation is
     // served, and — like `maybe_auto_freeze` below — only while the depth
     // bump is active, so its own nested allocations skip this layer.

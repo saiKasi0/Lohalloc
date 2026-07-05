@@ -217,13 +217,28 @@ impl BanditPolicy {
     /// completes. This updates the arm's statistics, allowing the bandit to
     /// learn from allocation outcomes.
     pub fn update(&mut self, sig: Signature, backend: Backend, reward: f64) {
+        self.update_weighted(sig, backend, reward, 1);
+    }
+
+    /// Like [`update`](Self::update) but credits `reward` as `weight`
+    /// separate observations. This is what keeps `mean_reward =
+    /// sum_reward / pulls` a true average under reward batching: `select()`
+    /// increments `pulls` once *per op*, but a batched reward flush arrives
+    /// only once per `reward_batch` ops (see `state::record_latency`).
+    /// Crediting the flushed reward with `weight = batch count` makes the
+    /// running mean identical to having recorded that (de-quantized)
+    /// reward on each of those pulls — without it, `sum_reward` would grow
+    /// ~1/batch as fast as `pulls` and every mean would collapse toward
+    /// zero. `weight = 1` is the ordinary per-op path.
+    pub fn update_weighted(&mut self, sig: Signature, backend: Backend, reward: f64, weight: u32) {
         let entry = self
             .stats
             .entry(sig)
             .or_insert_with(|| SignatureStats::new(&crate::tune::config().baseline_rewards));
         let arm = &mut entry.arms[backend as usize];
-        arm.sum_reward += reward;
-        // Note: pulls was already incremented in select(). We don't double-count.
+        arm.sum_reward += reward * weight as f64;
+        // Note: pulls was already incremented in select() (once per op, so
+        // `weight` of them since the last flush). We don't double-count.
     }
 
     /// True once every observed Signature's routing has stabilized — the

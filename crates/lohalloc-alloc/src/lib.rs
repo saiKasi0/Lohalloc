@@ -343,20 +343,52 @@ static PHT_MISSES: AtomicU64 = AtomicU64::new(0);
 /// Per-backend count of Inference-mode allocations actually *served* by that
 /// backend (indexed by `Backend as usize`), plus a separate count of times
 /// the frozen table's (or the miss fallback's) recommendation failed and the
-/// request fell through to `route_by_size`. Debug-gated observability added
-/// to diagnose a frozen model routing a Signature to the wrong backend
-/// (e.g. locking onto System for a size that fits Buddy) — `try_backend`
-/// never fails for System, so a bad System recommendation has no
-/// self-correcting fallthrough the way a bad Slab/Arena one does, and these
-/// counters are what make that visible from outside. Zero cost on the hit
-/// path beyond one relaxed increment already on this path's cold call graph.
+/// request fell through to `route_by_size`. Observability added to diagnose
+/// a frozen model routing a Signature to the wrong backend (e.g. locking
+/// onto System for a size that fits Buddy) — `try_backend` never fails for
+/// System, so a bad System recommendation has no self-correcting
+/// fallthrough the way a bad Slab/Arena one does, and these counters are
+/// what make that visible from outside.
+///
+/// # Gated behind `route-metrics` (Ladder 4 C1)
+///
+/// These `fetch_add`s ran unconditionally on **every** frozen alloc, and
+/// every thread increments the *same* cache line — false sharing on 100%
+/// of allocations that measurably degraded multithreaded scaling (all
+/// threads bouncing one line each op). They now compile away entirely
+/// unless the `route-metrics` feature is on (always on under `cfg(test)`,
+/// so the counter tests and the `LOHALLOC_DEBUG` route-diagnosis workflow
+/// still work — build the diagnostic cabi with `--features route-metrics`).
+/// `PHT_MISSES` (above) is NOT gated: it's a miss-only counter (cold path),
+/// carries no false-sharing cost on the hit path, and is load-bearing for
+/// verifying a model matches a process (`pht_misses≈0`).
+#[cfg(any(feature = "route-metrics", test))]
 static ROUTE_COUNTS: [AtomicU64; 4] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
+#[cfg(any(feature = "route-metrics", test))]
 static FALLTHROUGH_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Record a served-by-`backend` frozen route. No-op (fully compiled away)
+/// unless `route-metrics`/`test` — see `ROUTE_COUNTS`.
+#[inline(always)]
+fn record_route(backend: lohalloc_core::Backend) {
+    #[cfg(any(feature = "route-metrics", test))]
+    ROUTE_COUNTS[backend as usize].fetch_add(1, Ordering::Relaxed);
+    #[cfg(not(any(feature = "route-metrics", test)))]
+    let _ = backend;
+}
+
+/// Record a frozen-path recommendation fallthrough. No-op unless
+/// `route-metrics`/`test`.
+#[inline(always)]
+fn record_fallthrough() {
+    #[cfg(any(feature = "route-metrics", test))]
+    FALLTHROUGH_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 impl Default for Lohalloc {
     fn default() -> Self {
@@ -689,15 +721,24 @@ impl Lohalloc {
             (t0, Backend::from_u8(header.backend).map(Backend::to_core))
         {
             let dt = clock::now_ns().saturating_sub(t0);
-            if let Ok(mut st) = self.state.lock() {
-                st.record_latency(
-                    header.hash,
-                    core_backend,
-                    header.size_class_hint,
-                    dt,
-                    header.size,
-                );
-            }
+            // Ladder 4 A2: `record_latency` now mutates a `BTreeMap` of
+            // pending reward batches, which can allocate (node insert) while
+            // `self.state`'s lock is already held — the same reentrancy
+            // hazard `with_realloc_guard` exists for (see its doc comment).
+            // Without this guard, that nested allocation calls back into
+            // `route_alloc_inner`, which tries to relock the same non-
+            // reentrant `Mutex` and deadlocks the thread.
+            Self::with_realloc_guard(|| {
+                if let Ok(mut st) = self.state.lock() {
+                    st.record_latency(
+                        header.hash,
+                        core_backend,
+                        header.size_class_hint,
+                        dt,
+                        header.size,
+                    );
+                }
+            });
         }
     }
 }
@@ -757,12 +798,12 @@ impl Lohalloc {
                 }
             };
             if let Some(ptr) = self.try_backend(backend, total, align, pad, hash, size_class) {
-                ROUTE_COUNTS[backend as usize].fetch_add(1, Ordering::Relaxed);
+                record_route(backend);
                 return ptr;
             }
             // Fallthrough remembers the failed backend so it's never
             // re-locked/re-tried inside the size chain.
-            FALLTHROUGH_COUNT.fetch_add(1, Ordering::Relaxed);
+            record_fallthrough();
             return self.route_by_size(total, align, pad, hash, size_class, Some(backend));
         }
 
@@ -798,8 +839,17 @@ impl Lohalloc {
         };
         let latency_ns = clock::now_ns().saturating_sub(t0);
 
-        if let (Some(backend), Ok(mut st)) = (recommended, self.state.lock()) {
-            st.record_latency(hash, backend, size_class, latency_ns, total);
+        if let Some(backend) = recommended {
+            // See the matching guard in `dealloc_with_header` — kept here too
+            // so this call site stays deadlock-safe independent of caller
+            // discipline (currently `IN_ALLOC` is already >0 by the time we
+            // get here via `alloc`/`alloc_with_hash`, but that's an
+            // assumption about callers, not a guarantee this function makes).
+            Self::with_realloc_guard(|| {
+                if let Ok(mut st) = self.state.lock() {
+                    st.record_latency(hash, backend, size_class, latency_ns, total);
+                }
+            });
         }
 
         ptr
@@ -977,7 +1027,8 @@ impl Lohalloc {
             return Some(block);
         }
         // Magazine miss: batch-refill under the central lock.
-        let mut buf = [core::ptr::null_mut::<u8>(); 8]; // >= max refill_count
+        // Sized >= max buddy_mag::refill_count (cap 32 / 2 = 16).
+        let mut buf = [core::ptr::null_mut::<u8>(); 16];
         let want = buddy_mag::refill_count(idx).min(buf.len());
         let n = {
             let mut buddy = self.buddy.lock().ok()?;
@@ -1019,8 +1070,8 @@ impl Lohalloc {
             return;
         }
         // Magazine full: flush half of it plus this block back to the
-        // central buddy in one locked batch.
-        let mut buf = [core::ptr::null_mut::<u8>(); 8];
+        // central buddy in one locked batch. Sized >= max refill_count (16).
+        let mut buf = [core::ptr::null_mut::<u8>(); 16];
         let flush = buddy_mag::refill_count(idx).min(buf.len());
         let n = buddy_mag::take(owner, idx, &mut buf[..flush]);
         if let Ok(mut buddy) = self.buddy.lock() {
@@ -1571,16 +1622,42 @@ impl Lohalloc {
     }
 
     /// Process-wide count of Inference-mode allocations actually served by
-    /// `backend` (frozen fast path only). See `ROUTE_COUNTS`'s doc.
+    /// `backend` (frozen fast path only). See `ROUTE_COUNTS`'s doc. Always
+    /// `0` unless built with the `route-metrics` feature (or under test) —
+    /// the counters are compiled away otherwise to avoid per-op false
+    /// sharing.
     pub fn route_count(backend: lohalloc_core::Backend) -> u64 {
-        ROUTE_COUNTS[backend as usize].load(Ordering::Relaxed)
+        #[cfg(any(feature = "route-metrics", test))]
+        {
+            ROUTE_COUNTS[backend as usize].load(Ordering::Relaxed)
+        }
+        #[cfg(not(any(feature = "route-metrics", test)))]
+        {
+            let _ = backend;
+            0
+        }
     }
 
     /// Process-wide count of Inference-mode allocations whose recommended
     /// backend failed and fell through to size-based routing. See
-    /// `FALLTHROUGH_COUNT`'s doc.
+    /// `FALLTHROUGH_COUNT`'s doc. Always `0` unless built with
+    /// `route-metrics` (or under test).
     pub fn fallthrough_count() -> u64 {
-        FALLTHROUGH_COUNT.load(Ordering::Relaxed)
+        #[cfg(any(feature = "route-metrics", test))]
+        {
+            FALLTHROUGH_COUNT.load(Ordering::Relaxed)
+        }
+        #[cfg(not(any(feature = "route-metrics", test)))]
+        {
+            0
+        }
+    }
+
+    /// Whether route/fallthrough counters are compiled in (the
+    /// `route-metrics` feature). The `LOHALLOC_DEBUG` epilogue uses this to
+    /// print "counters disabled" instead of a misleading all-zero table.
+    pub fn route_metrics_enabled() -> bool {
+        cfg!(any(feature = "route-metrics", test))
     }
 
     // -----------------------------------------------------------------

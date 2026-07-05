@@ -48,6 +48,15 @@ struct LatencyReport {
     /// judging `frag_weight`/throughput configs: a config that wins
     /// latency by fragmenting pays here.
     peak_rss_bytes: u64,
+    /// Measured effective tick of `Instant` on this machine (ns) — see
+    /// `lohalloc_bench::clockinfo`. Per-op percentiles below ~3× this are
+    /// quantization buckets, not latencies (Apple Silicon: ~42ns).
+    clock_tick_ns: u64,
+    /// True when any reported alloc percentile sits under 3× the tick —
+    /// the aggregator/report must flag those values rather than compare
+    /// them. `measured_mops` (outer wall-clock over the whole run) is
+    /// unaffected either way.
+    quantized: bool,
 }
 
 /// Peak RSS in bytes, cross-platform (`ru_maxrss` is KiB on Linux, bytes
@@ -159,6 +168,7 @@ fn dump_config(cfg: &lohalloc_alloc::tune::TrainingConfig) -> String {
     out.push_str(&format!("frag_weight={}\n", cfg.frag_weight));
     out.push_str(&format!("freeze_mode={freeze_mode}\n"));
     out.push_str(&format!("converge_stable_n={}\n", cfg.converge_stable_n));
+    out.push_str(&format!("reward_batch={}\n", cfg.reward_batch));
     // Omitted when unset so the dump is itself a parseable tune file
     // (tune.rs has no "none" spelling for freeze_after).
     if let Some(v) = cfg.freeze_after {
@@ -250,6 +260,18 @@ fn main() {
     let (a50, a95, a99, a999, amean) = percentiles(&alloc_hist);
     let (d50, _d95, d99, _d999, dmean) = percentiles(&dealloc_hist);
 
+    let clock_tick_ns = lohalloc_bench::clockinfo::instant_tick_ns();
+    let quantized = [a50, a95, a99]
+        .iter()
+        .any(|&v| lohalloc_bench::clockinfo::is_quantized(v, clock_tick_ns));
+    if quantized {
+        eprintln!(
+            "latency_profile: WARNING — clock tick floor is {clock_tick_ns}ns and some \
+             percentiles sit below 3 ticks; those values are quantization buckets, not \
+             latencies (compare measured_mops instead)"
+        );
+    }
+
     let report = LatencyReport {
         lang: "rust",
         workload: args.workload.clone(),
@@ -273,6 +295,8 @@ fn main() {
             }
         },
         peak_rss_bytes: peak_rss_bytes(),
+        clock_tick_ns,
+        quantized,
     };
 
     let json = serde_json::to_string_pretty(&report).unwrap();

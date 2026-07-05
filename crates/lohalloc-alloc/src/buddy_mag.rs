@@ -40,12 +40,26 @@ pub const MAX_MAGAZINE_ORDER: usize = 14;
 const NUM_ORDERS: usize = MAX_MAGAZINE_ORDER - MIN_MAGAZINE_ORDER + 1;
 
 /// Slot-array dimension (the largest per-order cap).
-const MAX_CAP: usize = 8;
+const MAX_CAP: usize = 32;
 
-/// Per-order capacity, largest for the smallest (most common) blocks:
-/// 8×16KiB + 8×32KiB + 4×64KiB + 4×128KiB + 2×256KiB ≈ 1.4 MiB worst-case
-/// strand per thread — bounded, same rationale as `magazine.rs`'s ~210 KiB.
-const ORDER_CAPS: [u8; NUM_ORDERS] = [8, 8, 4, 4, 2];
+/// Per-order capacity, largest for the smallest (most common) blocks.
+///
+/// # Ladder 4 C2: raised from `[8, 8, 4, 4, 2]`
+///
+/// The miss rate that reaches the single `Mutex<Buddy>` is ≈ `1/(cap/2)`,
+/// so at t8 the old caps put a central-lock trip every ~2-4 buddy ops —
+/// the dominant term in the mt-mixed contention blow-up (diagnosed at
+/// t1 6.9× → t8 17.8× vs jemalloc). Quadrupling the two hottest orders
+/// (16/32 KiB — ~75% of adv-mixed's buddy traffic) and doubling 64 KiB
+/// cuts those trips 2-4×. Worst-case strand:
+/// 32×16KiB + 16×32KiB + 8×64KiB + 4×128KiB + 2×256KiB = 2.5 MiB/thread.
+/// This is *live* checked-out memory during the run (not just a
+/// thread-exit leak), so at t8 it's ~20 MiB extra resident — noise against
+/// buddy workloads' multi-GiB live sets, and now visible in the report's
+/// RSS column. The central `Mutex<Buddy>` sharding in C3 attacks the same
+/// contention structurally; this is the cheap multiplicative relief that
+/// stacks with it.
+const ORDER_CAPS: [u8; NUM_ORDERS] = [32, 16, 8, 4, 2];
 
 /// Map a buddy order to its magazine row index, or `None` if `order` is
 /// outside the magazined range (falls direct to `Mutex<Buddy>`).
@@ -254,8 +268,19 @@ mod tests {
 
     #[test]
     fn refill_count_is_half_cap_min_one() {
-        assert_eq!(refill_count(0), 4); // cap 8
-        assert_eq!(refill_count(2), 2); // cap 4
+        assert_eq!(refill_count(0), 16); // cap 32
+        assert_eq!(refill_count(1), 8); // cap 16
+        assert_eq!(refill_count(2), 4); // cap 8
         assert_eq!(refill_count(4), 1); // cap 2
+    }
+
+    #[test]
+    fn refill_count_never_exceeds_the_lib_buf_arrays() {
+        // The batch buffers in lib.rs's buddy magazine paths are `[_; 16]`;
+        // every order's refill_count must fit or a refill would silently
+        // truncate. (Guards against a future cap bump outgrowing them.)
+        for idx in 0..NUM_ORDERS {
+            assert!(refill_count(idx) <= 16, "order {idx} refill exceeds buf");
+        }
     }
 }

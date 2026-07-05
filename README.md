@@ -126,6 +126,31 @@ docker build -f docker/Dockerfile.linux-arm -t lohalloc-linux-arm .
 docker run --rm lohalloc-linux-arm
 ```
 
+### Hypothesis-validation benchmarking
+
+`lohalloc-bench` validates the allocator's two core hypotheses against
+jemalloc/mimalloc/system across Rust/C/C++, with real Mann-Whitney U
+significance testing (not point-estimate ratios) over hyperfine's raw
+per-run samples:
+
+- **H-A: inference is faster than training** (frozen O(1) routing beats
+  live MAB decisioning).
+- **H-B: a trained Lohalloc beats other allocators** across workloads.
+
+```bash
+cargo test -p lohalloc-bench                 # Layer 1: forced-routing (gates CI)
+make bench-all                                # full matrix + graphs -> results/<timestamp>/
+make bench-report RUN_DIR=results/<ts>        # (re)aggregate: report + hypothesis verdicts + graphs
+```
+
+`crates/lohalloc-cabi` exports the malloc family over `Lohalloc` as a
+`cdylib` for `LD_PRELOAD`/`DYLD_INSERT_LIBRARIES`, letting the C/C++/Rust
+native harness (`bench/run_native.sh`, hyperfine + cachegrind under
+Docker) benchmark Lohalloc as a true drop-in allocator, not just via its
+Rust API. `.github/workflows/bench.yml` (manual dispatch only) extends
+this to Terraform-provisioned AWS `c6i.large`/`c6g.large` instances for a
+real x86/ARM A/B.
+
 ---
 
 ## ARCHITECTURE
@@ -148,12 +173,12 @@ docker run --rm lohalloc-linux-arm
    +-----------------+    +------------------+    +-----------------+
                                     |
                                     v
-                    +-------------------------------+
-                    |        EXECUTION PLANE        |
-                    +-------------------------------+
-                    |  Arena  |  Slab  |  Buddy  |  System  |
-                    | (bump)  |  <=16K |  <=1Mi  |  mmap    |
-                    +-------------------------------+
+                +---------------------------------------+
+                |            EXECUTION PLANE            |
+                +---------------------------------------+
+                |  Arena  |  Slab  |  Buddy  |  System  |
+                | (bump)  |  <=16K |  <=1Mi  |  mmap    |
+                +----------------------------------------+
 ```
 
 **Module-level invariants.**
@@ -206,28 +231,32 @@ instances via Terraform.
 |   |-- lohalloc-alloc/       # GlobalAlloc shim + Slab/Buddy/Arena/System + Topology + MAB + MPHT
 |   |-- lohalloc-example/     # Binary: installs Lohalloc as the process global allocator
 |   |-- lohalloc-demo/       # Binary: live-training demo (Lohalloc + shim sink + churn workload)
-|   `-- lohalloc-server/      # Axum backend: WebSocket telemetry + trace replay + freeze/export
+|   |-- lohalloc-server/      # Axum backend: WebSocket telemetry + trace replay + freeze/export
+|   |-- lohalloc-bench/       # Workload generators, hypothesis validation, criterion, aggregate/report
+|   `-- lohalloc-cabi/        # cdylib-only malloc family over Lohalloc, for LD_PRELOAD
 |-- shim/                     # LD_PRELOAD C shim: ring buffer + HTTP POST bridge for live mode
+|-- bench/                    # run_native.sh (C/C++/Rust harness) + graphs/ (matplotlib report renderer)
 |-- gui/                      # React + Vite + Three.js + Tailwind + Recharts
 |   `-- src/
 |       |-- components/       # Constellations, CollapsedTopology, PolicyMatrix, PerfTraceView, StrategyToggle, TraceUpload
 |       |-- hooks/            # useTelemetry (WS), useApi (REST)
 |       `-- types/            # TS types mirroring Rust telemetry schema
-|-- docker/                   # Dockerfile.linux-{x86,arm}
-|-- infra/                    # Terraform: AWS instances for hybrid bench
-|-- .github/workflows/        # bench.yml: SSH + criterion artifact upload
-`-- COPILOT.md                # Living project state, architecture, known issues
+|-- docker/                   # Dockerfile.linux-{x86,arm}, Dockerfile.bench (native harness image)
+|-- infra/                    # Terraform: AWS instances for hybrid bench + remote_bench.sh
+|-- results/                  # make bench-all output: raw JSON + bench-report.{json,md} + graphs/
+|-- .github/workflows/        # bench.yml: manual-dispatch AWS x86+arm bench run
 ```
 
 ---
 
 ## TESTING
 
-- **209 Rust tests** across `lohalloc-core` (3), `lohalloc-alloc`
-  (87, incl. observer-hook tests), `lohalloc-server` (118 -- unit +
-  `replay_tests` + `server_tests`, incl. live-telemetry POST tests),
-  and `lohalloc-demo` (1); `lohalloc-example` is a smoke binary with no
-  unit tests.
+- **345+ Rust tests** across the workspace, including `lohalloc-core`,
+  `lohalloc-alloc` (182 lib tests incl. observer-hook + reward-batching
+  tests), `lohalloc-server` (unit + `replay_tests` + `server_tests`),
+  `lohalloc-bench` (forced-routing, tune e2e, aggregate/Mann-Whitney U,
+  decision-plane `#[ignore]`d timing tests), and `lohalloc-demo`;
+  `lohalloc-example` is a smoke binary with no unit tests.
 - **9 shim C tests** via `make -C shim test` (ring buffer, JSON
   encoding, record size pin, emit-no-crash).
 - **144 GUI tests** under `gui/src/{components,hooks}/__tests__/` via

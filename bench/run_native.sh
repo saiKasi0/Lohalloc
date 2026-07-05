@@ -178,6 +178,29 @@ run_timing() {
     echo "==> [timing] $lang/$allocator/$workload ($mode)"
     local pin
     pin="$(taskset_prefix_for "$workload")"
+    # Opt-in cold-cache isolation (BENCH_PREPARE=drop-caches): drop the
+    # kernel page cache before EVERY timed run so no run inherits warm
+    # file-cache state (the model file, the binary, shared libs) from the
+    # previous allocator's runs. This deliberately measures COLD launches —
+    # the default (no prepare) stays hot steady-state, which is what the
+    # regression gate and all historical numbers mean; never mix cold-mode
+    # and hot-mode rows in one RUN_DIR. Linux-only (needs a privileged
+    # container for /proc/sys/vm/drop_caches — `make bench-native
+    # BENCH_PREPARE=drop-caches` adds --privileged); on macOS `purge`
+    # requires sudo, so the mode is skipped with a warning rather than
+    # prompting mid-benchmark.
+    local prepare_args=()
+    if [ "${BENCH_PREPARE:-}" = "drop-caches" ]; then
+        if [ "$UNAME" = "Linux" ] && [ -w /proc/sys/vm/drop_caches ]; then
+            prepare_args=(--prepare "sync; echo 3 > /proc/sys/vm/drop_caches")
+        elif [ "$UNAME" = "Linux" ]; then
+            echo "ERROR: BENCH_PREPARE=drop-caches but /proc/sys/vm/drop_caches is not writable." >&2
+            echo "       Run the container with --privileged (make bench-native BENCH_PREPARE=drop-caches does this)." >&2
+            exit 1
+        else
+            echo "WARN: BENCH_PREPARE=drop-caches is Linux-only (macOS 'purge' needs sudo) — running without prepare." >&2
+        fi
+    fi
     # LD_PRELOAD/extra_env must be part of the *command string* hyperfine
     # runs, not hyperfine's own environment — `env VAR=x hyperfine ...`
     # would preload our allocator into hyperfine's own (large, Rust) process
@@ -195,9 +218,12 @@ run_timing() {
     # no code involved — a Docker Desktop VM artifact, not an allocator
     # regression). 2 warmup runs left that cold-start inside the 10 measured
     # runs and inflated the reported mean by ~10x on that one row.
+    # ${arr[@]+...} guard: bash 4.0-4.3 treat an empty array as unset under
+    # `set -u` and would abort on plain "${prepare_args[@]}".
     hyperfine \
         --warmup 8 \
         --min-runs 10 \
+        ${prepare_args[@]+"${prepare_args[@]}"} \
         --export-json "$out" \
         "env $extra_env $PRELOAD_VAR=$preload ${pin}$binary $workload $OPS" >/dev/null
 }

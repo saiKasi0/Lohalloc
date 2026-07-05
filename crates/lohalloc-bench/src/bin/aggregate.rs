@@ -111,6 +111,13 @@ struct Row {
     /// `throughput_mops` this excludes process startup — it is the pure
     /// hot-path rate.
     rust_throughput_mops: Option<f64>,
+    /// Measured `Instant` tick floor on the machine that produced this
+    /// rust-latency row (ns). Apple Silicon: ~42ns; x86 TSC: ~1-30ns.
+    clock_tick_ns: Option<u64>,
+    /// True when this rust-latency row's percentiles sit under ~3× the
+    /// tick floor — those values are quantization buckets, not latencies,
+    /// and are annotated (`*`) rather than compared in the report.
+    quantized: Option<bool>,
 }
 
 /// A `Row` with every metric `None` — each loader branch fills in only its
@@ -142,6 +149,8 @@ fn empty_row(
         alloc_p99_ns: None,
         dealloc_mean_ns: None,
         rust_throughput_mops: None,
+        clock_tick_ns: None,
+        quantized: None,
     }
 }
 
@@ -163,6 +172,12 @@ struct HyperfineResult {
     /// filename-format changes).
     #[serde(default)]
     command: Option<String>,
+    /// Every individual run's wall time in seconds — hyperfine always
+    /// exports the full sample array. This is what powers the real
+    /// hypothesis tests (Mann-Whitney U): mean±stddev alone can't say
+    /// whether a 6% delta on a noisy Docker VM is signal.
+    #[serde(default)]
+    times: Vec<f64>,
 }
 
 /// Recover the workload op count from a hyperfine command string's trailing
@@ -206,11 +221,32 @@ struct RustLatencyResult {
     alloc_mean_ns: Option<f64>,
     #[serde(default)]
     dealloc_mean_ns: Option<f64>,
+    /// Tick floor + quantization verdict stamped by `latency_profile`
+    /// (see `lohalloc_bench::clockinfo`). Optional: pre-Ladder-4 raw
+    /// files don't carry them.
+    #[serde(default)]
+    clock_tick_ns: Option<u64>,
+    #[serde(default)]
+    quantized: Option<bool>,
 }
+
+/// Every allocator the native pipeline can produce. Filename parsing
+/// validates against this closed set so a future dashed allocator name (or
+/// a typo in `run_native.sh`) fails loudly instead of silently leaking into
+/// the workload segment (the Ladder 4 label-integrity audit found the
+/// convention sound but unenforced).
+const KNOWN_ALLOCATORS: [&str; 4] = ["lohalloc", "jemalloc", "mimalloc", "system"];
+/// Every run mode the native pipeline can produce (same enforcement).
+const KNOWN_MODES: [&str; 3] = ["training", "inference", "baseline"];
 
 /// Parse `native-<lang>-<allocator>-<workload>-<mode>.json` (workload may
 /// itself contain hyphens, e.g. "adv-mixed" — allocator/lang/mode never do,
 /// so we split from both ends and take whatever's left as the workload).
+/// The allocator and mode segments are validated against the known sets:
+/// an unknown token returns `None` (the caller logs and skips the file) —
+/// mis-attribution is never silent. Note this also protects workloads: a
+/// hypothetical workload named `foo-baseline` would need the *mode* slot to
+/// hold a non-mode token to mis-parse, which this rejects.
 fn parse_native_filename(stem: &str) -> Option<(String, String, String, String)> {
     let rest = stem.strip_prefix("native-")?;
     let parts: Vec<&str> = rest.split('-').collect();
@@ -221,10 +257,32 @@ fn parse_native_filename(stem: &str) -> Option<(String, String, String, String)>
     let allocator = parts[1].to_string();
     let mode = parts[parts.len() - 1].to_string();
     let workload = parts[2..parts.len() - 1].join("-");
+    if !KNOWN_ALLOCATORS.contains(&allocator.as_str()) {
+        eprintln!(
+            "native result filename {stem}: unknown allocator token '{allocator}' \
+             (known: {KNOWN_ALLOCATORS:?}) — refusing to guess"
+        );
+        return None;
+    }
+    if !KNOWN_MODES.contains(&mode.as_str()) {
+        eprintln!(
+            "native result filename {stem}: unknown mode token '{mode}' \
+             (known: {KNOWN_MODES:?}) — refusing to guess"
+        );
+        return None;
+    }
     Some((lang, allocator, workload, mode))
 }
 
-fn load_rows(dir: &Path) -> Vec<Row> {
+/// Per-run wall-time sample arrays for native-timing rows, keyed by
+/// (lang, allocator, workload, mode). Kept OUT of `Row` deliberately:
+/// `Row` serializes into bench-report.json (which the graph scripts read),
+/// and ~1700 samples × ~130 rows would bloat it ~50× for data only the
+/// in-process hypothesis tests need.
+type SampleMap = BTreeMap<(String, String, String, String), Vec<f64>>;
+
+fn load_rows(dir: &Path) -> (Vec<Row>, SampleMap) {
+    let mut samples: SampleMap = BTreeMap::new();
     let mut rows = Vec::new();
     // Cachegrind rows are two-phase: main rows and their ops=1 calibration
     // companions are collected here, then paired by (lang, allocator,
@@ -233,7 +291,7 @@ fn load_rows(dir: &Path) -> Vec<Row> {
     let mut cg_cal: BTreeMap<(String, String, String, String), (u64, u64)> = BTreeMap::new();
     let Ok(entries) = fs::read_dir(dir) else {
         eprintln!("results directory {dir:?} not found or unreadable");
-        return rows;
+        return (rows, samples);
     };
 
     for entry in entries.flatten() {
@@ -254,7 +312,13 @@ fn load_rows(dir: &Path) -> Vec<Row> {
             match serde_json::from_str::<HyperfineExport>(&text) {
                 Ok(export) => {
                     if let Some(r) = export.results.first() {
-                        let mut row = empty_row("native-timing", lang, allocator, workload, mode);
+                        let mut row = empty_row(
+                            "native-timing",
+                            lang.clone(),
+                            allocator.clone(),
+                            workload.clone(),
+                            mode.clone(),
+                        );
                         row.mean_ns = Some(r.mean * 1e9);
                         row.stddev_ns = r.stddev.map(|s| s * 1e9);
                         row.throughput_mops = r
@@ -263,6 +327,9 @@ fn load_rows(dir: &Path) -> Vec<Row> {
                             .and_then(ops_from_command)
                             .filter(|&ops| ops > 0 && r.mean > 0.0)
                             .map(|ops| ops as f64 / r.mean / 1e6);
+                        if !r.times.is_empty() {
+                            samples.insert((lang, allocator, workload, mode), r.times.clone());
+                        }
                         rows.push(row);
                     }
                 }
@@ -295,6 +362,8 @@ fn load_rows(dir: &Path) -> Vec<Row> {
                     row.dealloc_mean_ns = r.dealloc_mean_ns;
                     row.rust_throughput_mops =
                         r.alloc_mean_ns.filter(|&m| m > 0.0).map(|m| 1e3 / m);
+                    row.clock_tick_ns = r.clock_tick_ns;
+                    row.quantized = r.quantized;
                     rows.push(row);
                 }
                 Err(e) => eprintln!("failed to parse {path:?} as rust latency result: {e}"),
@@ -315,7 +384,96 @@ fn load_rows(dir: &Path) -> Vec<Row> {
             .copied();
         rows.push(cachegrind_row(cg, cal));
     }
-    rows
+    (rows, samples)
+}
+
+/// Significance threshold for every hypothesis test in the report. 0.01
+/// (not 0.05): with ~40 gate rows per run, α=0.05 would produce ~2 false
+/// verdicts per run by chance alone.
+const ALPHA: f64 = 0.01;
+
+/// Two-sided Mann-Whitney U test (normal approximation, tie-corrected,
+/// continuity-corrected): p-value for "these two sample sets come from the
+/// same distribution". Chosen over Welch's t because hyperfine timing
+/// samples are right-skewed (occasional scheduler stalls) and MW-U is
+/// rank-based, so outliers can't dominate. Self-contained on purpose — no
+/// stats crate for one test.
+///
+/// Returns `None` when either side has < 8 samples (the normal
+/// approximation is unreliable below that; hyperfine's `--min-runs 10`
+/// means real rows always qualify). All-identical samples return
+/// `Some(1.0)` (no evidence of difference, by construction).
+fn mann_whitney_p(a: &[f64], b: &[f64]) -> Option<f64> {
+    let (n1, n2) = (a.len(), b.len());
+    if n1 < 8 || n2 < 8 {
+        return None;
+    }
+    // Rank the pooled samples, averaging ranks across ties.
+    let mut pooled: Vec<(f64, usize)> = a
+        .iter()
+        .map(|&v| (v, 0usize))
+        .chain(b.iter().map(|&v| (v, 1usize)))
+        .collect();
+    pooled.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let n = n1 + n2;
+    let mut rank_sum_a = 0.0f64;
+    let mut tie_term = 0.0f64; // sum over tie groups of (t^3 - t)
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j + 1 < n && pooled[j + 1].0 == pooled[i].0 {
+            j += 1;
+        }
+        let group = (j - i + 1) as f64;
+        // Average rank of positions i..=j (1-based ranks).
+        let avg_rank = (i + 1 + j + 1) as f64 / 2.0;
+        for entry in &pooled[i..=j] {
+            if entry.1 == 0 {
+                rank_sum_a += avg_rank;
+            }
+        }
+        if group > 1.0 {
+            tie_term += group * group * group - group;
+        }
+        i = j + 1;
+    }
+
+    let (n1f, n2f, nf) = (n1 as f64, n2 as f64, n as f64);
+    let u_a = rank_sum_a - n1f * (n1f + 1.0) / 2.0;
+    let mu = n1f * n2f / 2.0;
+    let var = n1f * n2f / 12.0 * ((nf + 1.0) - tie_term / (nf * (nf - 1.0)));
+    if var <= 0.0 {
+        return Some(1.0); // every value tied — no evidence of difference
+    }
+    // Continuity correction: shrink |U - mu| by 0.5 (clamped at 0).
+    let z = ((u_a - mu).abs() - 0.5).max(0.0) / var.sqrt();
+    Some(2.0 * (1.0 - std_normal_cdf(z)))
+}
+
+/// Render a p-value for the report. The normal approximation underflows to
+/// exactly 0 for |z| ≳ 6 — print that as an inequality, not a fake "0".
+fn fmt_p(p: Option<f64>) -> String {
+    match p {
+        None => "n/a".to_string(),
+        Some(p) if p < 1e-15 => "<1e-15".to_string(),
+        Some(p) => format!("{p:.2e}"),
+    }
+}
+
+/// Standard normal CDF via the Abramowitz–Stegun 7.1.26 erf approximation
+/// (|error| < 1.5e-7 — far below anything a p-threshold at 0.01 can see).
+fn std_normal_cdf(x: f64) -> f64 {
+    let t = 1.0 / (1.0 + 0.3275911 * (x.abs() / std::f64::consts::SQRT_2));
+    let poly = t
+        * (0.254829592
+            + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+    let erf = 1.0 - poly * (-(x * x) / 2.0).exp();
+    if x >= 0.0 {
+        0.5 * (1.0 + erf)
+    } else {
+        0.5 * (1.0 - erf)
+    }
 }
 
 /// Turn one main cachegrind result (plus its optional ops=1 calibration
@@ -345,10 +503,15 @@ fn cachegrind_row(cg: CachegrindResult, cal: Option<(u64, u64)>) -> Row {
 
 /// The regression gate: for every (lang, workload) where both a
 /// lohalloc/inference row and a jemalloc/baseline row exist in
-/// `native-timing`, lohalloc's mean must not exceed jemalloc's by >5%.
-fn evaluate_gate(rows: &[Row]) -> Vec<(String, bool, String)> {
+/// `native-timing`, lohalloc's mean must not exceed jemalloc's by >5% —
+/// AND (when per-run samples are available) the loss must be statistically
+/// significant (Mann-Whitney, p < [`ALPHA`]). The significance requirement
+/// stops Docker-VM noise from flipping a borderline row's verdict between
+/// runs; rows without samples (pre-Ladder-4 raw files) keep the pure
+/// ratio semantics.
+fn evaluate_gate(rows: &[Row], samples: &SampleMap) -> Vec<(String, bool, String)> {
     let mut lohalloc_inf: BTreeMap<(String, String), f64> = BTreeMap::new();
-    let mut jemalloc_base: BTreeMap<(String, String), f64> = BTreeMap::new();
+    let mut jemalloc_base: BTreeMap<(String, String), (f64, String)> = BTreeMap::new();
 
     for row in rows {
         if row.source != "native-timing" {
@@ -359,7 +522,7 @@ fn evaluate_gate(rows: &[Row]) -> Vec<(String, bool, String)> {
         if row.allocator == "lohalloc" && row.mode == "inference" {
             lohalloc_inf.insert(key, mean);
         } else if row.allocator == "jemalloc" {
-            jemalloc_base.insert(key, mean);
+            jemalloc_base.insert(key, (mean, row.mode.clone()));
         }
     }
 
@@ -370,14 +533,42 @@ fn evaluate_gate(rows: &[Row]) -> Vec<(String, bool, String)> {
         if key.1 == "system" {
             continue;
         }
-        if let Some(jemalloc_mean) = jemalloc_base.get(key) {
+        if let Some((jemalloc_mean, jemalloc_mode)) = jemalloc_base.get(key) {
             let ratio = lohalloc_mean / jemalloc_mean;
-            let pass = ratio <= 1.05;
+            let p = match (
+                samples.get(&(
+                    key.0.clone(),
+                    "lohalloc".to_string(),
+                    key.1.clone(),
+                    "inference".to_string(),
+                )),
+                samples.get(&(
+                    key.0.clone(),
+                    "jemalloc".to_string(),
+                    key.1.clone(),
+                    jemalloc_mode.clone(),
+                )),
+            ) {
+                (Some(a), Some(b)) => mann_whitney_p(a, b),
+                _ => None,
+            };
+            // Fail only on a loss that is real: over threshold AND
+            // significant (or unmeasurable — old runs without samples keep
+            // the strict ratio behavior rather than silently passing).
+            let over = ratio > 1.05;
+            let significant = p.map_or(true, |p| p < ALPHA);
+            let pass = !(over && significant);
+            let p_str = fmt_p(p);
+            let noise_note = if over && !significant {
+                " [over threshold but not significant — treated as noise]"
+            } else {
+                ""
+            };
             results.push((
                 format!("{}/{}: lohalloc-inference vs jemalloc", key.0, key.1),
                 pass,
                 format!(
-                    "lohalloc={lohalloc_mean:.0}ns jemalloc={jemalloc_mean:.0}ns ratio={ratio:.3} (max 1.05)"
+                    "lohalloc={lohalloc_mean:.0}ns jemalloc={jemalloc_mean:.0}ns ratio={ratio:.3} (max 1.05) p={p_str}{noise_note}"
                 ),
             ));
         }
@@ -385,23 +576,122 @@ fn evaluate_gate(rows: &[Row]) -> Vec<(String, bool, String)> {
     results
 }
 
+/// One H-B comparison row: lohalloc-inference vs one baseline allocator on
+/// one (lang, workload), with the Mann-Whitney verdict when samples exist.
+struct HbComparison {
+    lang: String,
+    workload: String,
+    baseline: String,
+    ratio: f64,
+    p_value: Option<f64>,
+}
+
+impl HbComparison {
+    /// "wins" / "loses" / "no significant difference" / "ratio-only".
+    /// A significant verdict needs p < ALPHA; direction comes from the
+    /// ratio. Without samples only the ratio is reported (no verdict).
+    fn verdict(&self) -> &'static str {
+        match self.p_value {
+            Some(p) if p < ALPHA && self.ratio < 1.0 => "wins",
+            Some(p) if p < ALPHA => "loses",
+            Some(_) => "no significant difference",
+            None => "ratio-only",
+        }
+    }
+}
+
+/// H-B (trained lohalloc beats other allocators): lohalloc-inference vs
+/// EACH of jemalloc / mimalloc / system per (lang, workload) — the gate
+/// only tests jemalloc; this is the full-hypothesis view.
+fn hb_comparisons(rows: &[Row], samples: &SampleMap) -> Vec<HbComparison> {
+    let mut lohalloc_inf: BTreeMap<(String, String), f64> = BTreeMap::new();
+    let mut baselines: BTreeMap<(String, String, String), (f64, String)> = BTreeMap::new();
+    for row in rows {
+        if row.source != "native-timing" {
+            continue;
+        }
+        let Some(mean) = row.mean_ns else { continue };
+        if row.allocator == "lohalloc" && row.mode == "inference" {
+            lohalloc_inf.insert((row.lang.clone(), row.workload.clone()), mean);
+        } else if row.allocator != "lohalloc" {
+            baselines.insert(
+                (
+                    row.lang.clone(),
+                    row.workload.clone(),
+                    row.allocator.clone(),
+                ),
+                (mean, row.mode.clone()),
+            );
+        }
+    }
+    let mut out = Vec::new();
+    for ((lang, workload, baseline), (base_mean, base_mode)) in &baselines {
+        if workload == "system" {
+            continue; // mmap-bound for everyone; same exclusion as the gate
+        }
+        let Some(lo_mean) = lohalloc_inf.get(&(lang.clone(), workload.clone())) else {
+            continue;
+        };
+        let p = match (
+            samples.get(&(
+                lang.clone(),
+                "lohalloc".to_string(),
+                workload.clone(),
+                "inference".to_string(),
+            )),
+            samples.get(&(
+                lang.clone(),
+                baseline.clone(),
+                workload.clone(),
+                base_mode.clone(),
+            )),
+        ) {
+            (Some(a), Some(b)) => mann_whitney_p(a, b),
+            _ => None,
+        };
+        out.push(HbComparison {
+            lang: lang.clone(),
+            workload: workload.clone(),
+            baseline: baseline.clone(),
+            ratio: lo_mean / base_mean,
+            p_value: p,
+        });
+    }
+    out
+}
+
 /// One (lang, workload) lohalloc training↔inference comparison from the
-/// native-timing rows. `within_noise` is true when the delta is smaller
-/// than the two runs' combined stddev (hyperfine's own run-to-run spread)
-/// — in that case the *direction* of the delta is not signal and must not
-/// be read as "inference got slower/faster".
+/// native-timing rows — the H-A hypothesis, per row. When per-run samples
+/// exist, `p_value` carries the Mann-Whitney verdict (the real test);
+/// `within_noise`/`combined_stddev_ns` remain as the fallback heuristic
+/// for pre-Ladder-4 runs whose raw files lack `times`.
 struct TrainVsInference {
     lang: String,
     workload: String,
     train_mean_ns: f64,
     inf_mean_ns: f64,
+    /// Mann-Whitney two-sided p for training vs inference samples.
+    /// `None` when either side lacks a sample array.
+    p_value: Option<f64>,
     /// `None` when either row predates stddev capture — then no noise
     /// verdict is possible and the delta is reported bare.
     combined_stddev_ns: Option<f64>,
     within_noise: bool,
 }
 
-fn train_vs_inference(rows: &[Row]) -> Vec<TrainVsInference> {
+impl TrainVsInference {
+    /// H-A verdict for this row: `Some(true)` = inference significantly
+    /// faster, `Some(false)` = significantly slower, `None` =
+    /// inconclusive (not significant, or no samples to test).
+    fn ha_verdict(&self) -> Option<bool> {
+        match self.p_value {
+            Some(p) if p < ALPHA => Some(self.inf_mean_ns < self.train_mean_ns),
+            _ => None,
+        }
+    }
+}
+
+fn train_vs_inference(rows: &[Row], samples: &SampleMap) -> Vec<TrainVsInference> {
     let mut train: BTreeMap<(String, String), (f64, Option<f64>)> = BTreeMap::new();
     let mut inf: BTreeMap<(String, String), (f64, Option<f64>)> = BTreeMap::new();
     for row in rows {
@@ -426,6 +716,23 @@ fn train_vs_inference(rows: &[Row]) -> Vec<TrainVsInference> {
         let Some(&(inf_mean_ns, inf_sd)) = inf.get(key) else {
             continue;
         };
+        let p_value = match (
+            samples.get(&(
+                key.0.clone(),
+                "lohalloc".to_string(),
+                key.1.clone(),
+                "training".to_string(),
+            )),
+            samples.get(&(
+                key.0.clone(),
+                "lohalloc".to_string(),
+                key.1.clone(),
+                "inference".to_string(),
+            )),
+        ) {
+            (Some(a), Some(b)) => mann_whitney_p(a, b),
+            _ => None,
+        };
         let combined_stddev_ns = match (train_sd, inf_sd) {
             (Some(a), Some(b)) => Some(a + b),
             _ => None,
@@ -437,6 +744,7 @@ fn train_vs_inference(rows: &[Row]) -> Vec<TrainVsInference> {
             workload: key.1.clone(),
             train_mean_ns,
             inf_mean_ns,
+            p_value,
             combined_stddev_ns,
             within_noise,
         });
@@ -444,13 +752,104 @@ fn train_vs_inference(rows: &[Row]) -> Vec<TrainVsInference> {
     out
 }
 
+/// The `## Hypothesis verdicts` roll-up: the two claims this whole pipeline
+/// exists to test, answered per-row-with-statistics and summarized. H-A =
+/// inference beats training (same binary, same workload); H-B = trained
+/// lohalloc beats each baseline allocator. "significant" = Mann-Whitney
+/// p < [`ALPHA`] over hyperfine's per-run samples.
+fn write_hypothesis_verdicts(out: &mut String, tvi: &[TrainVsInference], hb: &[HbComparison]) {
+    out.push_str("## Hypothesis verdicts\n\n");
+    out.push_str(&format!(
+        "Statistical test: two-sided Mann-Whitney U over hyperfine's per-run \
+         samples, significance at p < {ALPHA}. Rows without samples \
+         (pre-Ladder-4 raw files) are counted as inconclusive.\n\n"
+    ));
+
+    // H-A roll-up.
+    let ha_holds: Vec<&TrainVsInference> = tvi
+        .iter()
+        .filter(|c| c.ha_verdict() == Some(true))
+        .collect();
+    let ha_fails: Vec<&TrainVsInference> = tvi
+        .iter()
+        .filter(|c| c.ha_verdict() == Some(false))
+        .collect();
+    let ha_inconclusive = tvi.len() - ha_holds.len() - ha_fails.len();
+    if tvi.is_empty() {
+        out.push_str("**H-A (inference faster than training):** no paired rows in this run.\n\n");
+    } else {
+        out.push_str(&format!(
+            "**H-A (inference faster than training):** holds significantly in \
+             {}/{} rows, inconclusive in {}, fails in {}.\n",
+            ha_holds.len(),
+            tvi.len(),
+            ha_inconclusive,
+            ha_fails.len(),
+        ));
+        for c in &ha_fails {
+            out.push_str(&format!(
+                "- H-A FAIL: {}/{} — inference {:.1}ms vs training {:.1}ms (p={})\n",
+                c.lang,
+                c.workload,
+                c.inf_mean_ns / 1e6,
+                c.train_mean_ns / 1e6,
+                fmt_p(c.p_value),
+            ));
+        }
+        out.push('\n');
+    }
+
+    // H-B roll-up, per baseline.
+    if hb.is_empty() {
+        out.push_str(
+            "**H-B (trained lohalloc beats baselines):** no comparable rows in this run.\n\n",
+        );
+    } else {
+        for baseline in ["jemalloc", "mimalloc", "system"] {
+            let rows_for: Vec<&HbComparison> =
+                hb.iter().filter(|c| c.baseline == baseline).collect();
+            if rows_for.is_empty() {
+                continue;
+            }
+            let wins = rows_for.iter().filter(|c| c.verdict() == "wins").count();
+            let losses = rows_for.iter().filter(|c| c.verdict() == "loses").count();
+            let rest = rows_for.len() - wins - losses;
+            out.push_str(&format!(
+                "**H-B vs {baseline}:** lohalloc-inference wins significantly in \
+                 {wins}/{} rows, loses in {losses}, inconclusive/ratio-only in {rest}.\n",
+                rows_for.len(),
+            ));
+        }
+        out.push('\n');
+        out.push_str("Per-row H-B detail:\n\n");
+        out.push_str("| lang | workload | baseline | lohalloc/baseline ratio | p | verdict |\n|---|---|---|---|---|---|\n");
+        for c in hb {
+            out.push_str(&format!(
+                "| {} | {} | {} | {:.3} | {} | {} |\n",
+                c.lang,
+                c.workload,
+                c.baseline,
+                c.ratio,
+                fmt_p(c.p_value),
+                c.verdict(),
+            ));
+        }
+        out.push('\n');
+    }
+}
+
 fn write_markdown(
     rows: &[Row],
     gate: &[(String, bool, String)],
+    samples: &SampleMap,
     path: &Path,
 ) -> std::io::Result<()> {
     let mut out = String::new();
     out.push_str("# Phase 6 Bench Report\n\n");
+
+    let tvi = train_vs_inference(rows, samples);
+    let hb = hb_comparisons(rows, samples);
+    write_hypothesis_verdicts(&mut out, &tvi, &hb);
 
     out.push_str("## Regression gate\n\n");
     if gate.is_empty() {
@@ -485,33 +884,39 @@ fn write_markdown(
         ));
     }
 
-    let tvi = train_vs_inference(rows);
     if !tvi.is_empty() {
         out.push_str("\n### lohalloc training vs inference (native)\n\n");
         out.push_str(
-            "Deltas no larger than the two rows' combined run-to-run stddev are \
-             marked `~ within noise` — their direction is measurement spread, \
-             not signal. Only `SLOWER` rows are worth investigating.\n\n",
+            "Verdicts come from a two-sided Mann-Whitney U over the per-run \
+             samples when available (`p < 0.01` = significant); rows without \
+             samples fall back to the combined-stddev heuristic (`~ within \
+             noise`). Only significant `SLOWER` rows are worth \
+             investigating.\n\n",
         );
         out.push_str(
             "| lang | workload | training (ns) | inference (ns) | inf/train | verdict |\n|---|---|---|---|---|---|\n",
         );
         for c in &tvi {
             let ratio = c.inf_mean_ns / c.train_mean_ns;
-            let verdict = if c.within_noise {
-                "~ within noise".to_string()
-            } else {
-                let suffix = match c.combined_stddev_ns {
-                    Some(sd) if sd > 0.0 => format!(
-                        " (delta {:.1}x combined stddev)",
-                        (c.inf_mean_ns - c.train_mean_ns).abs() / sd
-                    ),
-                    _ => " (no stddev — unverified)".to_string(),
-                };
-                if ratio > 1.0 {
-                    format!("SLOWER{suffix}")
-                } else {
-                    format!("faster{suffix}")
+            let verdict = match c.p_value {
+                Some(p) if p < ALPHA && ratio > 1.0 => format!("SLOWER (p={})", fmt_p(Some(p))),
+                Some(p) if p < ALPHA => format!("faster (p={})", fmt_p(Some(p))),
+                Some(p) => format!("~ no significant difference (p={p:.2})"),
+                // Pre-Ladder-4 raw files: no samples — stddev heuristic.
+                None if c.within_noise => "~ within noise".to_string(),
+                None => {
+                    let suffix = match c.combined_stddev_ns {
+                        Some(sd) if sd > 0.0 => format!(
+                            " (delta {:.1}x combined stddev)",
+                            (c.inf_mean_ns - c.train_mean_ns).abs() / sd
+                        ),
+                        _ => " (no stddev — unverified)".to_string(),
+                    };
+                    if ratio > 1.0 {
+                        format!("SLOWER{suffix}")
+                    } else {
+                        format!("faster{suffix}")
+                    }
                 }
             };
             out.push_str(&format!(
@@ -549,16 +954,47 @@ fn write_markdown(
     }
 
     out.push_str("\n## Rust per-op latency (hdrhistogram)\n\n");
+    let any_quantized = rows
+        .iter()
+        .any(|r| r.source == "rust-latency" && r.quantized == Some(true));
+    if any_quantized {
+        let tick = rows
+            .iter()
+            .filter(|r| r.source == "rust-latency")
+            .find_map(|r| r.clock_tick_ns)
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "`*` = value is at/below ~3× the measuring clock's tick floor \
+             ({tick}ns on the machine that produced these rows) — a \
+             quantization bucket, not a latency; do not compare starred \
+             values across rows (use the throughput column, which is \
+             tick-immune, instead).\n\n"
+        ));
+    }
     out.push_str("| workload | mode | alloc p50 (ns) | alloc mean (ns) | alloc p99 (ns) | dealloc mean (ns) | throughput (Mops/s) |\n|---|---|---|---|---|---|---|\n");
     for row in rows.iter().filter(|r| r.source == "rust-latency") {
-        let fmt = |v: Option<f64>| v.map_or_else(|| "-".to_string(), |x| format!("{x:.0}"));
+        // Star any percentile that sits under the quantization threshold for
+        // this row's measured tick (row-level `quantized` alone would star
+        // the whole row — per-value is more honest: p50 may be a bucket
+        // while p99 is a real measurement).
+        let tick = row.clock_tick_ns.unwrap_or(1);
+        let star = |v: f64| -> &'static str {
+            if lohalloc_bench::clockinfo::is_quantized(v as u64, tick) {
+                "*"
+            } else {
+                ""
+            }
+        };
+        let fmt =
+            |v: Option<f64>| v.map_or_else(|| "-".to_string(), |x| format!("{x:.0}{}", star(x)));
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {:.0} | {} | {} |\n",
+            "| {} | {} | {} | {} | {:.0}{} | {} | {} |\n",
             row.workload,
             row.mode,
             fmt(row.alloc_p50_ns),
             fmt(row.alloc_mean_ns),
             row.alloc_p99_ns.unwrap_or(0.0),
+            star(row.alloc_p99_ns.unwrap_or(0.0)),
             fmt(row.dealloc_mean_ns),
             row.rust_throughput_mops
                 .map_or_else(|| "-".to_string(), |t| format!("{t:.2}")),
@@ -633,10 +1069,10 @@ fn main() {
         run_dir.clone()
     };
 
-    let rows = load_rows(&source);
+    let (rows, samples) = load_rows(&source);
     eprintln!("loaded {} result rows from {:?}", rows.len(), source);
 
-    let gate = evaluate_gate(&rows);
+    let gate = evaluate_gate(&rows, &samples);
     let any_gate_failed = gate.iter().any(|(_, pass, _)| !pass);
 
     if let Err(e) = fs::create_dir_all(&run_dir) {
@@ -655,7 +1091,7 @@ fn main() {
     if let Err(e) = fs::write(&json_path, serde_json::to_string_pretty(&report).unwrap()) {
         eprintln!("failed to write {json_path:?}: {e}");
     }
-    if let Err(e) = write_markdown(&rows, &gate, &md_path) {
+    if let Err(e) = write_markdown(&rows, &gate, &samples, &md_path) {
         eprintln!("failed to write {md_path:?}: {e}");
     }
 
@@ -701,6 +1137,276 @@ mod tests {
         // Negative / non-integer tails must not parse as u64.
         assert_eq!(ops_from_command("cmd workload -5"), None);
         assert_eq!(ops_from_command("cmd workload 1.5"), None);
+    }
+
+    #[test]
+    fn parse_native_filename_handles_dashed_workloads() {
+        assert_eq!(
+            parse_native_filename("native-c-lohalloc-mt-slab-t4-training"),
+            Some((
+                "c".to_string(),
+                "lohalloc".to_string(),
+                "mt-slab-t4".to_string(),
+                "training".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_native_filename("native-cpp-jemalloc-adv-mixed-baseline"),
+            Some((
+                "cpp".to_string(),
+                "jemalloc".to_string(),
+                "adv-mixed".to_string(),
+                "baseline".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_native_filename_rejects_unknown_tokens_loudly() {
+        // Unknown allocator (e.g. a future dashed name whose first segment
+        // isn't in the known set) must be rejected, not guessed at.
+        assert_eq!(
+            parse_native_filename("native-c-tcmalloc-slab-training"),
+            None
+        );
+        // Unknown mode: a workload accidentally named to end in a non-mode
+        // token would land here — refuse rather than absorb it silently.
+        assert_eq!(parse_native_filename("native-c-lohalloc-slab-warmup"), None);
+        // A workload whose LAST segment collides with a real mode still
+        // parses correctly (mode slot holds the true mode)...
+        assert_eq!(
+            parse_native_filename("native-c-lohalloc-foo-baseline-training"),
+            Some((
+                "c".to_string(),
+                "lohalloc".to_string(),
+                "foo-baseline".to_string(),
+                "training".to_string()
+            ))
+        );
+        // ...and too-short names never panic.
+        assert_eq!(parse_native_filename("native-c-lohalloc"), None);
+    }
+
+    #[test]
+    fn mann_whitney_identical_samples_is_not_significant() {
+        let a: Vec<f64> = (0..20).map(|i| 1.0 + (i % 5) as f64 * 0.01).collect();
+        let p = mann_whitney_p(&a, &a).unwrap();
+        assert!(p > 0.9, "identical samples must give p≈1, got {p}");
+    }
+
+    #[test]
+    fn mann_whitney_clearly_shifted_samples_is_significant() {
+        // Two tight distributions 2x apart — unambiguous.
+        let a: Vec<f64> = (0..20).map(|i| 1.0 + (i % 7) as f64 * 0.001).collect();
+        let b: Vec<f64> = (0..20).map(|i| 2.0 + (i % 7) as f64 * 0.001).collect();
+        let p = mann_whitney_p(&a, &b).unwrap();
+        assert!(
+            p < 1e-6,
+            "2x-shifted samples must be wildly significant, got {p}"
+        );
+        // Symmetric.
+        let p2 = mann_whitney_p(&b, &a).unwrap();
+        assert!((p - p2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn mann_whitney_overlapping_noise_is_not_significant() {
+        // Same distribution, interleaved differently — heavy overlap.
+        let a: Vec<f64> = (0..15).map(|i| ((i * 7919) % 100) as f64).collect();
+        let b: Vec<f64> = (0..15).map(|i| ((i * 6113 + 13) % 100) as f64).collect();
+        let p = mann_whitney_p(&a, &b).unwrap();
+        assert!(
+            p > ALPHA,
+            "overlapping samples must not be significant, got {p}"
+        );
+    }
+
+    #[test]
+    fn mann_whitney_handles_ties_and_small_samples() {
+        // All-tied values: no evidence of difference by construction.
+        let a = vec![5.0; 12];
+        let b = vec![5.0; 12];
+        assert_eq!(mann_whitney_p(&a, &b), Some(1.0));
+        // Below the normal-approximation floor -> None, never a bogus p.
+        assert_eq!(mann_whitney_p(&a[..4], &b), None);
+        assert_eq!(mann_whitney_p(&a, &b[..7]), None);
+    }
+
+    #[test]
+    fn gate_requires_significance_to_fail() {
+        // lohalloc 1.10x slower than jemalloc BUT the samples heavily
+        // overlap -> not significant -> must NOT fail (noise cannot flip
+        // the gate). Same ratio with tight, separated samples -> FAIL.
+        let mk = |allocator: &str, mode: &str, mean: f64| {
+            let mut r = empty_row(
+                "native-timing",
+                "c".into(),
+                allocator.into(),
+                "slab".into(),
+                mode.into(),
+            );
+            r.mean_ns = Some(mean);
+            r
+        };
+        let rows = vec![
+            mk("lohalloc", "inference", 1.10e6),
+            mk("jemalloc", "baseline", 1.0e6),
+        ];
+
+        let key_lo = (
+            "c".to_string(),
+            "lohalloc".to_string(),
+            "slab".to_string(),
+            "inference".to_string(),
+        );
+        let key_je = (
+            "c".to_string(),
+            "jemalloc".to_string(),
+            "slab".to_string(),
+            "baseline".to_string(),
+        );
+
+        // Overlapping noisy samples (seconds): both spread 0.8..1.4ms.
+        let noisy_lo: Vec<f64> = (0..30)
+            .map(|i| 0.0008 + ((i * 37) % 60) as f64 * 1e-5)
+            .collect();
+        let noisy_je: Vec<f64> = (0..30)
+            .map(|i| 0.0008 + ((i * 23 + 7) % 60) as f64 * 1e-5)
+            .collect();
+        let mut samples: SampleMap = BTreeMap::new();
+        samples.insert(key_lo.clone(), noisy_lo);
+        samples.insert(key_je.clone(), noisy_je);
+        let gate = evaluate_gate(&rows, &samples);
+        assert_eq!(gate.len(), 1);
+        assert!(
+            gate[0].1,
+            "over-threshold but insignificant must PASS: {}",
+            gate[0].2
+        );
+        assert!(gate[0].2.contains("not significant"));
+
+        // Tight separated samples: lohalloc clearly slower.
+        let tight_lo: Vec<f64> = (0..30).map(|i| 0.00110 + (i % 5) as f64 * 1e-7).collect();
+        let tight_je: Vec<f64> = (0..30).map(|i| 0.00100 + (i % 5) as f64 * 1e-7).collect();
+        samples.insert(key_lo, tight_lo);
+        samples.insert(key_je, tight_je);
+        let gate = evaluate_gate(&rows, &samples);
+        assert!(
+            !gate[0].1,
+            "significant over-threshold loss must FAIL: {}",
+            gate[0].2
+        );
+
+        // No samples at all: strict ratio semantics (old runs) -> FAIL.
+        let gate = evaluate_gate(&rows, &BTreeMap::new());
+        assert!(!gate[0].1, "sample-less over-threshold must keep failing");
+    }
+
+    #[test]
+    fn hypothesis_verdicts_roll_up_correctly() {
+        let tvi = vec![
+            TrainVsInference {
+                lang: "c".into(),
+                workload: "slab".into(),
+                train_mean_ns: 6.0e6,
+                inf_mean_ns: 1.5e6,
+                p_value: Some(1e-9), // significantly faster
+                combined_stddev_ns: None,
+                within_noise: false,
+            },
+            TrainVsInference {
+                lang: "cpp".into(),
+                workload: "adv-mixed".into(),
+                train_mean_ns: 20.0e6,
+                inf_mean_ns: 26.0e6,
+                p_value: Some(1e-5), // significantly SLOWER -> H-A fail
+                combined_stddev_ns: None,
+                within_noise: false,
+            },
+            TrainVsInference {
+                lang: "rust".into(),
+                workload: "buddy".into(),
+                train_mean_ns: 90.0e6,
+                inf_mean_ns: 88.0e6,
+                p_value: Some(0.4), // inconclusive
+                combined_stddev_ns: None,
+                within_noise: true,
+            },
+        ];
+        let hb = vec![
+            HbComparison {
+                lang: "c".into(),
+                workload: "slab".into(),
+                baseline: "jemalloc".into(),
+                ratio: 0.9,
+                p_value: Some(1e-4),
+            },
+            HbComparison {
+                lang: "c".into(),
+                workload: "buddy".into(),
+                baseline: "jemalloc".into(),
+                ratio: 1.8,
+                p_value: Some(1e-8),
+            },
+            HbComparison {
+                lang: "c".into(),
+                workload: "arena".into(),
+                baseline: "mimalloc".into(),
+                ratio: 1.02,
+                p_value: Some(0.5),
+            },
+        ];
+        assert_eq!(tvi[0].ha_verdict(), Some(true));
+        assert_eq!(tvi[1].ha_verdict(), Some(false));
+        assert_eq!(tvi[2].ha_verdict(), None);
+        assert_eq!(hb[0].verdict(), "wins");
+        assert_eq!(hb[1].verdict(), "loses");
+        assert_eq!(hb[2].verdict(), "no significant difference");
+
+        let mut md = String::new();
+        write_hypothesis_verdicts(&mut md, &tvi, &hb);
+        assert!(
+            md.contains("holds significantly in 1/3 rows, inconclusive in 1, fails in 1"),
+            "{md}"
+        );
+        assert!(md.contains("H-A FAIL: cpp/adv-mixed"), "{md}");
+        assert!(md.contains("**H-B vs jemalloc:** lohalloc-inference wins significantly in 1/2 rows, loses in 1"), "{md}");
+        assert!(md.contains("**H-B vs mimalloc:**"), "{md}");
+    }
+
+    #[test]
+    fn quantized_percentiles_get_starred_in_markdown() {
+        // One quantized row (tick 42, p50=42 is a bucket) and one clean row.
+        let mut q = empty_row(
+            "rust-latency",
+            "rust".into(),
+            "lohalloc".into(),
+            "slab".into(),
+            "inference".into(),
+        );
+        q.alloc_p50_ns = Some(42.0);
+        q.alloc_p99_ns = Some(4_000.0);
+        q.alloc_mean_ns = Some(26.0);
+        q.clock_tick_ns = Some(42);
+        q.quantized = Some(true);
+        let mut clean = q.clone();
+        clean.workload = "buddy".into();
+        clean.alloc_p50_ns = Some(541.0);
+        clean.alloc_mean_ns = Some(1_078.0);
+        clean.quantized = Some(false);
+
+        let dir = std::env::temp_dir().join("lohalloc-aggregate-quantized-test");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("report.md");
+        write_markdown(&[q, clean], &[], &BTreeMap::new(), &path).unwrap();
+        let md = fs::read_to_string(&path).unwrap();
+
+        assert!(md.contains("tick floor"), "footnote missing:\n{md}");
+        assert!(md.contains("| 42* |"), "quantized p50 not starred:\n{md}");
+        assert!(md.contains("| 26* |"), "quantized mean not starred:\n{md}");
+        assert!(!md.contains("4000*"), "real p99 must not be starred:\n{md}");
+        assert!(!md.contains("541*"), "clean row must not be starred:\n{md}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -780,7 +1486,7 @@ mod tests {
             native_row("c", "slab", "training", 7e6, None),
             native_row("c", "slab", "inference", 2e6, Some(0.1e6)),
         ];
-        let tvi = train_vs_inference(&rows);
+        let tvi = train_vs_inference(&rows, &BTreeMap::new());
         assert_eq!(tvi.len(), 3);
 
         let by_key = |lang: &str, wl: &str| {
@@ -806,7 +1512,7 @@ mod tests {
             // training with no matching inference row: skipped.
             native_row("c", "buddy", "training", 95e6, Some(1e6)),
         ];
-        assert!(train_vs_inference(&rows).is_empty());
+        assert!(train_vs_inference(&rows, &BTreeMap::new()).is_empty());
     }
 
     fn cg(ops: u64, d1: u64, ll: u64) -> CachegrindResult {

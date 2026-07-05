@@ -32,6 +32,8 @@
 //! a `.lohalloc` file and starts in Inference mode. See `perfect_hash.rs` for
 //! the binary format.
 
+use std::collections::BTreeMap;
+
 use lohalloc_core::{slab_class_for, Backend, Signature};
 
 use crate::bandit::BanditPolicy;
@@ -80,14 +82,62 @@ pub fn combine_hash_size_class(hash: u64, size_class: u8) -> u64 {
         .rotate_left(17)
 }
 
+/// One in-flight reward batch for a (Signature, Backend) arm — raw latency
+/// and fragmentation sums awaiting enough samples to convert to a reward.
+#[derive(Clone, Copy, Default)]
+struct PendingBatch {
+    latency_sum: u64,
+    frag_sum: f32,
+    count: u32,
+}
+
+/// Per-(Signature, Backend) reward batching (see [`AllocatorState::record_latency`]).
+///
+/// # Why rewards are batched (the ARM clock-floor fix)
+///
+/// `clock::now_ns()` is `Instant`-backed, and on Apple Silicon (and this
+/// project's local Docker, which passes the same 24 MHz ARM generic timer
+/// through) a single measured interval quantizes to multiples of ~41.7ns.
+/// A true ~25ns Slab/Arena op therefore reads as **either 0ns or 42ns** —
+/// with the default `t_ref_ns = 50` that's a reward of 1.000 vs 0.543, a
+/// ~2× swing for the identical operation, injected straight into UCB1.
+/// The bandit was learning fast-backend rankings from timer noise.
+///
+/// Averaging `reward_batch` (default 16) raw latencies before converting
+/// to a reward makes the quantization error average out (each sample's
+/// tick-rounding is ~uniform in [0, tick)), recovering a sub-tick-accurate
+/// mean; x86 (~ns TSC) is unaffected either way. `reward_batch = 1`
+/// reproduces the old per-op behavior bit-for-bit.
+///
+/// Batches are keyed by (Signature, Backend) because a signature's samples
+/// can span backends (fallthrough on alloc, dealloc-side attribution) and
+/// a reward must only ever credit the arm that produced its latencies.
+/// At `freeze()` any partial batches (< reward_batch samples) are simply
+/// dropped — at most `reward_batch - 1` samples per arm, noise-level.
+#[derive(Default)]
+pub struct PendingRewards {
+    batches: BTreeMap<(Signature, u8), PendingBatch>,
+}
+
+impl PendingRewards {
+    pub const fn new() -> Self {
+        Self {
+            batches: BTreeMap::new(),
+        }
+    }
+}
+
 /// The allocator's operating mode.
 ///
 /// `Training` learns routing via the MAB; `Inference` uses a frozen
 /// `PerfectHashTable` for O(1) hash-and-jump routing.
 pub enum AllocatorState {
     /// Learning mode: the Multi-Armed Bandit selects backends and learns
-    /// from outcomes.
-    Training { bandit: BanditPolicy },
+    /// from outcomes (rewards arrive in batches — see [`PendingRewards`]).
+    Training {
+        bandit: BanditPolicy,
+        pending: PendingRewards,
+    },
     /// Frozen mode: the bandit's weights have collapsed into a read-only
     /// `PerfectHashTable`. The hot path is a single O(1) MPHF lookup.
     Inference { routing_table: PerfectHashTable },
@@ -104,6 +154,7 @@ impl AllocatorState {
     pub fn new_training() -> Self {
         Self::Training {
             bandit: BanditPolicy::new(),
+            pending: PendingRewards::new(),
         }
     }
 
@@ -112,6 +163,7 @@ impl AllocatorState {
     pub const fn new_training_const() -> Self {
         Self::Training {
             bandit: BanditPolicy::new_const(),
+            pending: PendingRewards::new(),
         }
     }
 
@@ -130,7 +182,7 @@ impl AllocatorState {
     ///   for medium, System for large).
     pub fn route(&mut self, hash: u64, size: usize) -> Backend {
         match self {
-            Self::Training { bandit } => {
+            Self::Training { bandit, .. } => {
                 let size_class = size_class_for(size);
                 let sig = Signature::new(hash, size_class);
                 bandit.select(sig)
@@ -172,7 +224,7 @@ impl AllocatorState {
         latency_ns: u64,
         total_bytes: usize,
     ) {
-        if let Self::Training { bandit } = self {
+        if let Self::Training { bandit, pending } = self {
             let sig = Signature::new(hash, size_class);
             let cfg = crate::tune::config();
             let frag_pct = if cfg.frag_weight > 0.0 {
@@ -180,8 +232,28 @@ impl AllocatorState {
             } else {
                 0.0
             };
-            let reward = shaped_reward(latency_ns, frag_pct, cfg);
-            bandit.update(sig, backend, reward);
+            // Accumulate into this arm's pending batch; only convert to a
+            // reward and update the bandit once `reward_batch` samples have
+            // landed (averaging out the clock's tick quantization — see
+            // `PendingRewards`). `reward_batch == 1` flushes every call, so
+            // the reward is `shaped_reward(latency_ns, frag_pct, cfg)`
+            // exactly as before batching existed.
+            let batch = pending.batches.entry((sig, backend as u8)).or_default();
+            batch.latency_sum += latency_ns;
+            batch.frag_sum += frag_pct;
+            batch.count += 1;
+            if batch.count >= cfg.reward_batch {
+                let mean_latency = batch.latency_sum / batch.count as u64;
+                let mean_frag = batch.frag_sum / batch.count as f32;
+                let reward = shaped_reward(mean_latency, mean_frag, cfg);
+                // Credit the de-quantized reward once per pull in the batch
+                // so `mean_reward = sum/pulls` stays a true average (see
+                // `BanditPolicy::update_weighted`). With reward_batch == 1
+                // this is a plain weight-1 update — bit-identical to the
+                // pre-batching per-op path.
+                bandit.update_weighted(sig, backend, reward, batch.count);
+                pending.batches.remove(&(sig, backend as u8));
+            }
         }
     }
 
@@ -191,7 +263,7 @@ impl AllocatorState {
     /// Inference mode is trivially "converged" (already frozen).
     pub fn is_converged(&self) -> bool {
         match self {
-            Self::Training { bandit } => {
+            Self::Training { bandit, .. } => {
                 let cfg = crate::tune::config();
                 bandit.is_converged(cfg.converge_stable_n)
             }
@@ -211,7 +283,7 @@ impl AllocatorState {
     /// one-way transition.
     pub fn freeze(&mut self) {
         match self {
-            Self::Training { bandit } => {
+            Self::Training { bandit, .. } => {
                 let entries = bandit
                     .freeze()
                     .into_iter()
@@ -243,7 +315,7 @@ impl AllocatorState {
     /// already exposed via `export()`).
     pub fn routing_snapshot(&self) -> Vec<(u64, Backend)> {
         match self {
-            Self::Training { bandit } => bandit.snapshot(),
+            Self::Training { bandit, .. } => bandit.snapshot(),
             Self::Inference { .. } => Vec::new(),
         }
     }
@@ -252,7 +324,7 @@ impl AllocatorState {
     /// Returns 0 in Inference mode.
     pub fn signature_count(&self) -> usize {
         match self {
-            Self::Training { bandit } => bandit.len(),
+            Self::Training { bandit, .. } => bandit.len(),
             Self::Inference { .. } => 0,
         }
     }
@@ -430,6 +502,71 @@ mod tests {
             ..crate::tune::TrainingConfig::default()
         };
         assert!(shaped_reward(latency, 0.0, &flat) > shaped_reward(latency, 0.0, &sharp));
+    }
+
+    #[test]
+    fn batched_reward_de_quantizes_toward_true_mean() {
+        // The A2 fix's premise, as pure arithmetic. A backend whose true
+        // per-op cost is 21ns, measured on a 42ns-tick clock: each sample
+        // reads either 0ns or 42ns (1:1, so the sample mean is the true
+        // 21ns). `shaped_reward` is nonlinear in latency, so the per-op
+        // average of the two quantized rewards is BIASED away from the
+        // truth, while feeding the averaged latency into `shaped_reward`
+        // once (what batching does) lands exactly on it.
+        let cfg = crate::tune::TrainingConfig::default(); // t_ref_ns = 50
+        let ground_truth = shaped_reward(21, 0.0, &cfg); // 50/71
+        let per_op_avg = (shaped_reward(0, 0.0, &cfg) + shaped_reward(42, 0.0, &cfg)) / 2.0;
+        let batched = shaped_reward(42 / 2, 0.0, &cfg);
+
+        assert_eq!(batched, ground_truth, "batched == shaped(mean latency)");
+        assert!(
+            (batched - ground_truth).abs() < (per_op_avg - ground_truth).abs(),
+            "batched ({batched:.4}) must be closer to the true reward \
+             ({ground_truth:.4}) than the per-op quantized average \
+             ({per_op_avg:.4})"
+        );
+    }
+
+    #[test]
+    fn batching_preserves_decisive_ranking_through_bandit() {
+        // Feed the bandit batched (de-quantized) rewards directly via the
+        // weighted-update path and confirm a decisively-faster arm wins.
+        // Uses an explicit config (the process-wide OnceLock can't be
+        // safely mutated under parallel tests — same reason `select_with`
+        // exists).
+        use crate::bandit::BanditPolicy;
+        let cfg = crate::tune::TrainingConfig::default();
+        let sig = Signature::new(0xABC, 4);
+        let mut bandit = BanditPolicy::new();
+        // Mirror `record_latency`'s real loop: every selected arm gets a
+        // reward, batched by `reward_batch`. Slab is decisively fastest
+        // (~5ns); every other backend is ~500ns. Accumulate per-arm and
+        // flush in weighted batches, exactly as production does.
+        let batch = cfg.reward_batch;
+        let mut pending: [(u64, u32); 4] = [(0, 0); 4];
+        for _ in 0..(batch as usize * 60) {
+            let backend = bandit.select_with(sig, &cfg);
+            let latency = if backend == Backend::Slab { 5 } else { 500 };
+            let e = &mut pending[backend as usize];
+            e.0 += latency;
+            e.1 += 1;
+            if e.1 >= batch {
+                let reward = shaped_reward(e.0 / e.1 as u64, 0.0, &cfg);
+                bandit.update_weighted(sig, backend, reward, e.1);
+                *e = (0, 0);
+            }
+        }
+        let mut slab_wins = 0;
+        for _ in 0..50 {
+            if bandit.select_with(sig, &cfg) == Backend::Slab {
+                slab_wins += 1;
+            }
+        }
+        assert!(
+            slab_wins > 45,
+            "de-quantized rewards must let the decisively-faster arm win \
+             ({slab_wins}/50 for Slab)"
+        );
     }
 
     #[test]

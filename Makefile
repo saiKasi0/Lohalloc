@@ -254,9 +254,21 @@ bench: bench-latency
 # Linux-only, run inside Docker (see docker/Dockerfile.bench). Writes straight
 # into $(RUN_DIR)/raw. Standalone use must share RUN_DIR with bench-report
 # (bench-all does this for you); the echo prints the exact follow-up command.
+#
+# BENCH_PREPARE=drop-caches: opt-in cold-cache isolation — hyperfine drops
+# the kernel page cache before every timed run (requires a privileged
+# container for /proc/sys/vm/drop_caches, added automatically). This
+# measures deliberately COLD launches; keep such runs in their own RUN_DIR,
+# never mixed with default hot-steady-state rows.
+BENCH_PREPARE ?=
+# Exported so the host (no-Docker) targets' run_native.sh sees it too when
+# set as `make bench-native-host BENCH_PREPARE=drop-caches`.
+export BENCH_PREPARE
+DOCKER_PREPARE_FLAGS := $(if $(filter drop-caches,$(BENCH_PREPARE)),--privileged -e BENCH_PREPARE=drop-caches,)
+
 bench-native: bench-image
 	@mkdir -p $(RUN_DIR)/raw
-	docker run --rm -e RAW_DIR=/lohalloc/$(RUN_DIR)/raw \
+	docker run --rm $(DOCKER_PREPARE_FLAGS) -e RAW_DIR=/lohalloc/$(RUN_DIR)/raw \
 		-v "$(CURDIR)/$(RESULTS_DIR):/lohalloc/$(RESULTS_DIR)" lohalloc-bench
 	@echo "Raw in $(RUN_DIR)/raw — build the report with: make bench-report RUN_DIR=$(RUN_DIR)"
 

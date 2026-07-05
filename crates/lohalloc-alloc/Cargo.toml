@@ -15,3 +15,9 @@ libc = "0.2"
 # installed by the demo binary (via LD_PRELOAD). Compiled away completely
 # when disabled — no symbols, no branches, no atomic loads on the hot path.
 telemetry-observer = []
+# When enabled, the frozen-path per-backend route counters and the
+# fallthrough counter are compiled in (for `LOHALLOC_DEBUG` model-routing
+# diagnosis). OFF by default: every thread incrementing the same counter
+# cache line on every frozen alloc is false sharing that hurt MT scaling.
+# Always effectively on under `cfg(test)` so the counter tests still run.
+route-metrics = []

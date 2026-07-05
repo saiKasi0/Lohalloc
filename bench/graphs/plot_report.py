@@ -68,10 +68,14 @@ def _color_for(series, idx):
     return FALLBACK_CYCLE[idx % len(FALLBACK_CYCLE)]
 
 
-def grouped_bar(out_path, title, ylabel, categories, series_values, series_errors=None):
+def grouped_bar(
+    out_path, title, ylabel, categories, series_values, series_errors=None, footnote=None
+):
     """categories: ordered x labels. series_values: {series_name: {cat: value}}.
     series_errors (optional): same shape — per-bar stddev, rendered as an
-    error bar so run-to-run noise is visible next to the mean."""
+    error bar so run-to-run noise is visible next to the mean.
+    footnote (optional): small muted caption under the chart (e.g. the
+    clock-tick quantization warning on per-op latency charts)."""
     if not categories or not series_values:
         return False
     series_names = sorted(series_values.keys())
@@ -115,6 +119,16 @@ def grouped_bar(out_path, title, ylabel, categories, series_values, series_error
     if legend:
         legend.get_title().set_color(INK)
     fig.tight_layout()
+    if footnote:
+        fig.subplots_adjust(bottom=0.22)
+        fig.text(
+            0.01,
+            0.02,
+            footnote,
+            color=INK_MUTED,
+            fontsize=7,
+            family="monospace",
+        )
     fig.savefig(out_path, dpi=130, facecolor=CANVAS)
     plt.close(fig)
     print(f"  wrote {out_path}")
@@ -231,6 +245,18 @@ def main():
         )
 
     # 3. Rust per-op alloc latency, workload x mode (single language: rust).
+    # If any row was measured on a tick-floored clock (Apple Silicon: ~42ns
+    # — see aggregate.rs / clockinfo.rs), caption the per-op charts: bars
+    # at/near the tick are quantization buckets, not latencies.
+    tick_footnote = None
+    for r in rows:
+        if r.get("source") == "rust-latency" and r.get("quantized"):
+            tick = r.get("clock_tick_ns") or 0
+            tick_footnote = (
+                f"clock tick floor {tick}ns on this machine: bars at/below "
+                f"~{3 * tick}ns are quantization buckets, not latencies"
+            )
+            break
     for lang, (cats, sv) in collect(rows, "rust-latency", "alloc_p99_ns").items():
         wrote_any |= grouped_bar(
             out_dir / "rust-latency-p99.png",
@@ -238,6 +264,7 @@ def main():
             "p99 ns",
             cats,
             sv,
+            footnote=tick_footnote,
         )
     for lang, (cats, sv) in collect(rows, "rust-latency", "alloc_p50_ns").items():
         wrote_any |= grouped_bar(
@@ -246,6 +273,7 @@ def main():
             "p50 ns",
             cats,
             sv,
+            footnote=tick_footnote,
         )
     for lang, (cats, sv) in collect(rows, "rust-latency", "alloc_mean_ns").items():
         wrote_any |= grouped_bar(
@@ -254,6 +282,7 @@ def main():
             "mean ns",
             cats,
             sv,
+            footnote=tick_footnote,
         )
 
     if not wrote_any:

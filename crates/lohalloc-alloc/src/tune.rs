@@ -48,6 +48,7 @@
 //! | `freeze_mode`       | `ops`   | `ops` = freeze at a fixed malloc count; `converged` = freeze when the bandit stabilizes (see `BanditPolicy::is_converged`) |
 //! | `converge_stable_n` | 64      | consecutive same-arm selections per Signature required by `converged` |
 //! | `freeze_after`      | (none)  | op-count threshold; the env var `LOHALLOC_FREEZE_AFTER` (read by `lohalloc-cabi`) takes precedence over this key |
+//! | `reward_batch`      | 16      | latency samples averaged per bandit reward update; de-quantizes the ARM ~42ns `Instant` tick floor. `1` = pre-Ladder-4 per-op behavior |
 
 use std::sync::OnceLock;
 
@@ -79,6 +80,12 @@ pub struct TrainingConfig {
     pub freeze_mode: FreezeMode,
     pub converge_stable_n: u32,
     pub freeze_after: Option<u64>,
+    /// Number of latency samples averaged per bandit reward update (the
+    /// clock-quantization fix — see `state::PendingRewards`). Default 16
+    /// averages out the ~42ns `Instant` tick floor on ARM; `1` reproduces
+    /// pre-Ladder-4 per-op reward behavior bit-for-bit. Clamped to ≥1 by
+    /// the parser (0 would never flush a reward).
+    pub reward_batch: u32,
 }
 
 impl Default for TrainingConfig {
@@ -92,13 +99,14 @@ impl Default for TrainingConfig {
             freeze_mode: FreezeMode::Ops,
             converge_stable_n: 64,
             freeze_after: None,
+            reward_batch: 16,
         }
     }
 }
 
 /// The known keys, used both for file parsing and for deriving the
 /// `LOHALLOC_<KEY>` env-override names.
-const KEYS: [&str; 12] = [
+const KEYS: [&str; 13] = [
     "focus",
     "ucb_c",
     "hysteresis",
@@ -111,6 +119,7 @@ const KEYS: [&str; 12] = [
     "freeze_mode",
     "converge_stable_n",
     "freeze_after",
+    "reward_batch",
 ];
 
 /// Apply a `focus` preset. Only sets the reward-shape pair — everything
@@ -172,6 +181,12 @@ fn apply_key(cfg: &mut TrainingConfig, key: &str, value: &str) {
         "freeze_after" => match value.parse::<u64>() {
             Ok(v) if v > 0 => cfg.freeze_after = Some(v),
             _ => eprintln!("lohalloc tune: bad value '{value}' for freeze_after ignored"),
+        },
+        "reward_batch" => match value.parse::<u32>() {
+            Ok(v) if v > 0 => cfg.reward_batch = v,
+            _ => eprintln!(
+                "lohalloc tune: bad value '{value}' for reward_batch (must be >= 1) ignored"
+            ),
         },
         other => eprintln!("lohalloc tune: unknown key '{other}' ignored"),
     }

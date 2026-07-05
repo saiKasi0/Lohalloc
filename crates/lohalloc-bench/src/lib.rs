@@ -12,6 +12,7 @@
 //!   `tests/routing_validation.rs` and (once trained routing lands)
 //!   `tests/decision_plane.rs`.
 
+pub mod clockinfo;
 pub mod forced;
 pub mod global_alloc;
 pub mod hypotheses;

@@ -25,3 +25,10 @@ name = "lohalloc_cabi"
 lohalloc-alloc.workspace = true
 lohalloc-core.workspace = true
 libc = "0.2"
+
+[features]
+# Passthrough so `cargo build -p lohalloc-cabi --features route-metrics`
+# compiles the frozen-path route counters into the interposed allocator for
+# LOHALLOC_DEBUG model-routing diagnosis (off by default — see
+# lohalloc-alloc's `route-metrics`).
+route-metrics = ["lohalloc-alloc/route-metrics"]
