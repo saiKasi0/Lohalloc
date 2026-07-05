@@ -541,6 +541,35 @@ pub fn fast_stack_hash() -> u64 {
     hash
 }
 
+/// One-frame topological hash: the leaf return address only, normalized and
+/// mixed exactly as [`fast_stack_hash`] mixes its frame-0 slot
+/// (`mix_hash(&[normalize(ret0)])`). This is J2's distilled key: call sites
+/// that route identically across *every* 3-frame context they appear in are
+/// keyed on this cheaper 1-frame hash, so Inference can skip walking frames
+/// 1–2 for them.
+///
+/// Returns `SENTINEL_HASH` (0) if the frame-pointer guard fails or no leaf
+/// return address is readable — same degradation contract as
+/// `fast_stack_hash` (a sentinel routes to the size fallback, never a
+/// misroute). Not memoized: it is already just one guarded deref + one
+/// normalize + one mix, cheaper than a memo probe.
+#[inline(always)]
+pub fn one_frame_hash() -> u64 {
+    let (sp, fp) = read_sp_fp();
+    if !is_valid_fp(fp, sp) {
+        return SENTINEL_HASH;
+    }
+    let ret0 = match read_frame(fp) {
+        Some((_next_fp, ret)) if ret != 0 => ret,
+        _ => return SENTINEL_HASH,
+    };
+    // Same module table + normalization + mixer the 3-frame path uses, so a
+    // 1-frame hash computed here at Inference is bit-identical to the one the
+    // training path stored for this site (see `AllocatorState`/`freeze`).
+    let modules = module_table().entries();
+    mix_hash(&[normalize_pc_with(ret0 as u64, modules)])
+}
+
 /// ASLR-stable normalization + mix over an already-walked raw PC array.
 /// Bit-identical to the pre-C5 single-pass implementation — exported
 /// `.lohalloc` models key on these exact hash values, so any change here
@@ -753,6 +782,25 @@ mod tests {
                 "memo hit must be bit-identical to the full walk"
             );
         }
+    }
+
+    #[test]
+    fn one_frame_hash_is_deterministic_and_nonzero() {
+        // J2: the 1-frame distilled key must be stable for a fixed call site
+        // (so a training-time key matches the Inference-time probe) and
+        // non-sentinel on a real stack (so distilled entries are reachable).
+        let h1 = one_frame_hash();
+        let h2 = one_frame_hash();
+        assert_eq!(h1, h2, "1-frame hash must be deterministic for a site");
+        assert_ne!(h1, SENTINEL_HASH, "1-frame hash should be non-sentinel");
+    }
+
+    #[test]
+    fn one_frame_differs_from_three_frame() {
+        // The distilled key is a *different* value than the full 3-frame hash
+        // for the same site (it folds only the leaf return address), so the
+        // two tables never alias keys.
+        assert_ne!(one_frame_hash(), fast_stack_hash());
     }
 
     #[test]

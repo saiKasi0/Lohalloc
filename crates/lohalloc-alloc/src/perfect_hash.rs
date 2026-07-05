@@ -134,6 +134,20 @@ fn fastrange(x: u64, n: usize) -> usize {
     ((x as u128 * n as u128) >> 64) as usize
 }
 
+/// Decode a stored backend discriminant byte. Kept as a free function so the
+/// hot `lookup` fast path and the cold `entry_backend_at` accessor share one
+/// definition (and so the `_` arm's `Arena` default lives in exactly one
+/// place).
+#[inline]
+fn backend_from_u8(b: u8) -> Backend {
+    match b {
+        0 => Backend::Slab,
+        1 => Backend::Buddy,
+        2 => Backend::System,
+        _ => Backend::Arena,
+    }
+}
+
 /// Packed on-disk-in-memory size of one slot entry: `hash: u64 LE` (8) +
 /// `backend: u8` (1) + `size_class: u8` (1). No alignment padding, unlike
 /// the old `Vec<Entry>` (16 bytes/entry under default `u64` alignment) —
@@ -181,12 +195,6 @@ pub struct PerfectHashTable {
 
 impl PerfectHashTable {
     #[inline]
-    fn seed_at(&self, bucket: usize) -> u32 {
-        let off = bucket * 4;
-        u32::from_le_bytes(self.buf[off..off + 4].try_into().unwrap())
-    }
-
-    #[inline]
     fn entry_offset(&self, slot: usize) -> usize {
         self.num_buckets * 4 + slot * ENTRY_BYTES
     }
@@ -199,13 +207,7 @@ impl PerfectHashTable {
 
     #[inline]
     fn entry_backend_at(&self, slot: usize) -> Backend {
-        let off = self.entry_offset(slot);
-        match self.buf[off + 8] {
-            0 => Backend::Slab,
-            1 => Backend::Buddy,
-            2 => Backend::System,
-            _ => Backend::Arena,
-        }
+        backend_from_u8(self.buf[self.entry_offset(slot) + 8])
     }
 
     #[inline]
@@ -361,14 +363,42 @@ impl PerfectHashTable {
     /// O(1): two mixes, two array reads, one comparison — no heap
     /// allocations. Returns `None` if the hash is not in the table (the
     /// caller should fall back to size-based routing in that case).
+    ///
+    /// This is the single hottest read in Inference mode (one call per
+    /// allocation), so it takes the raw-pointer fast path: the entry offset
+    /// is computed once and shared between the hash compare and the backend
+    /// read, and the three in-bounds byte reads skip the slice bounds checks
+    /// the safe accessors pay. `[u8; N]` pointer casts keep the reads
+    /// alignment-1 (valid unaligned) and `from_le_bytes` keeps them
+    /// endianness-correct, so the frozen wire format still decodes identically
+    /// on any target.
     pub fn lookup(&self, hash: u64) -> Option<Backend> {
-        if self.num_slots == 0 {
+        let n = self.num_slots;
+        if n == 0 {
             return None;
         }
-        let bucket = fastrange(mix(hash, self.global_seed), self.num_buckets);
-        let d = self.seed_at(bucket) as u64;
-        let slot = fastrange(mix(hash, self.global_seed ^ d), self.num_slots);
-        (self.entry_hash_at(slot) == hash).then(|| self.entry_backend_at(slot))
+        let g = self.global_seed;
+        let m = self.num_buckets;
+        let base = self.buf.as_ptr();
+
+        // SAFETY: `buf` is `[seeds: u32 LE; m][entries: ENTRY_BYTES; n]`, so
+        // `buf.len() == m*4 + n*ENTRY_BYTES`. `bucket = fastrange(_, m)` is in
+        // `0..m`, so its 4-byte seed read at `bucket*4` lies in the seed
+        // region. `slot = fastrange(_, n)` is in `0..n`, so its
+        // `ENTRY_BYTES`-wide entry at `m*4 + slot*ENTRY_BYTES` (bytes 0..10)
+        // lies in the entry region. Every read below is provably in-bounds;
+        // the `[u8; N]` casts are alignment-1, valid for unaligned loads.
+        unsafe {
+            let bucket = fastrange(mix(hash, g), m);
+            let d = u32::from_le_bytes(*(base.add(bucket * 4) as *const [u8; 4])) as u64;
+            let slot = fastrange(mix(hash, g ^ d), n);
+            let eoff = m * 4 + slot * ENTRY_BYTES;
+            let stored = u64::from_le_bytes(*(base.add(eoff) as *const [u8; 8]));
+            if stored != hash {
+                return None;
+            }
+            Some(backend_from_u8(*base.add(eoff + 8)))
+        }
     }
 
     /// Number of routing entries.
