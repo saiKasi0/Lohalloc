@@ -1,15 +1,13 @@
 //! Slab sub-allocator (fixed-size blocks).
 //!
-//! One free-list per size class. Blocks are carved out of page-backed regions
-//! obtained from the System Fallback. On `alloc` we pop a block from the front
-//! of the free list; on `dealloc` we push it back. When a list is empty we
-//! map a fresh page region, slice it into blocks, and thread them onto the list.
-//!
-//! Each freed block is linked through its own first bytes (intrusive free
-//! list), so we track no per-block metadata of our own — the block size is
-//! recoverable from the size class the caller returns at dealloc time. This is
-//! a Phase 1 implementation: simple, correct, alignment-clean. Phase 2 adds
-//! the telemetry hooks on top without changing the free-list structure.
+//! Per size class: a no-touch pointer-stack cache over an intrusive
+//! overflow free list, plus a bump-carve cursor into the class's active
+//! fresh region (Ladder 5 J3-slab — see the [`Slab`] struct doc for the
+//! tier design and the Phase P measurement behind it). Blocks are carved
+//! out of page-backed regions obtained from the System Fallback; the block
+//! size is recoverable from the size class the caller returns at dealloc
+//! time (header `slab_class` or the segment registry), so no per-block
+//! metadata of our own.
 //!
 //! # Stripe agnosticism (Ladder 4 C4)
 //!
@@ -39,11 +37,51 @@ struct FreeNode {
     next: Option<*mut FreeNode>,
 }
 
+/// Ladder 5 J3-slab: per-class central pointer-stack capacity (the no-touch
+/// hot tier in front of the intrusive lists — same design language as
+/// `buddy.rs`'s `ORDER_CACHE`). Sized to absorb a whole magazine flush
+/// (≤ 16 blocks) plus a whole magazine refill without ping-ponging into
+/// the intrusive overflow under steady churn.
+const CENTRAL_CACHE: usize = 64;
+
 /// One slab allocator: a per-class free-list array plus the list of backing
 /// regions (so they are freed on drop and not leaked).
+///
+/// # Free/carve tiers (Ladder 5 J3-slab: never touch block memory on the
+/// common path)
+///
+/// Phase P measured that on workloads that never write their allocations,
+/// every intrusive free-list op is a cold-block cache/dTLB miss and every
+/// first touch of a fresh page is a fault (a 2 MiB residency grant under
+/// THP `[always]`) — jemalloc pays none of that because its metadata is
+/// fully out-of-band. Three changes mirror `buddy.rs`'s J3-OOB here:
+///
+/// 1. **Cursor carve**: a fresh region is *not* threaded block-by-block
+///    onto the free list at map time (the old `refill` wrote a `FreeNode`
+///    into every block upfront — touching every page of the region).
+///    Instead `carve_cursor/carve_end[class]` bump-carve it
+///    arithmetically; a fresh block's memory is first touched by the
+///    *application*, if ever.
+/// 2. **Central pointer cache**: freed blocks land in a per-class pointer
+///    stack (`cache`, no block writes); only overflow beyond
+///    [`CENTRAL_CACHE`] spills to the intrusive lists.
+/// 3. Pop order is cache → intrusive → carve → refill: recycled blocks
+///    are preferred over fresh carves (RSS-friendly), and the intrusive
+///    tier — the only one that touches block memory — is reached only
+///    when a class's recycled mass exceeds the cache, which steady churn
+///    never does.
 pub struct Slab {
-    /// `free_heads[i]` is the head of the free list for `SLAB_SIZE_CLASSES[i]`.
+    /// `free_heads[i]` is the head of the **intrusive overflow** free list
+    /// for `SLAB_SIZE_CLASSES[i]` — the only tier that reads/writes block
+    /// memory; reached only past `CENTRAL_CACHE` recycled blocks per class.
     free_heads: [Option<*mut FreeNode>; NUM_CLASSES],
+    /// Hot no-touch tier: per-class stacks of recycled block pointers.
+    cache: [[*mut u8; CENTRAL_CACHE]; NUM_CLASSES],
+    cache_len: [u16; NUM_CLASSES],
+    /// Bump cursors into each class's active fresh region (`cursor == end`
+    /// = exhausted). Strides are `MIN_ALIGN`-aligned at refill time.
+    carve_cursor: [usize; NUM_CLASSES],
+    carve_end: [usize; NUM_CLASSES],
     /// Owning handles to the page regions we carved blocks from. Held alive so
     /// the memory stays mapped for the lifetime of the allocator.
     regions: Vec<system::Mapping>,
@@ -72,8 +110,58 @@ impl Slab {
     pub const fn new() -> Self {
         Self {
             free_heads: [None; NUM_CLASSES],
+            cache: [[core::ptr::null_mut(); CENTRAL_CACHE]; NUM_CLASSES],
+            cache_len: [0; NUM_CLASSES],
+            carve_cursor: [0; NUM_CLASSES],
+            carve_end: [0; NUM_CLASSES],
             regions: Vec::new(),
         }
+    }
+
+    /// Pop one block from the no-touch tiers: pointer cache first
+    /// (recycled), then the carve cursor (fresh, arithmetic only). `None`
+    /// means both are empty for this class — the caller tries the
+    /// intrusive overflow list, then refills.
+    #[inline]
+    fn pop_untouched(&mut self, class: usize) -> Option<*mut u8> {
+        let n = self.cache_len[class];
+        if n > 0 {
+            self.cache_len[class] = n - 1;
+            return Some(self.cache[class][(n - 1) as usize]);
+        }
+        None
+    }
+
+    /// Bump-carve one fresh block, if the class's active region has any.
+    #[inline]
+    fn pop_carve(&mut self, class: usize) -> Option<*mut u8> {
+        let cur = self.carve_cursor[class];
+        if cur == self.carve_end[class] {
+            return None;
+        }
+        let stride = align_up(SLAB_SIZE_CLASSES[class], lohalloc_core::MIN_ALIGN);
+        self.carve_cursor[class] = cur + stride;
+        Some(cur as *mut u8)
+    }
+
+    /// Pop one recycled block from the intrusive overflow list (the only
+    /// pop that touches block memory).
+    #[inline]
+    fn pop_intrusive(&mut self, class: usize) -> Option<*mut u8> {
+        let block = self.free_heads[class].take()?;
+        let node = unsafe { &mut *block };
+        self.free_heads[class] = node.next;
+        Some(block as *mut u8)
+    }
+
+    /// One pop across all tiers in preference order (cache → intrusive →
+    /// carve). Recycled-before-fresh keeps RSS bounded; the intrusive tier
+    /// sits before the carve so overflow mass drains instead of stranding.
+    #[inline]
+    fn pop_any(&mut self, class: usize) -> Option<*mut u8> {
+        self.pop_untouched(class)
+            .or_else(|| self.pop_intrusive(class))
+            .or_else(|| self.pop_carve(class))
     }
 
     /// Allocate a block of `size` bytes (rounded up to the nearest slab class),
@@ -96,15 +184,11 @@ impl Slab {
     pub fn alloc_class(&mut self, class: usize) -> Option<*mut u8> {
         debug_assert!(class < NUM_CLASSES);
         loop {
-            if let Some(block) = self.free_heads[class].take() {
-                // Pop the front of the free list. The block's `next` field
-                // holds the new head.
-                let node = unsafe { &mut *block };
-                self.free_heads[class] = node.next;
-                return Some(block as *mut u8);
+            if let Some(block) = self.pop_any(class) {
+                return Some(block);
             }
-            // Refill: map a region and slice it into blocks of the class
-            // size, then loop to pop (refill either added blocks or failed).
+            // Refill: map a region and point the class's carve cursor at it
+            // (no block threading — J3-slab), then loop to carve from it.
             self.refill(class, SLAB_SIZE_CLASSES[class])?;
         }
     }
@@ -117,11 +201,9 @@ impl Slab {
         let mut n = 0;
         let mut refilled = false;
         while n < out.len() {
-            match self.free_heads[class].take() {
+            match self.pop_any(class) {
                 Some(block) => {
-                    let node = unsafe { &mut *block };
-                    self.free_heads[class] = node.next;
-                    out[n] = block as *mut u8;
+                    out[n] = block;
                     n += 1;
                 }
                 None => {
@@ -130,6 +212,33 @@ impl Slab {
                     }
                     refilled = true;
                 }
+            }
+        }
+        n
+    }
+
+    /// Pop up to `out.len()` **recycled** blocks (cache + intrusive tiers
+    /// only — never the carve cursor, never a refill). Ladder 5 Phase 3:
+    /// this is the cross-stripe steal primitive. Under striped centrals, a
+    /// producer/consumer split (mt-xfree) migrates every freed block to the
+    /// consumer's stripe while the producer's stripe carves fresh segments
+    /// forever — recycled mass piles up unreachable. `lib.rs`'s miss path
+    /// now tries its own stripe's recycled tier, then *steals* from the
+    /// other stripes' recycled tiers (try_lock, one stripe at a time),
+    /// and only then carves fresh — recycled-anywhere beats fresh-anywhere.
+    pub fn alloc_batch_recycled(&mut self, class: usize, out: &mut [*mut u8]) -> usize {
+        debug_assert!(class < NUM_CLASSES);
+        let mut n = 0;
+        while n < out.len() {
+            match self
+                .pop_untouched(class)
+                .or_else(|| self.pop_intrusive(class))
+            {
+                Some(block) => {
+                    out[n] = block;
+                    n += 1;
+                }
+                None => break,
             }
         }
         n
@@ -158,7 +267,14 @@ impl Slab {
     /// `ptr` must be a block of exactly this class, not double-freed.
     pub unsafe fn dealloc_class(&mut self, ptr: *mut u8, class: usize) {
         debug_assert!(class < NUM_CLASSES);
-        // Push to front of free list.
+        // No-touch hot tier first (J3-slab); intrusive push only past
+        // CENTRAL_CACHE recycled blocks for this class.
+        let n = self.cache_len[class];
+        if (n as usize) < CENTRAL_CACHE {
+            self.cache[class][n as usize] = ptr;
+            self.cache_len[class] = n + 1;
+            return;
+        }
         let node = ptr as *mut FreeNode;
         unsafe {
             (*node).next = self.free_heads[class].take();
@@ -203,16 +319,12 @@ impl Slab {
         try_register: &mut dyn FnMut(usize) -> bool,
     ) -> Option<(*mut u8, Option<usize>)> {
         debug_assert!(class < NUM_CLASSES);
-        if let Some(block) = self.free_heads[class].take() {
-            let node = unsafe { &mut *block };
-            self.free_heads[class] = node.next;
-            return Some((block as *mut u8, None));
+        if let Some(block) = self.pop_any(class) {
+            return Some((block, None));
         }
         let new_base = self.refill_segment(class, try_register)?;
-        let block = self.free_heads[class].take()?;
-        let node = unsafe { &mut *block };
-        self.free_heads[class] = node.next;
-        Some((block as *mut u8, Some(new_base)))
+        let block = self.pop_carve(class)?;
+        Some((block, Some(new_base)))
     }
 
     /// Batch counterpart of `alloc_class_headerless`, for the magazine
@@ -233,11 +345,9 @@ impl Slab {
         debug_assert!(class < NUM_CLASSES);
         let mut n = 0;
         while n < out.len() {
-            match self.free_heads[class].take() {
+            match self.pop_any(class) {
                 Some(block) => {
-                    let node = unsafe { &mut *block };
-                    self.free_heads[class] = node.next;
-                    out[n] = block as *mut u8;
+                    out[n] = block;
                     n += 1;
                 }
                 None => match self.refill_segment(class, try_register) {
@@ -278,28 +388,28 @@ impl Slab {
         let region = system::alloc_pages(SEGMENT_SIZE, SEGMENT_SIZE)?;
         let base = region.as_ptr();
         if !try_register(base as usize) {
-            // `region` drops here, munmapping it — never threaded onto any
-            // free list, so no headerless block is ever handed out from it.
+            // `region` drops here, munmapping it — never carved, so no
+            // headerless block is ever handed out from it.
             return None;
         }
         let stride = align_up(SLAB_SIZE_CLASSES[class], lohalloc_core::MIN_ALIGN);
         let n = SEGMENT_SIZE / stride;
 
-        let mut next = self.free_heads[class];
-        for i in (0..n).rev() {
-            let block = unsafe { base.add(i * stride) } as *mut FreeNode;
-            unsafe {
-                (*block).next = next;
-            }
-            next = Some(block);
-        }
-        self.free_heads[class] = next;
+        // J3-slab: point the class's carve cursor at the fresh segment
+        // instead of threading a FreeNode into every block (which touched
+        // — and faulted — every page of the segment at map time). Only
+        // called when every tier is empty, so no partially-carved segment
+        // is ever abandoned.
+        debug_assert_eq!(self.carve_cursor[class], self.carve_end[class]);
+        self.carve_cursor[class] = base as usize;
+        self.carve_end[class] = base as usize + n * stride;
         self.regions.push(region);
         Some(base as usize)
     }
 
-    /// Map a fresh region sized to hold several `class_size` blocks and thread
-    /// them all onto the free list for `class`.
+    /// Map a fresh region sized to hold several `class_size` blocks and
+    /// point the class's carve cursor at it (J3-slab: no block threading —
+    /// see the struct doc).
     fn refill(&mut self, class: usize, class_size: usize) -> Option<()> {
         // Grab ~64 KiB of blocks per refill (at least one page). Align block
         // size up to MIN_ALIGN so every block satisfies the global alignment
@@ -312,20 +422,11 @@ impl Slab {
         let usable = region.usable();
         let n = usable / stride;
 
-        // Thread every block onto the free list. (The pre-loop version of
-        // `alloc` skipped block 0 here on the assumption its recursion
-        // would pop it; the loop-based `alloc_class`/`alloc_batch` pop
-        // strictly from the list, so all `n` blocks must be threaded or
-        // block 0 leaks once per region.)
-        let mut next = self.free_heads[class];
-        for i in (0..n).rev() {
-            let block = unsafe { base.add(i * stride) } as *mut FreeNode;
-            unsafe {
-                (*block).next = next;
-            }
-            next = Some(block);
-        }
-        self.free_heads[class] = next;
+        // Only called when every tier (cache, intrusive, carve) is empty
+        // for this class, so no partially-carved region is abandoned.
+        debug_assert_eq!(self.carve_cursor[class], self.carve_end[class]);
+        self.carve_cursor[class] = base as usize;
+        self.carve_end[class] = base as usize + n * stride;
         self.regions.push(region);
         Some(())
     }

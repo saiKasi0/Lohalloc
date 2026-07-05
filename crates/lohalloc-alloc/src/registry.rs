@@ -13,28 +13,47 @@
 //! lookup is fully lock-free (plain atomic loads), since it runs on every
 //! headerless dealloc/realloc/usable-size call.
 //!
-//! Saturation (all `CAPACITY` slots taken) is a safe, silent degrade: a
+//! Saturation (probe bound hit — see [`PROBE_MAX`]) is a safe, silent degrade: a
 //! segment that can't be registered simply never round-trips through the
 //! headerless path — its blocks still work correctly via the ordinary
 //! header-based dealloc route (a registry miss falls through there).
 
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-/// Fixed slot count. 1024 entries at `slab::SEGMENT_SIZE` (64 KiB) each
-/// cover 64 MiB of live headerless slab memory before saturation — ample
-/// for the (bounded-live-set, region-count-capped) workloads this crate
-/// benchmarks against. Embedded directly in `Lohalloc` (itself often a
-/// `const`-initialized static, and sometimes stack-placed — e.g. a test's
-/// `let alloc = Lohalloc::new();`) as fixed arrays rather than lazily
-/// heap-allocated, so there is no first-use allocation or lock to reason
-/// about — the same const-array-repeat pattern `magazine.rs`/`buddy_mag.rs`
-/// use for their per-thread slot arrays. Deliberately kept small (~9 KiB,
-/// not the ~72 KiB an 8192-entry table would cost): a large embedded array
-/// here reproduced as a real stack-overflow SIGSEGV under `cargo test`'s
-/// parallel harness, which runs each test on its own (comparatively small)
-/// thread stack and had several `Lohalloc::new()` locals alive across
-/// nested/concurrent test calls.
-const CAPACITY: usize = 1024;
+/// Fixed slot count for the **segment** registry. 4096 entries at
+/// `slab::SEGMENT_SIZE` (64 KiB) each cover 256 MiB of live headerless
+/// slab memory before saturation. Ladder 5 Phase P found the previous
+/// 1024-entry table *actually saturating* on adv-mixed at 100k ops
+/// (~1500 live segments): every slab refill past that fell through to the
+/// System backend (an mmap per sub-16 KiB alloc!), and — worse — every
+/// registry **miss** lookup in the saturated table scanned all 1024 slots
+/// before giving up (no empty slot ever terminates the probe), measured by
+/// cachegrind as 45% of the whole program's D1 read misses (every buddy
+/// free probes this table first). Both fixed together: 4× capacity and
+/// [`PROBE_MAX`]-bounded probing.
+///
+/// Still embedded directly in `Lohalloc` (often a `const` static, and
+/// sometimes stack-placed — e.g. a test's `let alloc = Lohalloc::new();`)
+/// as fixed arrays rather than lazily heap-allocated, so there is no
+/// first-use allocation or lock to reason about. Size check: 4096 × 9 B =
+/// 36 KiB (an earlier ~72 KiB 8192-entry version reproduced a stack
+/// overflow under `cargo test`'s parallel harness — if instances-on-stack
+/// grow again, move the arrays behind a lazily-mmapped pointer instead of
+/// shrinking capacity).
+const SEGMENT_CAPACITY: usize = 4096;
+
+/// Fixed slot count for the **region** registry: 2048 × 4 MiB regions =
+/// 8 GiB of live buddy memory before saturation (~34 KiB embedded).
+const REGION_CAPACITY: usize = 2048;
+
+/// Probe-length bound for both tables (open addressing, linear probing).
+/// Bounds the *saturated/miss* path to 32 slot reads instead of a full
+/// table scan (see `SEGMENT_CAPACITY`'s doc for the measured incident);
+/// inserts give up after 32 occupied slots (statistically negligible below
+/// ~60% load with the multiplicative hash). A key placed by `insert` is
+/// always within `PROBE_MAX` of its home slot, so bounded lookups can
+/// never miss a present key.
+const PROBE_MAX: usize = 32;
 
 #[allow(clippy::declare_interior_mutable_const)]
 const EMPTY_KEY: AtomicUsize = AtomicUsize::new(0);
@@ -45,8 +64,8 @@ const EMPTY_VAL: AtomicU8 = AtomicU8::new(0);
 pub struct SegmentRegistry {
     /// `0` means empty; any registered segment base is guaranteed nonzero
     /// (real mmap addresses are never 0) and `SEGMENT_SIZE`-aligned.
-    keys: [AtomicUsize; CAPACITY],
-    vals: [AtomicU8; CAPACITY],
+    keys: [AtomicUsize; SEGMENT_CAPACITY],
+    vals: [AtomicU8; SEGMENT_CAPACITY],
 }
 
 impl Default for SegmentRegistry {
@@ -58,8 +77,8 @@ impl Default for SegmentRegistry {
 impl SegmentRegistry {
     pub const fn new() -> Self {
         Self {
-            keys: [EMPTY_KEY; CAPACITY],
-            vals: [EMPTY_VAL; CAPACITY],
+            keys: [EMPTY_KEY; SEGMENT_CAPACITY],
+            vals: [EMPTY_VAL; SEGMENT_CAPACITY],
         }
     }
 
@@ -69,8 +88,9 @@ impl SegmentRegistry {
     /// naive low-bits mask would collide on directly — the mix spreads
     /// those bits across the whole word before masking.
     #[inline]
-    fn slot_for(base: usize) -> usize {
-        (((base as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> 48) as usize & (CAPACITY - 1)
+    fn slot_for(base: usize, capacity: usize) -> usize {
+        debug_assert!(capacity.is_power_of_two());
+        (((base as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> 48) as usize & (capacity - 1)
     }
 
     /// Register `base` (a fresh segment's start address — must be nonzero
@@ -105,8 +125,8 @@ impl SegmentRegistry {
     #[must_use]
     pub fn insert(&self, base: usize, class: u8) -> bool {
         debug_assert!(base != 0, "segment base must be nonzero");
-        let mut idx = Self::slot_for(base);
-        for _ in 0..CAPACITY {
+        let mut idx = Self::slot_for(base, SEGMENT_CAPACITY);
+        for _ in 0..PROBE_MAX {
             let existing = self.keys[idx].load(Ordering::Acquire);
             if existing == base {
                 return true; // already registered
@@ -124,9 +144,9 @@ impl SegmentRegistry {
                     Err(_) => {} // lost a theoretical race; fall through and advance
                 }
             }
-            idx = (idx + 1) & (CAPACITY - 1);
+            idx = (idx + 1) & (SEGMENT_CAPACITY - 1);
         }
-        false // Saturated.
+        false // Probe bound hit: treat as saturated (see PROBE_MAX's doc).
     }
 
     /// Look up `base` (already masked down by the caller via `ptr &
@@ -135,8 +155,8 @@ impl SegmentRegistry {
     /// or a saturation-skipped segment) — the miss path.
     #[inline]
     pub fn lookup(&self, base: usize) -> Option<u8> {
-        let mut idx = Self::slot_for(base);
-        for _ in 0..CAPACITY {
+        let mut idx = Self::slot_for(base, SEGMENT_CAPACITY);
+        for _ in 0..PROBE_MAX {
             let k = self.keys[idx].load(Ordering::Acquire);
             if k == 0 {
                 return None;
@@ -144,7 +164,7 @@ impl SegmentRegistry {
             if k == base {
                 return Some(self.vals[idx].load(Ordering::Acquire));
             }
-            idx = (idx + 1) & (CAPACITY - 1);
+            idx = (idx + 1) & (SEGMENT_CAPACITY - 1);
         }
         None
     }
@@ -161,8 +181,8 @@ impl SegmentRegistry {
 /// effort": a block must only ever be freed into the stripe whose `Buddy`
 /// tracks its region's bitmap).
 ///
-/// Capacity is the shared `CAPACITY` (1024): at 4 MiB per region that
-/// covers 4 GiB of live buddy memory before saturation. Saturation is
+/// Capacity is [`REGION_CAPACITY`] (2048): at 4 MiB per region that
+/// covers 8 GiB of live buddy memory before saturation. Saturation is
 /// handled *at allocation time* — `Buddy::refill` registers a fresh region
 /// **before** carving it and fails the refill (unmapping the region) if
 /// registration fails, so no block from an unregistered region can ever
@@ -183,12 +203,12 @@ impl SegmentRegistry {
 /// doc derives from the ARM64 key-before-val SIGSEGV.
 pub struct RegionRegistry {
     /// `0` = empty; region bases are nonzero and `REGION_BYTES`-aligned.
-    keys: [AtomicUsize; CAPACITY],
+    keys: [AtomicUsize; REGION_CAPACITY],
     /// Owning `[Mutex<Buddy>]` stripe index.
-    stripes: [AtomicU8; CAPACITY],
+    stripes: [AtomicU8; REGION_CAPACITY],
     /// Address of the region's order map (`REGION_BYTES >> 14` order
     /// bytes, one per 16 KiB slot), or 0 for none.
-    maps: [AtomicUsize; CAPACITY],
+    maps: [AtomicUsize; REGION_CAPACITY],
 }
 
 impl Default for RegionRegistry {
@@ -200,9 +220,9 @@ impl Default for RegionRegistry {
 impl RegionRegistry {
     pub const fn new() -> Self {
         Self {
-            keys: [EMPTY_KEY; CAPACITY],
-            stripes: [EMPTY_VAL; CAPACITY],
-            maps: [EMPTY_KEY; CAPACITY],
+            keys: [EMPTY_KEY; REGION_CAPACITY],
+            stripes: [EMPTY_VAL; REGION_CAPACITY],
+            maps: [EMPTY_KEY; REGION_CAPACITY],
         }
     }
 
@@ -214,8 +234,8 @@ impl RegionRegistry {
     #[must_use]
     pub fn insert(&self, base: usize, stripe: u8, map: usize) -> bool {
         debug_assert!(base != 0, "region base must be nonzero");
-        let mut idx = SegmentRegistry::slot_for(base);
-        for _ in 0..CAPACITY {
+        let mut idx = SegmentRegistry::slot_for(base, REGION_CAPACITY);
+        for _ in 0..PROBE_MAX {
             let existing = self.keys[idx].load(Ordering::Acquire);
             if existing == base {
                 return true; // already registered
@@ -231,9 +251,9 @@ impl RegionRegistry {
                     Err(_) => {} // lost a theoretical race; advance
                 }
             }
-            idx = (idx + 1) & (CAPACITY - 1);
+            idx = (idx + 1) & (REGION_CAPACITY - 1);
         }
-        false // Saturated.
+        false // Probe bound hit: treat as saturated (see PROBE_MAX's doc).
     }
 
     /// Owning stripe for `base` (already masked to the region base by the
@@ -246,8 +266,8 @@ impl RegionRegistry {
     /// `(stripe, order_map_base)` for `base`, or `None` on a miss.
     #[inline]
     pub fn lookup_full(&self, base: usize) -> Option<(u8, usize)> {
-        let mut idx = SegmentRegistry::slot_for(base);
-        for _ in 0..CAPACITY {
+        let mut idx = SegmentRegistry::slot_for(base, REGION_CAPACITY);
+        for _ in 0..PROBE_MAX {
             let k = self.keys[idx].load(Ordering::Acquire);
             if k == 0 {
                 return None;
@@ -258,9 +278,97 @@ impl RegionRegistry {
                     self.maps[idx].load(Ordering::Acquire),
                 ));
             }
-            idx = (idx + 1) & (CAPACITY - 1);
+            idx = (idx + 1) & (REGION_CAPACITY - 1);
         }
         None
+    }
+}
+
+/// Fixed slot count for the **arena chunk** set: an arena maps at most
+/// `arena::MAX_CHUNKS` (32) chunks per instance, so 256 slots keep the
+/// load factor at 12.5% — a `PROBE_MAX`-length cluster is statistically
+/// impossible, i.e. `insert` cannot fail in practice (the `bool` return
+/// exists for the same defensive fallthrough discipline as the other
+/// tables). 2 KiB embedded.
+const ARENA_CHUNK_CAPACITY: usize = 256;
+
+/// Insert-only, lock-free **arena chunk** membership set (Ladder 5
+/// headerless Arena).
+///
+/// Key-only — a hit answers the single question the dealloc side asks:
+/// "is this pointer inside a bump-arena chunk?" (in which case `free` is a
+/// no-op and no header may be read: headerless arena blocks have none, and
+/// `ptr - HEADER_SIZE` may be a neighboring live block's tail). Chunks are
+/// `arena::CHUNK_BYTES`-aligned and -sized, so `ptr & !(CHUNK_BYTES - 1)`
+/// recovers the chunk base — the same mask-probe design as the other two
+/// tables, same publish discipline (key CAS is the only word; there is no
+/// payload to order against), same single-writer context (inserted under
+/// `Lohalloc`'s `arena` Mutex on the chunk-creating slow path, before the
+/// chunk is published to the lock-free fast path or any block from it is
+/// returned).
+///
+/// No false positives across backends: mappings are disjoint, so a
+/// slab/buddy/System pointer masked to `CHUNK_BYTES` can only equal a
+/// registered chunk base if it lay inside that chunk — impossible.
+pub struct ArenaChunkRegistry {
+    /// `0` = empty; chunk bases are nonzero and `CHUNK_BYTES`-aligned.
+    keys: [AtomicUsize; ARENA_CHUNK_CAPACITY],
+}
+
+impl Default for ArenaChunkRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ArenaChunkRegistry {
+    pub const fn new() -> Self {
+        Self {
+            keys: [EMPTY_KEY; ARENA_CHUNK_CAPACITY],
+        }
+    }
+
+    /// Register `base` (a fresh chunk's `CHUNK_BYTES`-aligned start).
+    /// Returns `false` only on a probe-bound hit (see
+    /// [`ARENA_CHUNK_CAPACITY`] — unreachable in practice); the caller
+    /// must then not serve headerless blocks from the chunk.
+    #[must_use]
+    pub fn insert(&self, base: usize) -> bool {
+        debug_assert!(base != 0, "chunk base must be nonzero");
+        let mut idx = SegmentRegistry::slot_for(base, ARENA_CHUNK_CAPACITY);
+        for _ in 0..PROBE_MAX {
+            let existing = self.keys[idx].load(Ordering::Acquire);
+            if existing == base {
+                return true;
+            }
+            if existing == 0 {
+                match self.keys[idx].compare_exchange(0, base, Ordering::Release, Ordering::Relaxed)
+                {
+                    Ok(_) => return true,
+                    Err(actual) if actual == base => return true,
+                    Err(_) => {}
+                }
+            }
+            idx = (idx + 1) & (ARENA_CHUNK_CAPACITY - 1);
+        }
+        false
+    }
+
+    /// Is `base` (pre-masked by the caller) a registered arena chunk?
+    #[inline]
+    pub fn contains(&self, base: usize) -> bool {
+        let mut idx = SegmentRegistry::slot_for(base, ARENA_CHUNK_CAPACITY);
+        for _ in 0..PROBE_MAX {
+            let k = self.keys[idx].load(Ordering::Acquire);
+            if k == 0 {
+                return false;
+            }
+            if k == base {
+                return true;
+            }
+            idx = (idx + 1) & (ARENA_CHUNK_CAPACITY - 1);
+        }
+        false
     }
 }
 
@@ -282,11 +390,31 @@ mod tests {
 
     #[test]
     fn region_registry_saturation_reports_failure() {
+        // With PROBE_MAX-bounded probing, inserts start failing somewhere
+        // between ~60% load and full capacity (clustering-dependent) —
+        // what matters is that failure is reported (never a panic/hang)
+        // and that every insert that reported success still resolves.
         let r = RegionRegistry::new();
-        for i in 0..CAPACITY {
-            assert!(r.insert(0x1000_0000 + i * 0x40_0000, (i % 4) as u8, i));
+        let mut inserted = Vec::new();
+        let mut saturated = false;
+        for i in 0..2 * REGION_CAPACITY {
+            let base = 0x1000_0000 + i * 0x40_0000;
+            if r.insert(base, (i % 4) as u8, i) {
+                inserted.push((base, (i % 4) as u8, i));
+            } else {
+                saturated = true;
+                break;
+            }
         }
-        assert!(!r.insert(0x1000_0000 + CAPACITY * 0x40_0000, 0, 0));
+        assert!(saturated, "2x capacity worth of inserts must saturate");
+        assert!(
+            inserted.len() >= REGION_CAPACITY / 2,
+            "saturated far too early: {} inserts",
+            inserted.len()
+        );
+        for &(base, stripe, map) in &inserted {
+            assert_eq!(r.lookup_full(base), Some((stripe, map)));
+        }
     }
 
     #[test]
@@ -321,7 +449,7 @@ mod tests {
     #[test]
     fn many_distinct_segments_all_resolve() {
         let r = SegmentRegistry::new();
-        // Well under CAPACITY so no saturation; bases spaced by
+        // Well under SEGMENT_CAPACITY so no saturation; bases spaced by
         // SEGMENT_SIZE (64 KiB) as real segments would be.
         for i in 0..500usize {
             let base = 0x1000_0000 + i * 0x1_0000;
@@ -335,24 +463,35 @@ mod tests {
 
     #[test]
     fn saturation_reports_failure_not_panic() {
-        // Fill the table completely, then a further insert must not panic
-        // (the loop must terminate after CAPACITY probes even with no
-        // empty slot left) and must report failure so the caller knows not
-        // to serve headerless blocks from that segment.
+        // Insert until the PROBE_MAX-bounded table reports saturation:
+        // failure must be a `false` return (never a panic or an unbounded
+        // scan), every successful insert must still resolve, and a miss
+        // lookup on the saturated table must terminate within PROBE_MAX
+        // (this bounded-miss property is exactly what Ladder 5 added —
+        // the old full-scan miss cost 45% of adv-mixed's D1 read misses).
         let r = SegmentRegistry::new();
-        for i in 0..CAPACITY {
+        let mut inserted = Vec::new();
+        let mut saturated = false;
+        for i in 0..2 * SEGMENT_CAPACITY {
             let base = 0x1000_0000 + i * 0x1_0000;
-            assert!(r.insert(base, 1));
+            if r.insert(base, (i % 12) as u8) {
+                inserted.push((base, (i % 12) as u8));
+            } else {
+                saturated = true;
+                break;
+            }
         }
-        // One more, past capacity — must return false, not panic or hang.
-        assert!(!r.insert(0x1000_0000 + CAPACITY * 0x1_0000, 1));
-        // A key that was never inserted (and can't be, table is full):
-        // lookup must still terminate and report a miss (or, since the
-        // table is full, could in principle find a false match only if
-        // hash collision landed exactly there — vanishingly unlikely with
-        // this key spacing, and irrelevant to what's being tested: that
-        // the loop terminates).
-        let _ = r.lookup(0xDEAD_0000);
+        assert!(saturated, "2x capacity worth of inserts must saturate");
+        assert!(
+            inserted.len() >= SEGMENT_CAPACITY / 2,
+            "saturated far too early: {} inserts",
+            inserted.len()
+        );
+        for &(base, class) in &inserted {
+            assert_eq!(r.lookup(base), Some(class));
+        }
+        // A key that was never inserted: lookup must terminate and miss.
+        assert_eq!(r.lookup(0xDEAD_0000), None);
     }
 
     #[test]
@@ -367,7 +506,7 @@ mod tests {
 
         let registry = Arc::new(SegmentRegistry::new());
         let done = Arc::new(AtomicBool::new(false));
-        const N: usize = 700; // well under CAPACITY, no saturation noise
+        const N: usize = 700; // well under SEGMENT_CAPACITY, no saturation noise
 
         let readers: Vec<_> = (0..4)
             .map(|_| {

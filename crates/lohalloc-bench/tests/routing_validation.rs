@@ -136,8 +136,10 @@ fn adv_exhaust_forces_fallthrough_once_arena_full() {
 
     // The arena now CHAINS 1 MiB chunks up to a 32 MiB cap (it used to be a
     // single 1 MiB region), so exhausting it takes > 32 MiB of live,
-    // never-freed traffic: 140_000 × (208B + 48B header) ≈ 36 MiB.
-    let ptrs = workloads::workload_exhaust_no_free(&recording, hashes::W_ADV_EXHAUST, 140_000);
+    // never-freed traffic. Since Ladder 5's headerless Arena, a
+    // load()-booted instance's arena blocks carry NO 48-byte header, so
+    // each allocation consumes exactly 208 B: 170_000 × 208 B ≈ 35 MiB.
+    let ptrs = workloads::workload_exhaust_no_free(&recording, hashes::W_ADV_EXHAUST, 170_000);
 
     let arena_frac = recording.fraction_served_by(Backend::Arena);
     assert!(

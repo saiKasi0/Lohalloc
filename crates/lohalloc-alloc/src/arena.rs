@@ -46,6 +46,13 @@ use lohalloc_core::{align_up, round_up_pow2, MIN_ALIGN};
 /// enough that we don't waste too much memory if a cluster is small.
 const DEFAULT_CHUNK_SIZE: usize = 1 << 20; // 1 MiB
 
+/// Ladder 5 headerless Arena: the chunk size/alignment the dealloc side's
+/// mask-probe depends on (`ptr & !(CHUNK_BYTES - 1)` recovers a
+/// default-sized chunk's base — chunks are mapped aligned to their size,
+/// see the module doc). Only default-sized chunks are ever registered for
+/// headerless serving; `with_capacity` arenas (tests) keep headers.
+pub(crate) const CHUNK_BYTES: usize = DEFAULT_CHUNK_SIZE;
+
 /// Maximum number of chained chunks (32 × 1 MiB = 32 MiB by default). At the
 /// cap, `alloc` returns `None` and the caller falls through to size-based
 /// routing — the pre-chaining behavior, just 32× later.
@@ -247,6 +254,21 @@ impl BumpArena {
     pub(crate) fn exhausted_after_failed(&self, size: usize, align: usize) -> bool {
         self.chunks.len() == MAX_CHUNKS
             && size.saturating_add(align.max(MIN_ALIGN)) <= self.chunk_size
+    }
+
+    /// Base address of every currently mapped chunk, for the headerless
+    /// chunk registry (`lib.rs` registers them — idempotently, ≤
+    /// [`MAX_CHUNKS`] entries — on the chunk-creating slow path, before
+    /// the current chunk is (re)published to the lock-free fast path).
+    pub(crate) fn chunk_bases(&self) -> impl Iterator<Item = usize> + '_ {
+        self.chunks.iter().map(|c| c.base as usize)
+    }
+
+    /// Whether every chunk is exactly [`CHUNK_BYTES`] (default-sized) —
+    /// the mask-probe precondition for headerless serving.
+    pub(crate) fn chunks_are_default_sized(&self) -> bool {
+        self.chunk_size == DEFAULT_CHUNK_SIZE
+            && self.chunks.iter().all(|c| c.capacity <= CHUNK_BYTES)
     }
 
     /// Total usable capacity across all currently mapped chunks (bytes).

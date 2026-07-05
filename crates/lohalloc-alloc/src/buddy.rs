@@ -13,11 +13,22 @@
 //! The per-region bitmap (one bit per (order, block)) is the source of
 //! truth for freeness. On top sit two access tiers: a per-order
 //! out-of-line pointer cache (the hot tier — freeing/allocating through it
-//! never reads or writes the block's own cold memory) and the intrusive
-//! doubly-linked lists (overflow tier). Frees do **no** merging on the hot
-//! path; merging happens *only* incrementally, in [`Buddy::merge_drain_row`],
-//! when a cache row fills (amortized: one bounded drain of half the row per
-//! `ORDER_CACHE/2` frees at that order). The eager-merge-then-resplit
+//! never reads or writes the block's own cold memory) and an overflow
+//! tier. Since Ladder 5 J3-OOB the overflow tier is **also out-of-band**
+//! for orders >= [`OOB_MIN_ORDER`] (16 KiB — all routed buddy traffic):
+//! per-region u16 slot-link arrays in the metadata carve plus per-order
+//! lists of regions-with-free-blocks, so *no tier ever touches block
+//! memory* at those orders. Phase P measured why this matters: on a
+//! workload that never writes its allocations (adv-mixed), the old
+//! intrusive `FreeNode` spill was the allocator's only touch of user
+//! pages — each one a cold cache/dTLB miss, a page fault on first touch,
+//! and a 2 MiB residency grant under THP `[always]` (2.1 GiB RSS vs
+//! jemalloc's 21 MB at 100k ops, 15× wall). Orders below `OOB_MIN_ORDER`
+//! (reachable only via the slab-exhausted fallthrough and direct test use)
+//! keep the intrusive doubly-linked lists. Frees do **no** merging on the
+//! hot path; merging happens *only* incrementally, in
+//! [`Buddy::merge_drain_row`], when a cache row fills (amortized: one
+//! bounded drain of half the row per `ORDER_CACHE/2` frees at that order). The eager-merge-then-resplit
 //! metadata thrash of a naive design (measured: 3.75% LL miss rate vs
 //! jemalloc's 0.46% on the churn benchmark) is gone, and under steady churn
 //! frees at an order feed the next alloc at that order directly.
@@ -136,8 +147,35 @@ const ORDER_MAP_SLOTS: usize = REGION_BYTES >> (MIN_BLOCK_SHIFT + MIN_HEADERLESS
 /// metadata carve.
 const ORDER_MAP_WORDS: usize = ORDER_MAP_SLOTS.div_ceil(8);
 
-/// One region's full out-of-band metadata: free bitmap + order map.
-const METADATA_WORDS: usize = BITMAP_WORDS + ORDER_MAP_WORDS;
+/// Ladder 5 J3-OOB: out-of-band free-list links for blocks of order >=
+/// [`OOB_MIN_ORDER`]. One `u16` prev + one `u16` next per order-map granule
+/// (16 KiB), stored in the region's metadata carve — so linking/unlinking a
+/// free block never reads or writes the block itself (the intrusive
+/// `FreeNode` touch was Phase P's measured adv-mixed killer: cold-block
+/// cache/dTLB misses per list op, and each 16-byte write faulting a page —
+/// a 2 MiB page under THP `[always]`). Values use a `slot + 1` encoding
+/// (`0` = none) so fresh, kernel-zeroed metadata is a valid empty state
+/// with no init pass. A granule belongs to at most one free block at one
+/// order at a time (the bitmap is the source of truth and a free block
+/// exists at exactly one order), so one shared link array serves every OOB
+/// order simultaneously.
+const LINK_WORDS: usize = (ORDER_MAP_SLOTS * 2 * core::mem::size_of::<u16>()).div_ceil(8);
+
+/// One region's full out-of-band metadata: free bitmap + order map +
+/// free-list links (J3-OOB).
+const METADATA_WORDS: usize = BITMAP_WORDS + ORDER_MAP_WORDS + LINK_WORDS;
+
+/// Smallest order whose free blocks are tracked out-of-band (J3-OOB): the
+/// order-map granule (16 KiB). Routing only sends sub-16 KiB sizes to Buddy
+/// via the rare slab-exhausted fallthrough (plus direct unit-test use), so
+/// orders below this keep the intrusive in-block `FreeNode` overflow lists —
+/// tracking them out-of-band would need `MIN_BLOCK`-granularity links
+/// (256 K slots, ~25% metadata overhead per region) for traffic that
+/// essentially never occurs.
+const OOB_MIN_ORDER: usize = MIN_HEADERLESS_ORDER;
+
+/// Number of out-of-band-tracked orders (`OOB_MIN_ORDER..=MAX_ORDER`).
+const OOB_ORDERS: usize = NUM_ORDERS - OOB_MIN_ORDER;
 
 /// Order-map slot index for a block address inside its region.
 #[inline]
@@ -213,6 +251,23 @@ struct Region {
     /// cross-thread hand-off is ordered by pointer publication, the atomic
     /// keeps it TSAN-clean and UB-free).
     order_map: *mut u8,
+    /// J3-OOB: `ORDER_MAP_SLOTS` u16 `prev` entries followed by
+    /// `ORDER_MAP_SLOTS` u16 `next` entries (see `LINK_WORDS`), carved
+    /// after the order map in the same metadata block. `slot + 1`
+    /// encoding, `0` = none.
+    links: *mut u16,
+    /// J3-OOB: head/tail of this region's free-slot list per OOB order
+    /// (`oob_head[order - OOB_MIN_ORDER]`, `slot + 1` encoding, `0` =
+    /// empty). The tail exists so the drain can park unmergeable blocks at
+    /// the cold end instead of re-examining them on the next drain.
+    oob_head: [u16; OOB_ORDERS],
+    oob_tail: [u16; OOB_ORDERS],
+    /// J3-OOB: prev/next *region base addresses* on the owning `Buddy`'s
+    /// per-order region list (`0` = none). Base addresses, not `regions`
+    /// indices — `refill`'s sorted insert shifts indices, but bases are
+    /// stable for the region's lifetime.
+    rl_prev: [usize; OOB_ORDERS],
+    rl_next: [usize; OOB_ORDERS],
     _mapping: system::Mapping,
 }
 
@@ -255,20 +310,75 @@ impl Region {
     fn bitmap_words(&self) -> &[u64] {
         unsafe { core::slice::from_raw_parts(self.bitmap, BITMAP_WORDS) }
     }
+
+    // J3-OOB link-array accessors (`slot + 1` encoding, `0` = none). The
+    // arrays live in the metadata carve, never in block memory.
+    #[inline]
+    fn link_prev(&self, slot: usize) -> u16 {
+        debug_assert!(slot < ORDER_MAP_SLOTS);
+        unsafe { *self.links.add(slot) }
+    }
+    #[inline]
+    fn set_link_prev(&mut self, slot: usize, v: u16) {
+        debug_assert!(slot < ORDER_MAP_SLOTS);
+        unsafe { *self.links.add(slot) = v };
+    }
+    #[inline]
+    fn link_next(&self, slot: usize) -> u16 {
+        debug_assert!(slot < ORDER_MAP_SLOTS);
+        unsafe { *self.links.add(ORDER_MAP_SLOTS + slot) }
+    }
+    #[inline]
+    fn set_link_next(&mut self, slot: usize, v: u16) {
+        debug_assert!(slot < ORDER_MAP_SLOTS);
+        unsafe { *self.links.add(ORDER_MAP_SLOTS + slot) = v };
+    }
 }
 
 /// Number of buddy orders (compile-time constant so `new()` can be const).
 const NUM_ORDERS: usize = MAX_ORDER + 1;
 
-/// Per-order out-of-line pointer-stack capacity (see `cache` field).
+/// Per-order out-of-line pointer-stack capacity (see `cache` field) —
+/// sub-OOB orders only since the Ladder 5 single-tier rework.
 const ORDER_CACHE: usize = 32;
+
+/// J3-OOB merge-drain trigger: when an OOB order's list length crosses
+/// this, `free_order` drains half of it through `merge_up` (mirrors the
+/// old cache-row-overflow trigger, same amortization).
+const OOB_DRAIN_AT: u32 = 32;
 
 /// One buddy allocator instance.
 pub struct Buddy {
-    /// `free_lists[o]` is the head of the doubly-linked free list for
-    /// blocks of order `o` (null = empty). The *overflow* tier — the hot
-    /// path goes through `cache` and never touches block memory.
+    /// `free_lists[o]` is the head of the doubly-linked **intrusive** free
+    /// list for blocks of order `o` (null = empty) — the overflow tier for
+    /// orders below [`OOB_MIN_ORDER`] only (J3-OOB: orders >= 16 KiB
+    /// overflow to the out-of-band region lists instead and never touch
+    /// block memory). The hot path goes through `cache` either way.
     free_lists: [*mut FreeNode; NUM_ORDERS],
+    /// J3-OOB: head *region base* of the per-order list of regions holding
+    /// at least one out-of-band-tracked free block at that order (`0` =
+    /// none). Together with each region's `oob_head`/`links`, this replaces
+    /// the intrusive overflow list for orders >= `OOB_MIN_ORDER`: alloc
+    /// pops head region → head slot; free pushes a slot and links the
+    /// region in on its empty→nonempty edge.
+    oob_region_heads: [usize; OOB_ORDERS],
+    /// J3-OOB: exact count of blocks on the out-of-band lists per order
+    /// (invariant checking / introspection only — NOT the drain trigger,
+    /// see `oob_pending`).
+    oob_len: [u32; OOB_ORDERS],
+    /// J3-OOB merge-drain trigger: pushes at this order since the last
+    /// drain. The drain must key on *recent free pressure*, never on the
+    /// standing list length: with a growing live set most free blocks'
+    /// buddies are live (unmergeable), so the standing mass never shrinks
+    /// — a length-based trigger (the first version of this code) fired a
+    /// full 16-block drain on EVERY free once the list crossed the
+    /// threshold, endlessly re-examining the same unmergeable blocks
+    /// (measured: 76% of adv-mixed's instructions in the buddy free
+    /// machinery, ~10 list pops per op). Push-count triggering restores
+    /// the old cache-row amortization exactly: each freed block is
+    /// examined for merging ~once, and tail-parked mass is only ever
+    /// revisited by allocation pops.
+    oob_pending: [u32; OOB_ORDERS],
     /// Per-order out-of-line pointer stacks: the hot free/alloc tier.
     /// Freed block addresses are recorded here (plus their bitmap bit)
     /// WITHOUT writing a `FreeNode` into the freed block itself — under
@@ -307,6 +417,9 @@ impl Buddy {
     pub const fn new() -> Self {
         Self {
             free_lists: [core::ptr::null_mut(); NUM_ORDERS],
+            oob_region_heads: [0; OOB_ORDERS],
+            oob_len: [0; OOB_ORDERS],
+            oob_pending: [0; OOB_ORDERS],
             cache: [[core::ptr::null_mut(); ORDER_CACHE]; NUM_ORDERS],
             cache_len: [0; NUM_ORDERS],
             regions: Vec::new(),
@@ -433,9 +546,15 @@ impl Buddy {
         debug_assert!(order <= MAX_ORDER);
 
         loop {
-            // Find the smallest order >= `order` with a free block.
+            // Find the smallest order >= `order` with a free block in any
+            // tier: pointer cache, OOB region lists (orders >=
+            // OOB_MIN_ORDER), or intrusive list (orders below).
             let mut o = order;
-            while o <= MAX_ORDER && self.cache_len[o] == 0 && self.free_lists[o].is_null() {
+            while o <= MAX_ORDER
+                && self.cache_len[o] == 0
+                && self.free_lists[o].is_null()
+                && (o < OOB_MIN_ORDER || self.oob_region_heads[o - OOB_MIN_ORDER] == 0)
+            {
                 o += 1;
             }
             if o > MAX_ORDER {
@@ -457,12 +576,16 @@ impl Buddy {
                 continue;
             }
 
-            // Pop a block at order `o`: cache first (block memory untouched),
-            // intrusive list otherwise.
+            // Pop a block at order `o`: cache first (block memory
+            // untouched), then the out-of-band tier (also untouched,
+            // J3-OOB), intrusive list last (orders below OOB_MIN_ORDER
+            // only).
             let block: *mut u8 = if self.cache_len[o] > 0 {
                 let n = self.cache_len[o] - 1;
                 self.cache_len[o] = n;
                 self.cache[o][n as usize]
+            } else if o >= OOB_MIN_ORDER && self.oob_region_heads[o - OOB_MIN_ORDER] != 0 {
+                self.oob_pop(o).expect("nonempty OOB region list must pop")
             } else {
                 let head = self.free_lists[o];
                 unsafe { self.unlink(head, o) };
@@ -518,6 +641,22 @@ impl Buddy {
             );
             return; // release mode: leak rather than corrupt the lists
         };
+        if order >= OOB_MIN_ORDER {
+            // Single-tier OOB path: push (metadata only), then drain when
+            // the order's list crosses the trigger. Push-first is safe
+            // here (unlike the cache path below): a pushed block IS in
+            // its tier, so the drain can never unlink a phantom — and it
+            // means the just-freed block is immediately merge-eligible.
+            self.regions[region_idx].set_free_bit(ptr as usize, order);
+            self.oob_push(ptr, order, region_idx);
+            let oi = order - OOB_MIN_ORDER;
+            self.oob_pending[oi] += 1;
+            if self.oob_pending[oi] >= OOB_DRAIN_AT {
+                self.oob_pending[oi] = 0;
+                self.oob_drain(order, (OOB_DRAIN_AT / 2) as usize);
+            }
+            return;
+        }
         // On a full row, merge-drain half of it BEFORE marking `ptr` free:
         // draining runs `merge_up`, and a bit-set block that is in no tier
         // yet would get `unlink`ed as a phantom list node (reading garbage
@@ -537,12 +676,18 @@ impl Buddy {
     /// spilling to the intrusive list on overflow. Sets the bitmap bit.
     fn stash_free(&mut self, ptr: *mut u8, order: usize, region_idx: usize) {
         self.regions[region_idx].set_free_bit(ptr as usize, order);
-        if (self.cache_len[order] as usize) < ORDER_CACHE {
+        if order >= OOB_MIN_ORDER {
+            // J3-OOB single tier: metadata writes only, the block itself
+            // stays untouched, and the cache rows stay empty at these
+            // orders (which is what keeps `remove_free`'s cache scan free
+            // during merges — `cache_len` is 0, the loop never runs).
+            self.oob_push(ptr, order, region_idx);
+        } else if (self.cache_len[order] as usize) < ORDER_CACHE {
             self.cache[order][self.cache_len[order] as usize] = ptr;
             self.cache_len[order] += 1;
         } else {
-            // Cache full: the *new* block spills straight to the list (one
-            // touch) rather than evicting cache entries.
+            // Sub-OOB orders (slab-exhausted fallthrough / direct test
+            // use): the old intrusive spill, one block touch.
             unsafe { self.push_list(ptr, order) };
         }
     }
@@ -564,7 +709,14 @@ impl Buddy {
                 return;
             }
         }
-        unsafe { self.unlink(ptr as *mut FreeNode, order) };
+        if order >= OOB_MIN_ORDER {
+            let region_idx = self
+                .region_index_of(ptr as usize)
+                .expect("free block outside every region");
+            self.oob_remove(ptr, order, region_idx);
+        } else {
+            unsafe { self.unlink(ptr as *mut FreeNode, order) };
+        }
     }
 
     /// Merge an in-hand block (bitmap bit already cleared, resident in no
@@ -625,10 +777,14 @@ impl Buddy {
             self.regions[region_idx].clear_free_bit(ptr as usize, order);
             let (addr, o) = unsafe { self.merge_up(ptr as usize, order, region_idx) };
             if o == order {
-                // No merge: park on the overflow list (one cold-block
-                // touch, amortized over the drain trigger).
+                // No merge: park on the overflow tier — out-of-band
+                // (no block touch) at OOB orders, intrusive below.
                 self.regions[region_idx].set_free_bit(addr, o);
-                unsafe { self.push_list(addr as *mut u8, o) };
+                if o >= OOB_MIN_ORDER {
+                    self.oob_push(addr as *mut u8, o, region_idx);
+                } else {
+                    unsafe { self.push_list(addr as *mut u8, o) };
+                }
             } else {
                 merged_any = true;
                 self.stash_free(addr as *mut u8, o, region_idx);
@@ -678,6 +834,205 @@ impl Buddy {
         }
     }
 
+    // ---- J3-OOB out-of-band free tracking (orders >= OOB_MIN_ORDER) -------
+    //
+    // These five methods replace `push_list`/`unlink` for OOB orders. All
+    // state lives in region metadata (link arrays, per-region heads) and in
+    // `Buddy` itself (per-order region-list heads) — free blocks are never
+    // read or written. All are plain field mutations on fixed-size,
+    // pre-mapped storage: no allocation can occur here (safe under the
+    // stripe lock per the standing reentrancy rule).
+
+    /// Push a free block onto its region's out-of-band slot list for
+    /// `order`, linking the region into the per-order region list on the
+    /// empty→nonempty edge. Does not touch bitmap bits (callers manage
+    /// bits, exactly like `push_list`).
+    fn oob_push(&mut self, ptr: *mut u8, order: usize, region_idx: usize) {
+        debug_assert!((OOB_MIN_ORDER..NUM_ORDERS).contains(&order));
+        let oi = order - OOB_MIN_ORDER;
+        let base = self.regions[region_idx].base as usize;
+        let slot = order_map_slot(ptr as usize, base);
+        let enc = (slot + 1) as u16;
+        let head = {
+            let r = &mut self.regions[region_idx];
+            let head = r.oob_head[oi];
+            r.set_link_prev(slot, 0);
+            r.set_link_next(slot, head);
+            if head != 0 {
+                r.set_link_prev((head - 1) as usize, enc);
+            } else {
+                r.oob_tail[oi] = enc;
+            }
+            r.oob_head[oi] = enc;
+            head
+        };
+        self.oob_len[oi] += 1;
+        if head == 0 {
+            self.region_list_link(region_idx, oi);
+        }
+    }
+
+    /// Like [`Self::oob_push`], but appends at the **tail**: the drain
+    /// parks unmergeable blocks here so the next drain examines fresh
+    /// frees (at the head) instead of re-scanning the same unmergeable
+    /// mass — the single-list equivalent of the old "park on the overflow
+    /// list, never back into the row being drained" rule.
+    fn oob_push_tail(&mut self, ptr: *mut u8, order: usize, region_idx: usize) {
+        debug_assert!((OOB_MIN_ORDER..NUM_ORDERS).contains(&order));
+        let oi = order - OOB_MIN_ORDER;
+        let base = self.regions[region_idx].base as usize;
+        let slot = order_map_slot(ptr as usize, base);
+        let enc = (slot + 1) as u16;
+        let was_empty = {
+            let r = &mut self.regions[region_idx];
+            let tail = r.oob_tail[oi];
+            r.set_link_next(slot, 0);
+            r.set_link_prev(slot, tail);
+            if tail != 0 {
+                r.set_link_next((tail - 1) as usize, enc);
+            } else {
+                r.oob_head[oi] = enc;
+            }
+            r.oob_tail[oi] = enc;
+            tail == 0
+        };
+        self.oob_len[oi] += 1;
+        if was_empty {
+            self.region_list_link(region_idx, oi);
+        }
+    }
+
+    /// Unlink a known-free block from its region's out-of-band slot list
+    /// for `order`, unlinking the region from the per-order region list on
+    /// the nonempty→empty edge. Does not touch bitmap bits.
+    fn oob_remove(&mut self, ptr: *mut u8, order: usize, region_idx: usize) {
+        debug_assert!((OOB_MIN_ORDER..NUM_ORDERS).contains(&order));
+        let oi = order - OOB_MIN_ORDER;
+        let base = self.regions[region_idx].base as usize;
+        let slot = order_map_slot(ptr as usize, base);
+        let now_empty = {
+            let r = &mut self.regions[region_idx];
+            let p = r.link_prev(slot);
+            let n = r.link_next(slot);
+            if p == 0 {
+                debug_assert_eq!(
+                    r.oob_head[oi],
+                    (slot + 1) as u16,
+                    "oob unlink of a non-listed slot"
+                );
+                r.oob_head[oi] = n;
+            } else {
+                r.set_link_next((p - 1) as usize, n);
+            }
+            if n == 0 {
+                r.oob_tail[oi] = p;
+            } else {
+                r.set_link_prev((n - 1) as usize, p);
+            }
+            r.oob_head[oi] == 0
+        };
+        debug_assert!(self.oob_len[oi] > 0);
+        self.oob_len[oi] -= 1;
+        if now_empty {
+            self.region_list_unlink(region_idx, oi);
+        }
+    }
+
+    /// Pop any free block at `order` from the out-of-band tier: head
+    /// region → head slot. Returns `None` when no region holds a free
+    /// block at this order. Does not touch bitmap bits.
+    fn oob_pop(&mut self, order: usize) -> Option<*mut u8> {
+        debug_assert!((OOB_MIN_ORDER..NUM_ORDERS).contains(&order));
+        let oi = order - OOB_MIN_ORDER;
+        let head_base = self.oob_region_heads[oi];
+        if head_base == 0 {
+            return None;
+        }
+        let region_idx = self
+            .region_index_of(head_base)
+            .expect("oob region-list head must be a mapped region");
+        let enc = self.regions[region_idx].oob_head[oi];
+        debug_assert!(enc != 0, "region on the order list with an empty slot list");
+        let slot = (enc - 1) as usize;
+        let ptr = (head_base + (slot << (MIN_BLOCK_SHIFT + OOB_MIN_ORDER))) as *mut u8;
+        self.oob_remove(ptr, order, region_idx);
+        Some(ptr)
+    }
+
+    /// Drain up to `count` blocks from `order`'s out-of-band lists,
+    /// merging each upward and re-inserting the result — the J3-OOB
+    /// counterpart of [`Self::merge_drain_row`], with identical
+    /// amortization (bounded per call, triggered by [`OOB_DRAIN_AT`]).
+    /// Merged blocks land at their new order via `stash_free` (still
+    /// out-of-band at OOB orders); unmerged blocks are parked at the
+    /// **tail** so the next drain examines fresh frees instead of
+    /// re-scanning the same unmergeable mass. `merge_up`'s buddy unlinks
+    /// are O(1) here: at OOB orders the slot links are the only tier
+    /// (`remove_free`'s cache scan sees `cache_len == 0`).
+    fn oob_drain(&mut self, order: usize, count: usize) {
+        debug_assert!((OOB_MIN_ORDER..NUM_ORDERS).contains(&order));
+        for _ in 0..count {
+            let Some(ptr) = self.oob_pop(order) else {
+                break;
+            };
+            let Some(region_idx) = self.region_index_of(ptr as usize) else {
+                debug_assert!(false, "oob free block outside every region");
+                continue;
+            };
+            self.regions[region_idx].clear_free_bit(ptr as usize, order);
+            let (addr, o) = unsafe { self.merge_up(ptr as usize, order, region_idx) };
+            if o == order {
+                self.regions[region_idx].set_free_bit(addr, o);
+                self.oob_push_tail(addr as *mut u8, o, region_idx);
+            } else {
+                self.stash_free(addr as *mut u8, o, region_idx);
+            }
+        }
+    }
+
+    /// Link `regions[region_idx]` at the head of the per-order region list
+    /// (called on its slot list's empty→nonempty edge).
+    fn region_list_link(&mut self, region_idx: usize, oi: usize) {
+        let base = self.regions[region_idx].base as usize;
+        let head_base = self.oob_region_heads[oi];
+        {
+            let r = &mut self.regions[region_idx];
+            r.rl_prev[oi] = 0;
+            r.rl_next[oi] = head_base;
+        }
+        if head_base != 0 {
+            let hidx = self
+                .region_index_of(head_base)
+                .expect("region-list head must be a mapped region");
+            self.regions[hidx].rl_prev[oi] = base;
+        }
+        self.oob_region_heads[oi] = base;
+    }
+
+    /// Unlink `regions[region_idx]` from the per-order region list (called
+    /// on its slot list's nonempty→empty edge).
+    fn region_list_unlink(&mut self, region_idx: usize, oi: usize) {
+        let (base, prev_base, next_base) = {
+            let r = &self.regions[region_idx];
+            (r.base as usize, r.rl_prev[oi], r.rl_next[oi])
+        };
+        if prev_base == 0 {
+            debug_assert_eq!(self.oob_region_heads[oi], base, "region-list head mismatch");
+            self.oob_region_heads[oi] = next_base;
+        } else {
+            let pidx = self
+                .region_index_of(prev_base)
+                .expect("region-list prev must be a mapped region");
+            self.regions[pidx].rl_next[oi] = next_base;
+        }
+        if next_base != 0 {
+            let nidx = self
+                .region_index_of(next_base)
+                .expect("region-list next must be a mapped region");
+            self.regions[nidx].rl_prev[oi] = prev_base;
+        }
+    }
+
     /// Map a fresh `REGION_BYTES` region (aligned to `REGION_BYTES` so buddy
     /// arithmetic is exact) and carve it into top-order blocks on the cache
     /// tier. One `mmap` serves `REGION_BYTES / BUDDY_MAX` top-order blocks
@@ -690,7 +1045,7 @@ impl Buddy {
     /// Returns `(bitmap, order_map)` — one region's metadata carve. The
     /// order map lives immediately after the bitmap words (J1); both come
     /// zeroed from the batch `mmap`.
-    fn alloc_bitmap(&mut self) -> Option<(*mut u64, *mut u8)> {
+    fn alloc_bitmap(&mut self) -> Option<(*mut u64, *mut u8, *mut u16)> {
         let need_new_batch = match self.bitmap_batches.last() {
             Some(b) => b.used >= BITMAP_BATCH,
             None => true,
@@ -710,13 +1065,17 @@ impl Buddy {
         let ptr = unsafe { batch.base.add(batch.used * METADATA_WORDS) };
         batch.used += 1;
         let order_map = unsafe { ptr.add(BITMAP_WORDS) } as *mut u8;
-        Some((ptr, order_map))
+        // J3-OOB: link arrays right after the order map — u64-word aligned
+        // start, so the u16 accesses are trivially aligned. Kernel-zeroed,
+        // and `0` is the links' "none" encoding: no init pass needed.
+        let links = unsafe { ptr.add(BITMAP_WORDS + ORDER_MAP_WORDS) } as *mut u16;
+        Some((ptr, order_map, links))
     }
 
     fn refill(&mut self, register: &mut dyn FnMut(usize, usize) -> bool) -> Option<()> {
         let region = system::alloc_pages(REGION_BYTES, REGION_BYTES)?;
         let base = region.as_ptr();
-        let (bitmap, order_map) = self.alloc_bitmap()?;
+        let (bitmap, order_map, links) = self.alloc_bitmap()?;
         // Register the region BEFORE carving it into blocks: once a block
         // has been handed out, its eventual free must be able to resolve
         // the region (striped callers: to the owning stripe; headerless
@@ -740,6 +1099,11 @@ impl Buddy {
                 base,
                 bitmap,
                 order_map,
+                links,
+                oob_head: [0; OOB_ORDERS],
+                oob_tail: [0; OOB_ORDERS],
+                rl_prev: [0; OOB_ORDERS],
+                rl_next: [0; OOB_ORDERS],
                 _mapping: region,
             },
         );
@@ -832,6 +1196,59 @@ impl Buddy {
                 );
                 free_entries += 1;
             }
+        }
+        // J3-OOB tier: walk every per-order region list and each region's
+        // slot list, checking link coherence and bitmap agreement. Also
+        // assert the intrusive lists stay empty at OOB orders — nothing
+        // may push there anymore.
+        for o in OOB_MIN_ORDER..NUM_ORDERS {
+            assert!(
+                self.free_lists[o].is_null(),
+                "intrusive list non-empty at OOB order {o}"
+            );
+            assert_eq!(
+                self.cache_len[o], 0,
+                "cache row non-empty at OOB order {o} (single-tier invariant)"
+            );
+            let oi = o - OOB_MIN_ORDER;
+            let mut oob_walked = 0usize;
+            let mut rbase = self.oob_region_heads[oi];
+            let mut prev_rbase = 0usize;
+            while rbase != 0 {
+                let ridx = self
+                    .region_index_for_test(rbase)
+                    .expect("oob region-list entry outside every region");
+                let r = &self.regions[ridx];
+                assert_eq!(
+                    r.rl_prev[oi], prev_rbase,
+                    "region-list prev broken at order {o}"
+                );
+                let mut enc = r.oob_head[oi];
+                assert!(enc != 0, "region on order-{o} list with empty slot list");
+                let mut prev_enc = 0u16;
+                let mut last_enc = 0u16;
+                while enc != 0 {
+                    let slot = (enc - 1) as usize;
+                    assert_eq!(r.link_prev(slot), prev_enc, "slot prev broken at order {o}");
+                    let addr = rbase + (slot << (MIN_BLOCK_SHIFT + OOB_MIN_ORDER));
+                    assert!(
+                        r.is_free_bit(addr, o),
+                        "oob free slot at order {o} has no bitmap bit"
+                    );
+                    free_entries += 1;
+                    oob_walked += 1;
+                    prev_enc = enc;
+                    last_enc = enc;
+                    enc = r.link_next(slot);
+                }
+                assert_eq!(r.oob_tail[oi], last_enc, "tail mismatch at order {o}");
+                prev_rbase = rbase;
+                rbase = r.rl_next[oi];
+            }
+            assert_eq!(
+                self.oob_len[oi] as usize, oob_walked,
+                "oob_len counter out of sync at order {o}"
+            );
         }
         let set_bits: usize = self
             .regions
@@ -1230,5 +1647,72 @@ mod tests {
         // All sizes in this churn are <= 1024 bytes; the whole run fits in
         // a couple of 4 MiB regions at most.
         assert!(b.region_count() <= 2, "region_count = {}", b.region_count());
+    }
+
+    /// J3-OOB: cache-row overflow at an OOB order must spill to the
+    /// out-of-band tier (never the intrusive list), survive the invariant
+    /// walk, and be fully reusable — no fresh regions on re-allocation.
+    #[test]
+    fn oob_spill_and_reuse_roundtrip() {
+        const SZ: usize = 16 * 1024; // order 10, the OOB floor
+        let mut b = Buddy::new();
+        // 130 live order-10 blocks (spans >1 region: 256 per region).
+        let blocks: Vec<*mut u8> = (0..130).map(|_| b.alloc_t(SZ).expect("alloc")).collect();
+        let regions_before = b.region_count();
+        // Free every other block: no two freed blocks are buddies, so
+        // merge_drain can never promote them — the frees pile up at order
+        // 10 until the 32-entry cache row overflows into the OOB tier.
+        for p in blocks.iter().step_by(2) {
+            unsafe { b.dealloc(*p, SZ) };
+        }
+        assert!(
+            b.free_lists[OOB_MIN_ORDER].is_null(),
+            "intrusive list must stay empty at OOB orders"
+        );
+        assert!(
+            b.oob_region_heads.iter().any(|&h| h != 0),
+            "expected OOB spill after 65 same-order frees"
+        );
+        b.check_invariants();
+        // Re-allocate the same count: every block must come from the freed
+        // pool (cache + OOB tiers), mapping zero new regions.
+        let again: Vec<*mut u8> = (0..65).map(|_| b.alloc_t(SZ).expect("realloc")).collect();
+        assert_eq!(
+            b.region_count(),
+            regions_before,
+            "reuse must not map regions"
+        );
+        b.check_invariants();
+        for p in again {
+            unsafe { b.dealloc(p, SZ) };
+        }
+        for p in blocks.iter().skip(1).step_by(2) {
+            unsafe { b.dealloc(*p, SZ) };
+        }
+        b.check_invariants();
+    }
+
+    /// J3-OOB: freeing both buddies must still coalesce upward when the
+    /// drain runs, with the OOB lists staying coherent through the
+    /// remove_free → oob_remove path.
+    #[test]
+    fn oob_merge_up_through_drain() {
+        const SZ: usize = 16 * 1024;
+        let mut b = Buddy::new();
+        let blocks: Vec<*mut u8> = (0..128).map(|_| b.alloc_t(SZ).expect("alloc")).collect();
+        // Free ALL of them: buddies pair up, so overflow drains merge
+        // entire runs up toward MAX_ORDER, exercising oob_remove (buddy
+        // unlink) and oob_push (merged re-insert) heavily.
+        for p in &blocks {
+            unsafe { b.dealloc(*p, SZ) };
+        }
+        b.check_invariants();
+        // A top-order allocation must now be satisfiable from merged mass
+        // without a new region.
+        let regions_before = b.region_count();
+        let big = b.alloc_t(block_size(MAX_ORDER)).expect("top-order alloc");
+        assert_eq!(b.region_count(), regions_before, "merge must enable reuse");
+        unsafe { b.dealloc(big, block_size(MAX_ORDER)) };
+        b.check_invariants();
     }
 }

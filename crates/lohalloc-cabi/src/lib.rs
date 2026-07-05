@@ -484,6 +484,21 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, new_size: usize) -> *mut c_vo
         };
     };
 
+    // Ladder 5 J6 (1a): in-place no-op when the existing block already
+    // accommodates `new_size` — every shrink, and any grow within the
+    // slab-class / buddy-order rounding slack. glibc and jemalloc both do
+    // this; before this branch existed, `realloc` *always* paid
+    // malloc + copy + free, even for shrinks. Keeping an oversized block on
+    // a large shrink is allowed by the C standard (the block's usable size
+    // simply stays what `malloc_usable_size` already reported) and mirrors
+    // jemalloc's same-size-class behavior. The token is deliberately
+    // dropped — the block is not freed. Headerless-arena tokens forbid
+    // this branch: their `old_usable` is a safe copy bound that OVERSTATES
+    // the block (see `ReallocToken::allows_in_place`).
+    if token.allows_in_place() && new_size <= old_usable {
+        return ptr;
+    }
+
     let new_ptr = unsafe { malloc(new_size) };
     if new_ptr.is_null() {
         return core::ptr::null_mut();
