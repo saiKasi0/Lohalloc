@@ -54,7 +54,7 @@ pub mod tune;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::Cell;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use lohalloc_core::{align_up, BUDDY_MAX, MIN_ALIGN, SLAB_MAX};
 use std::sync::Mutex;
 
@@ -229,8 +229,29 @@ pub struct BackendCounters {
 /// The composite allocator. Install an instance of this as
 /// `#[global_allocator]` to route every Rust allocation through Lohalloc.
 pub struct Lohalloc {
-    slab: Mutex<slab::Slab>,
-    buddy: Mutex<buddy::Buddy>,
+    /// Central Slab backend, sharded like `buddy` (Ladder 4 C4) — but with
+    /// a simpler routing story: slab frees are **stripe-agnostic**. A slab
+    /// free is a pure free-list push (no bitmap, no coalescing, no region
+    /// ownership — see `slab.rs`'s "Stripe agnosticism" module-doc note),
+    /// so both allocs and frees simply use the calling thread's stripe and
+    /// blocks migrate between stripes' lists harmlessly. No registry
+    /// widening or header stripe field is needed (deviation from the
+    /// original C4 sketch, justified there).
+    slab: [Mutex<slab::Slab>; BACKEND_STRIPES],
+    /// Central Buddy backend, sharded into `BACKEND_STRIPES` independent
+    /// stripes (Ladder 4 C3). Allocations pick a stripe by the calling
+    /// thread (`thread_stripe()` — magazine misses from different threads
+    /// land on different stripes); frees resolve the *exact* owning stripe
+    /// from `buddy_region_stripes` (a block must only be freed into the
+    /// `Buddy` whose bitmap tracks its region — see `buddy.rs`'s "Stripe
+    /// safety" module-doc section for why coalescing can never cross
+    /// stripes).
+    buddy: [Mutex<buddy::Buddy>; BACKEND_STRIPES],
+    /// Region base → owning buddy stripe (exact free-side routing). Fixed
+    /// atomics; inserted from inside `Buddy::refill`'s `register` callback
+    /// *while the stripe lock is held* — safe only because insertion can
+    /// never allocate (the Ladder-4 reentrancy rule).
+    buddy_region_stripes: registry::RegionRegistry,
     arena: Mutex<Option<arena::BumpArena>>,
     /// Fast-fail latch: set when the arena hits its `MAX_CHUNKS` cap and
     /// fails a chunk-fitting request, cleared only by `reset_arena()`. A
@@ -307,6 +328,15 @@ pub struct Lohalloc {
     /// `dealloc`/cabi entry points can recover a headerless block's class
     /// from its address alone. See `registry::SegmentRegistry`.
     segment_registry: registry::SegmentRegistry,
+    /// J1: one-way latch mirroring `slab_headerless`, for the Buddy
+    /// backend. Set only by `load()` on an instance whose buddy stripes
+    /// are all untouched — from then on every buddy block is served
+    /// header-free (no 48-byte header write → no minor fault on fresh
+    /// untouched blocks, no pow2 order-inflation) and frees recover
+    /// `(stripe, order)` from `buddy_region_stripes` + the per-region
+    /// order map. Training instances never set this (reward attribution
+    /// needs the header's `hash`/`size_class_hint`).
+    buddy_headerless: AtomicBool,
     /// Published descriptor of the arena chunk currently being bumped, for
     /// `arena_alloc_fast`'s lock-free path — null until the arena is first
     /// initialized. See `ArenaChunkDescriptor`'s doc.
@@ -396,11 +426,18 @@ impl Default for Lohalloc {
     }
 }
 
+/// Number of central-`Buddy` stripes (Ladder 4 C3). Power of two so the
+/// stripe pick is a mask. 4 matches the approved plan: enough to take the
+/// mt-mixed t4/t8 rows off one lock, small enough that per-stripe region
+/// pools stay warm.
+pub(crate) const BACKEND_STRIPES: usize = 4;
+
 impl Lohalloc {
     pub const fn new() -> Self {
         Self {
-            slab: Mutex::new(slab::Slab::new()),
-            buddy: Mutex::new(buddy::Buddy::new()),
+            slab: [const { Mutex::new(slab::Slab::new()) }; BACKEND_STRIPES],
+            buddy: [const { Mutex::new(buddy::Buddy::new()) }; BACKEND_STRIPES],
+            buddy_region_stripes: registry::RegionRegistry::new(),
             // Arena is lazily initialized on first use (requires mmap, which
             // is not const-evaluable).
             arena: Mutex::new(None),
@@ -415,6 +452,7 @@ impl Lohalloc {
             frozen_table: AtomicPtr::new(core::ptr::null_mut()),
             slab_headerless: AtomicBool::new(false),
             segment_registry: registry::SegmentRegistry::new(),
+            buddy_headerless: AtomicBool::new(false),
             arena_chunk: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
@@ -489,6 +527,32 @@ thread_local! {
     /// Capture the start time of the allocation for latency measurement.
     /// Set at entry to alloc(), read in emit_alloc() to compute elapsed time.
     static ALLOC_START_NS: Cell<u64> = const { Cell::new(0) };
+    /// This thread's central-backend stripe (Ladder 4 C3/C4), assigned
+    /// round-robin on first use so concurrent threads spread evenly across
+    /// the `BACKEND_STRIPES` stripes regardless of thread-id numbering.
+    /// `usize::MAX` = unassigned. Plain dtor-free `Cell`, same TLS
+    /// discipline as the magazines. Process-wide (not per-instance):
+    /// a stripe index is just a load-spreading hint on the alloc side —
+    /// frees always resolve ownership through the per-instance registry,
+    /// so instance mixing is harmless here.
+    static THREAD_STRIPE: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// Round-robin source for `THREAD_STRIPE` assignments.
+static NEXT_STRIPE: AtomicU64 = AtomicU64::new(0);
+
+/// The calling thread's stripe index in `[0, BACKEND_STRIPES)`.
+#[inline]
+fn thread_stripe() -> usize {
+    THREAD_STRIPE.with(|c| {
+        let v = c.get();
+        if v != usize::MAX {
+            return v;
+        }
+        let v = (NEXT_STRIPE.fetch_add(1, Ordering::Relaxed) as usize) & (BACKEND_STRIPES - 1);
+        c.set(v);
+        v
+    })
 }
 
 /// Retrieve the allocation start time (for telemetry latency measurement).
@@ -544,6 +608,21 @@ impl Lohalloc {
     pub fn with_bootstrap_guard<T>(f: impl FnOnce() -> T) -> T {
         Self::with_realloc_guard(f)
     }
+
+    /// `true` while this thread is anywhere inside the allocator
+    /// (`alloc`/`dealloc`/a `with_realloc_guard` section). For interposition
+    /// layers (`lohalloc-cabi`) that must treat a nested `malloc` — one
+    /// triggered *by* allocator internals, e.g. `record_latency`'s
+    /// `BTreeMap` node insert allocating while `self.state`'s lock is held —
+    /// as re-entrant even when the layer's own depth counter says
+    /// "top-level" (the nested call can arrive through an entry point that
+    /// never bumped it, like `free`). Deadlock #4's exact mechanism: such a
+    /// nested malloc crossed `LOHALLOC_FREEZE_AFTER` and called `freeze()`,
+    /// which re-locked the already-held `state` Mutex. One TLS read.
+    #[inline]
+    pub fn thread_inside_allocator() -> bool {
+        IN_ALLOC.get() > 0
+    }
 }
 
 // SAFETY: we uphold the `GlobalAlloc` contract:
@@ -594,6 +673,10 @@ unsafe impl GlobalAlloc for Lohalloc {
         // memory (see `headerless_class_for`'s doc).
         if let Some(class) = self.headerless_class_for(ptr) {
             self.slab_dealloc_headerless(ptr, class);
+            return;
+        }
+        if let Some(order) = self.buddy_headerless_order_for(ptr) {
+            unsafe { self.buddy_dealloc_via_magazine(ptr, buddy::block_size_of(order)) };
             return;
         }
         // Read the header (unaligned) sitting immediately before the user ptr.
@@ -670,7 +753,7 @@ impl Lohalloc {
                     // Defensive: a Slab-tagged header must carry a valid
                     // class; fall back to the size-derived path.
                     debug_assert!(false, "slab header without a valid class");
-                    if let Ok(mut slab) = self.slab.lock() {
+                    if let Ok(mut slab) = self.slab[thread_stripe()].lock() {
                         unsafe { slab.dealloc(block, header.size) };
                     }
                 } else {
@@ -681,7 +764,7 @@ impl Lohalloc {
                         let mut buf = [core::ptr::null_mut::<u8>(); 16];
                         let flush = magazine::refill_count(class).min(buf.len());
                         let n = magazine::take(owner, class, &mut buf[..flush]);
-                        if let Ok(mut slab) = self.slab.lock() {
+                        if let Ok(mut slab) = self.slab[thread_stripe()].lock() {
                             unsafe {
                                 slab.dealloc_batch(class, &buf[..n]);
                                 slab.dealloc_class(block, class);
@@ -870,7 +953,7 @@ impl Lohalloc {
         let mut buf = [core::ptr::null_mut::<u8>(); 16]; // >= max refill_count
         let want = magazine::refill_count(class).min(buf.len());
         let n = {
-            let mut slab = self.slab.lock().ok()?;
+            let mut slab = self.slab[thread_stripe()].lock().ok()?;
             slab.alloc_batch(class, &mut buf[..want])
         };
         if n == 0 {
@@ -904,7 +987,7 @@ impl Lohalloc {
         let mut buf = [core::ptr::null_mut::<u8>(); 16];
         let want = magazine::refill_count(class).min(buf.len());
         let n = {
-            let mut slab = self.slab.lock().ok()?;
+            let mut slab = self.slab[thread_stripe()].lock().ok()?;
             let mut try_register = |base: usize| self.segment_registry.insert(base, class as u8);
             slab.alloc_batch_headerless(class, &mut buf[..want], &mut try_register)
         };
@@ -931,7 +1014,7 @@ impl Lohalloc {
         let mut buf = [core::ptr::null_mut::<u8>(); 16];
         let flush = magazine::refill_count(class).min(buf.len());
         let n = magazine::take(owner, class, &mut buf[..flush]);
-        if let Ok(mut slab) = self.slab.lock() {
+        if let Ok(mut slab) = self.slab[thread_stripe()].lock() {
             unsafe {
                 slab.dealloc_batch(class, &buf[..n]);
                 slab.dealloc_class(block, class);
@@ -1016,23 +1099,103 @@ impl Lohalloc {
     /// same shape as `slab_block_via_magazine`. Orders outside that range
     /// (512 KiB, 1 MiB) go straight to `Mutex<Buddy>`: rare enough in every
     /// measured workload that magazining them would only add strand risk.
+    /// The calling thread's buddy stripe, locked, paired with a `register`
+    /// closure that records fresh regions as owned by that stripe. Every
+    /// buddy *allocation* goes through here (frees resolve their stripe via
+    /// `buddy_stripe_of` instead — ownership is exact, not thread-affine).
+    #[inline]
+    fn buddy_alloc_stripe(&self) -> (usize, &Mutex<buddy::Buddy>) {
+        let stripe = thread_stripe();
+        (stripe, &self.buddy[stripe])
+    }
+
+    /// Exact owning stripe for a live buddy block, from the region → stripe
+    /// registry. `None` means the pointer is in no region this instance
+    /// ever mapped — a caller bug; callers debug-assert and leak rather
+    /// than corrupt another stripe's metadata.
+    #[inline]
+    fn buddy_stripe_of(&self, block: *mut u8) -> Option<usize> {
+        let base = block as usize & !(buddy::REGION_BYTES - 1);
+        self.buddy_region_stripes
+            .lookup(base)
+            .map(|s| s as usize & (BACKEND_STRIPES - 1))
+    }
+
+    /// J1: raw, header-free Buddy block for `size` bytes (caller must have
+    /// checked `buddy_headerless` and `align <= MIN_ALIGN`). Refuses orders
+    /// below the order map's granularity (`MIN_HEADERLESS_ORDER`) — routing
+    /// only produces those via the rare slab-exhausted fallthrough, which
+    /// lands on System instead. The block IS the user pointer: no header
+    /// write, so a fresh untouched block costs zero page faults (the
+    /// J0-measured gap vs jemalloc).
+    fn buddy_block_headerless_via_magazine(&self, size: usize) -> Option<*mut u8> {
+        let order = buddy::order_for(size)?;
+        if order < buddy::MIN_HEADERLESS_ORDER {
+            return None;
+        }
+        self.buddy_block_via_magazine(size)
+    }
+
+    /// J1: if `ptr` is a header-free Buddy block, its order — recovered
+    /// from the region's out-of-band order map with one lock-free registry
+    /// probe. Mirrors `headerless_class_for`: must run before any header
+    /// read (a headerless block's `ptr - HEADER_SIZE` may be another live
+    /// block's tail), costs one relaxed load when the gate is off. The
+    /// slab/buddy probes can never false-positive on each other's blocks:
+    /// mappings are disjoint, so masking a slab pointer down to
+    /// `REGION_BYTES` can't land on a registered buddy region base (and
+    /// vice versa for the 64 KiB segment mask).
+    #[inline]
+    fn buddy_headerless_order_for(&self, ptr: *mut u8) -> Option<usize> {
+        if !self.buddy_headerless.load(Ordering::Relaxed) {
+            return None;
+        }
+        let base = ptr as usize & !(buddy::REGION_BYTES - 1);
+        let (_stripe, map) = self.buddy_region_stripes.lookup_full(base)?;
+        if map == 0 {
+            return None;
+        }
+        let slot = buddy::order_map_slot(ptr as usize, base);
+        let order =
+            unsafe { (*((map + slot) as *const AtomicU8)).load(Ordering::Relaxed) } as usize;
+        debug_assert!(
+            (buddy::MIN_HEADERLESS_ORDER..=buddy::MAX_ORDER).contains(&order),
+            "headerless buddy free with unrecorded order {order} — foreign pointer inside a registered region?"
+        );
+        if (buddy::MIN_HEADERLESS_ORDER..=buddy::MAX_ORDER).contains(&order) {
+            Some(order)
+        } else {
+            None // release mode: leak rather than free at a garbage order
+        }
+    }
+
     fn buddy_block_via_magazine(&self, total: usize) -> Option<*mut u8> {
         let order = buddy::order_for(total)?;
+        let (stripe, stripe_lock) = self.buddy_alloc_stripe();
         let Some(idx) = buddy_mag::index_for(order) else {
-            let mut buddy = self.buddy.lock().ok()?;
-            return buddy.alloc(total);
+            let mut buddy = stripe_lock.lock().ok()?;
+            return buddy.alloc(total, &mut |base, map| {
+                self.buddy_region_stripes.insert(base, stripe as u8, map)
+            });
         };
         let owner = self.magazine_owner();
         if let Some(block) = buddy_mag::pop(owner, idx) {
             return Some(block);
         }
-        // Magazine miss: batch-refill under the central lock.
-        // Sized >= max buddy_mag::refill_count (cap 32 / 2 = 16).
-        let mut buf = [core::ptr::null_mut::<u8>(); 16];
+        // Magazine miss: batch-refill under this thread's stripe lock.
+        // Sized with headroom over the max buddy_mag::refill_count
+        // (currently 16) so cap experiments never silently truncate a
+        // refill; the `.min` keeps it correct either way. (A cap-64
+        // experiment measured 25-50% slower on mixed rows: 32-block
+        // flushes exactly fill buddy's ORDER_CACHE and force a
+        // merge-drain per flush.)
+        let mut buf = [core::ptr::null_mut::<u8>(); 32];
         let want = buddy_mag::refill_count(idx).min(buf.len());
         let n = {
-            let mut buddy = self.buddy.lock().ok()?;
-            buddy.alloc_order_batch(order, &mut buf[..want])
+            let mut buddy = stripe_lock.lock().ok()?;
+            buddy.alloc_order_batch(order, &mut buf[..want], &mut |base, map| {
+                self.buddy_region_stripes.insert(base, stripe as u8, map)
+            })
         };
         if n == 0 {
             return None;
@@ -1060,7 +1223,13 @@ impl Lohalloc {
             return;
         };
         let Some(idx) = buddy_mag::index_for(order) else {
-            if let Ok(mut buddy) = self.buddy.lock() {
+            // Direct (non-magazined) orders: free into the exact owning
+            // stripe — never the thread's stripe, which may differ.
+            let Some(stripe) = self.buddy_stripe_of(block) else {
+                debug_assert!(false, "buddy free outside every registered region");
+                return; // release mode: leak rather than corrupt a stripe
+            };
+            if let Ok(mut buddy) = self.buddy[stripe].lock() {
                 unsafe { buddy.dealloc(block, size) };
             }
             return;
@@ -1070,14 +1239,42 @@ impl Lohalloc {
             return;
         }
         // Magazine full: flush half of it plus this block back to the
-        // central buddy in one locked batch. Sized >= max refill_count (16).
-        let mut buf = [core::ptr::null_mut::<u8>(); 16];
-        let flush = buddy_mag::refill_count(idx).min(buf.len());
+        // central stripes. A thread's magazine mixes blocks from every
+        // stripe (pop doesn't care where a block was carved), so resolve
+        // each flushed block's owning stripe via the region registry and
+        // free per-stripe batches — locking one stripe at a time, never
+        // two at once (no lock-order deadlock possible). Sized with
+        // headroom over the max refill_count (currently 16) + 1 for the
+        // block that triggered the flush — see the refill-side comment.
+        let mut buf = [core::ptr::null_mut::<u8>(); 33];
+        let flush = buddy_mag::refill_count(idx).min(buf.len() - 1);
         let n = buddy_mag::take(owner, idx, &mut buf[..flush]);
-        if let Ok(mut buddy) = self.buddy.lock() {
-            unsafe {
-                buddy.dealloc_order_batch(order, &buf[..n]);
-                buddy.dealloc_order_batch(order, core::slice::from_ref(&block));
+        buf[n] = block;
+        let total = n + 1;
+
+        let mut stripes = [usize::MAX; 33];
+        for i in 0..total {
+            match self.buddy_stripe_of(buf[i]) {
+                Some(s) => stripes[i] = s,
+                // Unresolvable block: leak it (debug-assert — every buddy
+                // block came from a registered region by construction).
+                None => debug_assert!(false, "flushed buddy block in no registered region"),
+            }
+        }
+        let mut grouped = [core::ptr::null_mut::<u8>(); 33];
+        for stripe in 0..BACKEND_STRIPES {
+            let mut g = 0;
+            for i in 0..total {
+                if stripes[i] == stripe {
+                    grouped[g] = buf[i];
+                    g += 1;
+                }
+            }
+            if g == 0 {
+                continue;
+            }
+            if let Ok(mut buddy) = self.buddy[stripe].lock() {
+                unsafe { buddy.dealloc_order_batch(order, &grouped[..g]) };
             }
         }
     }
@@ -1119,6 +1316,14 @@ impl Lohalloc {
                 })
             }
             lohalloc_core::Backend::Buddy if total <= BUDDY_MAX => {
+                // J1 header-free fast path: mirror of the Slab arm above —
+                // `load()`-booted instances only, natural alignment only,
+                // and only orders the per-region order map can express
+                // (>= 16 KiB; smaller fallthrough sizes go to System).
+                if self.buddy_headerless.load(Ordering::Relaxed) && align <= MIN_ALIGN {
+                    let size = total - pad;
+                    return self.buddy_block_headerless_via_magazine(size);
+                }
                 self.buddy_block_via_magazine(total).map(|block| {
                     self.write_header(
                         block,
@@ -1248,7 +1453,12 @@ impl Lohalloc {
 
         // 2. Buddy: medium, variable-size (magazine-first).
         if total <= BUDDY_MAX && skip != Some(lohalloc_core::Backend::Buddy) {
-            if let Some(block) = self.buddy_block_via_magazine(total) {
+            if self.buddy_headerless.load(Ordering::Relaxed) && align <= MIN_ALIGN {
+                let size = total - pad;
+                if let Some(block) = self.buddy_block_headerless_via_magazine(size) {
+                    return block;
+                }
+            } else if let Some(block) = self.buddy_block_via_magazine(total) {
                 return self.write_header(
                     block,
                     pad,
@@ -1585,10 +1795,34 @@ impl Lohalloc {
                     // check always passes; it's a safety net for any other
                     // caller, not a hot-path cost — `load()` is a rare,
                     // one-time call.
-                    if let Ok(slab) = self.slab.lock() {
-                        if slab.region_count() == 0 {
-                            self.slab_headerless.store(true, Ordering::Release);
-                        }
+                    let all_stripes_untouched = self.slab.iter().all(|stripe| {
+                        stripe
+                            .lock()
+                            .map(|s| s.region_count() == 0)
+                            .unwrap_or(false)
+                    });
+                    if all_stripes_untouched {
+                        self.slab_headerless.store(true, Ordering::Release);
+                    }
+                    // J1: same untouched-instance argument for Buddy. Flip
+                    // each stripe's order-recording flag under its own lock
+                    // BEFORE publishing the gate, so no block is ever
+                    // served headerless from a stripe that isn't recording.
+                    let all_buddy_untouched = self.buddy.iter().all(|stripe| {
+                        stripe
+                            .lock()
+                            .map(|mut b| {
+                                if b.region_count() == 0 {
+                                    b.set_record_orders();
+                                    true
+                                } else {
+                                    false
+                                }
+                            })
+                            .unwrap_or(false)
+                    });
+                    if all_buddy_untouched {
+                        self.buddy_headerless.store(true, Ordering::Release);
                     }
                     return true;
                 }
@@ -1767,8 +2001,16 @@ impl Lohalloc {
     /// and tests that want to observe backend state without depending on
     /// the `telemetry-observer` feature (Phase 6).
     pub fn backend_counters(&self) -> BackendCounters {
-        let slab_region_count = self.slab.lock().map(|s| s.region_count()).unwrap_or(0);
-        let buddy_region_count = self.buddy.lock().map(|b| b.region_count()).unwrap_or(0);
+        let slab_region_count = self
+            .slab
+            .iter()
+            .map(|stripe| stripe.lock().map(|s| s.region_count()).unwrap_or(0))
+            .sum();
+        let buddy_region_count = self
+            .buddy
+            .iter()
+            .map(|stripe| stripe.lock().map(|b| b.region_count()).unwrap_or(0))
+            .sum();
         let (arena_used, arena_capacity) = self
             .arena
             .lock()
@@ -1799,6 +2041,9 @@ impl Lohalloc {
         if self.headerless_class_for(ptr).is_some() {
             return Some(lohalloc_core::Backend::Slab);
         }
+        if self.buddy_headerless_order_for(ptr).is_some() {
+            return Some(lohalloc_core::Backend::Buddy);
+        }
         let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
         Backend::from_u8(header.backend).map(|b| match b {
             Backend::Slab => lohalloc_core::Backend::Slab,
@@ -1825,6 +2070,9 @@ impl Lohalloc {
         }
         if let Some(class) = self.headerless_class_for(ptr) {
             return lohalloc_core::SLAB_SIZE_CLASSES[class as usize];
+        }
+        if let Some(order) = self.buddy_headerless_order_for(ptr) {
+            return buddy::block_size_of(order);
         }
         let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
         if header.magic != MAGIC {
@@ -1870,7 +2118,9 @@ impl Lohalloc {
         if ptr.is_null() {
             return false;
         }
-        if self.headerless_class_for(ptr).is_some() {
+        if self.headerless_class_for(ptr).is_some()
+            || self.buddy_headerless_order_for(ptr).is_some()
+        {
             return true;
         }
         let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
@@ -1893,6 +2143,10 @@ impl Lohalloc {
             self.slab_dealloc_headerless(ptr, class);
             return true;
         }
+        if let Some(order) = self.buddy_headerless_order_for(ptr) {
+            unsafe { self.buddy_dealloc_via_magazine(ptr, buddy::block_size_of(order)) };
+            return true;
+        }
         let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
         if header.magic != MAGIC {
             return false;
@@ -1912,6 +2166,9 @@ impl Lohalloc {
         }
         if let Some(class) = self.headerless_class_for(ptr) {
             return Some(lohalloc_core::SLAB_SIZE_CLASSES[class as usize]);
+        }
+        if let Some(order) = self.buddy_headerless_order_for(ptr) {
+            return Some(buddy::block_size_of(order));
         }
         let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
         if header.magic != MAGIC {
@@ -1938,6 +2195,13 @@ impl Lohalloc {
             let usable = lohalloc_core::SLAB_SIZE_CLASSES[class as usize];
             return Some((usable, ReallocToken(ReallocTokenInner::Headerless(class))));
         }
+        if let Some(order) = self.buddy_headerless_order_for(ptr) {
+            let usable = buddy::block_size_of(order);
+            return Some((
+                usable,
+                ReallocToken(ReallocTokenInner::BuddyHeaderless(order)),
+            ));
+        }
         let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
         if header.magic != MAGIC {
             return None;
@@ -1956,6 +2220,9 @@ impl Lohalloc {
         match token.0 {
             ReallocTokenInner::Header(header) => unsafe { self.dealloc_with_header(ptr, header) },
             ReallocTokenInner::Headerless(class) => self.slab_dealloc_headerless(ptr, class),
+            ReallocTokenInner::BuddyHeaderless(order) => unsafe {
+                self.buddy_dealloc_via_magazine(ptr, buddy::block_size_of(order))
+            },
         }
     }
 }
@@ -1969,6 +2236,8 @@ pub struct ReallocToken(ReallocTokenInner);
 enum ReallocTokenInner {
     Header(Header),
     Headerless(u8),
+    /// J1: a header-free Buddy block's order.
+    BuddyHeaderless(usize),
 }
 
 // ---------------------------------------------------------------------------
@@ -2010,9 +2279,13 @@ mod integration_tests {
 
     #[test]
     fn frozen_alloc_uses_published_table() {
-        // Load a hand-built model routing (hash, size_class(64)) → Buddy.
-        // Size 64 would default to Slab, so getting Buddy back proves the
+        // Load a hand-built model routing (hash, size_class(64)) → Arena.
+        // Size 64 would default to Slab, so getting Arena back proves the
         // lock-free published table (not the size fallback) made the call.
+        // (Arena, not Buddy: since J1, a load()-booted instance serves
+        // Buddy header-free and deliberately refuses sub-16 KiB orders —
+        // the order map can't express them — so a small Buddy
+        // recommendation now falls through by design.)
         let hash = 0xDEAD_BEEF_u64;
         let size = 64usize;
         let sc = state::size_class_for(size);
@@ -2020,7 +2293,7 @@ mod integration_tests {
         let table = perfect_hash::PerfectHashTable::from_entries(vec![(
             key,
             sc,
-            lohalloc_core::Backend::Buddy,
+            lohalloc_core::Backend::Arena,
         )]);
         let alloc = Lohalloc::new();
         assert!(alloc.load(&table.serialize()), "model load should succeed");
@@ -2030,7 +2303,7 @@ mod integration_tests {
         assert!(!ptr.is_null());
         assert_eq!(
             unsafe { alloc.backend_for_ptr(ptr) },
-            Some(lohalloc_core::Backend::Buddy),
+            Some(lohalloc_core::Backend::Arena),
             "published frozen table must drive routing"
         );
         unsafe { alloc.dealloc_with_hash(ptr, layout) };
@@ -2267,7 +2540,9 @@ mod integration_tests {
         // binary, so parallel tests may also bump them — assert on the
         // delta this test itself causes, not an absolute value.
         let hash = 0x1234_5678_u64;
-        let size = 64usize;
+        // 32 KiB: a headerless-eligible Buddy order (>= 16 KiB) — since J1
+        // a load()-booted instance refuses sub-16 KiB Buddy service.
+        let size = 32 * 1024usize;
         let sc = state::size_class_for(size);
         let key = state::combine_hash_size_class(hash, sc);
         let table = perfect_hash::PerfectHashTable::from_entries(vec![(
@@ -2834,6 +3109,144 @@ mod integration_tests {
             assert!(!p.is_null());
             unsafe { alloc.dealloc(p, layout) };
         }
+    }
+
+    #[test]
+    fn buddy_blocks_resolve_to_a_registered_stripe() {
+        // C3: every buddy allocation's region must be registered in the
+        // region → stripe registry before the block reaches the caller —
+        // that registration is what makes exact free-side stripe routing
+        // possible. Drives the internal buddy path directly (the public
+        // `alloc` routes through the training bandit, which may
+        // legitimately explore other backends for these sizes). Covers
+        // both the magazined path (64 KiB) and the direct path (512 KiB,
+        // above MAX_MAGAZINE_ORDER).
+        let alloc = Lohalloc::new();
+        for size in [20 * 1024usize, 64 * 1024, 512 * 1024] {
+            let block = alloc
+                .buddy_block_via_magazine(size)
+                .expect("buddy path must serve");
+            let stripe = alloc.buddy_stripe_of(block);
+            assert!(
+                matches!(stripe, Some(s) if s < BACKEND_STRIPES),
+                "buddy block ({size} B) must resolve to a registered stripe, got {stripe:?}"
+            );
+            // All allocations from one thread land on that thread's stripe.
+            assert_eq!(stripe, Some(thread_stripe()));
+            unsafe { alloc.buddy_dealloc_via_magazine(block, size) };
+        }
+    }
+
+    #[test]
+    fn buddy_direct_order_cross_thread_free_routes_by_registry() {
+        // C3: 512 KiB blocks bypass the magazines, so a cross-thread free
+        // exercises the registry-routed direct path — the free must land in
+        // the *allocating* thread's stripe (wrong-stripe frees panic in
+        // debug via free_order's region assert). Blocks must then be
+        // recyclable: the region count stays bounded across rounds.
+        use std::sync::Arc;
+
+        let alloc = Arc::new(Lohalloc::new());
+        const SIZE: usize = 512 * 1024;
+        for _round in 0..20 {
+            let a = Arc::clone(&alloc);
+            let ptrs: Vec<usize> = std::thread::spawn(move || {
+                (0..8)
+                    .map(|_| {
+                        let p = a
+                            .buddy_block_via_magazine(SIZE)
+                            .expect("buddy path must serve");
+                        p as usize
+                    })
+                    .collect()
+            })
+            .join()
+            .unwrap();
+            // Free on this (potentially different-stripe) thread.
+            for p in ptrs {
+                unsafe { alloc.buddy_dealloc_via_magazine(p as *mut u8, SIZE) };
+            }
+        }
+        let counters = alloc.backend_counters();
+        assert!(
+            counters.buddy_region_count < 40,
+            "cross-thread direct frees must recycle regions, got {}",
+            counters.buddy_region_count
+        );
+    }
+
+    #[test]
+    fn headerless_buddy_roundtrip_and_no_order_inflation() {
+        // J1: a load()-booted instance serves Buddy header-free. A 32 KiB
+        // request must come back as an exact 32 KiB block (the header path
+        // inflated it to 64 KiB: 32 KiB + 48 rounds to the next order),
+        // recover its backend/usable size from the order map alone, and
+        // free cleanly through the magazine layer.
+        let table = perfect_hash::PerfectHashTable::from_entries(vec![]);
+        let alloc = Lohalloc::new();
+        assert!(alloc.load(&table.serialize()));
+
+        // (No exact-1 MiB row: `total` — request + header pad — gates the
+        // Buddy range even in headerless mode, so 1 MiB + 48 routes to
+        // System. Acceptable: the SystemCache path is our strongest row.)
+        for size in [16 * 1024usize, 32 * 1024, 256 * 1024, 512 * 1024] {
+            let layout = Layout::from_size_align(size, 16).unwrap();
+            let ptr = unsafe { alloc.alloc(layout) };
+            assert!(!ptr.is_null());
+            assert_eq!(
+                unsafe { alloc.backend_for_ptr(ptr) },
+                Some(lohalloc_core::Backend::Buddy),
+                "{size} B should route Buddy by size in inference"
+            );
+            assert_eq!(
+                unsafe { alloc.usable_size(ptr) },
+                size,
+                "headerless pow2 request must not order-inflate"
+            );
+            assert!(unsafe { alloc.owns(ptr) });
+            unsafe { alloc.dealloc(ptr, layout) };
+        }
+        // Churn: recycled headerless blocks keep regions bounded.
+        let layout = Layout::from_size_align(64 * 1024, 16).unwrap();
+        for _ in 0..200 {
+            let ptr = unsafe { alloc.alloc(layout) };
+            assert!(!ptr.is_null());
+            unsafe { alloc.dealloc(ptr, layout) };
+        }
+        assert!(alloc.backend_counters().buddy_region_count < 8);
+    }
+
+    #[test]
+    fn headerless_buddy_cross_thread_free() {
+        // J1 + C3: headerless blocks freed on a different thread resolve
+        // (stripe, order) purely from the registry + order map.
+        use std::sync::Arc;
+
+        let table = perfect_hash::PerfectHashTable::from_entries(vec![]);
+        let alloc = Arc::new(Lohalloc::new());
+        assert!(alloc.load(&table.serialize()));
+
+        let layout = Layout::from_size_align(128 * 1024, 16).unwrap();
+        for _round in 0..10 {
+            let a = Arc::clone(&alloc);
+            let ptrs: Vec<usize> = std::thread::spawn(move || {
+                (0..16)
+                    .map(|_| {
+                        let p = unsafe { a.alloc(layout) };
+                        assert!(!p.is_null());
+                        p as usize
+                    })
+                    .collect()
+            })
+            .join()
+            .unwrap();
+            for p in ptrs {
+                let p = p as *mut u8;
+                assert_eq!(unsafe { alloc.usable_size(p) }, 128 * 1024);
+                unsafe { alloc.dealloc(p, layout) };
+            }
+        }
+        assert!(alloc.backend_counters().buddy_region_count < 40);
     }
 
     #[test]

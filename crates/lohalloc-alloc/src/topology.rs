@@ -41,9 +41,11 @@
 //! # Hot-path cost & allocation discipline
 //!
 //! The stack walk + hash itself uses only `core` features (inline asm,
-//! integer math) and makes no heap allocations. The module table adds one
-//! `OnceLock` acquire-load plus, per PC, a ~6-level binary search over
-//! ≤64 entries. Table construction runs at most once, is allocation-free
+//! integer math) and makes no heap allocations. A per-thread direct-mapped
+//! memo (`HASH_MEMO`, 64 entries, C5) keyed on the raw walked PC triple
+//! serves repeat call sites without touching the module table or the mix —
+//! those only run on a memo miss. The table itself adds one `OnceLock`
+//! acquire-load plus, per PC, a ~6-level binary search over ≤64 entries. Table construction runs at most once, is allocation-free
 //! (`dl_iterate_phdr` fills a fixed array via callback; the dyld APIs are
 //! straight reads of mapped memory), and any incidental allocation would
 //! anyway hit the caller's `IN_ALLOC` bypass since `fast_stack_hash` runs
@@ -357,6 +359,71 @@ fn normalize_pc_with(pc: u64, entries: &[ModuleRange]) -> u64 {
 /// Maximum number of frames to walk.
 const NUM_FRAMES: usize = 3;
 
+// ---------------------------------------------------------------------------
+// C5: TLS stack-hash memo — skip the frame-1/2 walk + normalize + mix when
+// this exact call site was hashed recently on this thread.
+// ---------------------------------------------------------------------------
+
+/// Entries in the per-thread direct-mapped hash memo. 64 × 24 bytes =
+/// 1.5 KiB per thread.
+const MEMO_ENTRIES: usize = 64;
+
+/// One memo slot: raw walked PC triple `(ret0, ret1, ret2)` → final hash.
+///
+/// The key is the *complete* raw input of the normalize+mix pipeline, so a
+/// hit is sound by construction: the module table is immutable after first
+/// build and `normalize_pc_with`/`mix_hash` are pure, so the same raw
+/// triple always maps to the same hash within a process. (The originally
+/// planned `(fp, ret0)` key aliased in practice — the debug cross-check
+/// caught `lohalloc-demo`'s churn workload producing two different
+/// 3-frame topologies behind one `(fp, ret0)` pair within milliseconds:
+/// a helper called from two sites at identical stack depth shares both the
+/// leaf frame address and the leaf return address. Keying on the full
+/// triple trades away skipping the frame walk — 3 guarded derefs, cheap —
+/// and keeps skipping what actually costs: the module-table lookups and
+/// the mix.)
+///
+/// Unwalked frames key as `0`. `ret0 == 0` marks an empty slot (a zero
+/// first return address is rejected before the memo is consulted).
+/// `SENTINEL_HASH` results are never stored, so a hit is always a real
+/// hash.
+struct MemoEntry {
+    ret0: core::cell::Cell<usize>,
+    ret1: core::cell::Cell<usize>,
+    ret2: core::cell::Cell<usize>,
+    hash: core::cell::Cell<u64>,
+}
+
+std::thread_local! {
+    /// Direct-mapped, dtor-free (plain `Cell`s, per the crate's TLS
+    /// invariant: no destructors on the alloc path), const-initialized so
+    /// first touch never allocates.
+    static HASH_MEMO: [MemoEntry; MEMO_ENTRIES] = const {
+        [const {
+            MemoEntry {
+                ret0: core::cell::Cell::new(0),
+                ret1: core::cell::Cell::new(0),
+                ret2: core::cell::Cell::new(0),
+                hash: core::cell::Cell::new(0),
+            }
+        }; MEMO_ENTRIES]
+    };
+}
+
+#[cfg(debug_assertions)]
+std::thread_local! {
+    /// Debug-only sample counter for the 1/256 memo-vs-fresh-walk
+    /// cross-check.
+    static MEMO_SAMPLE: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Slot index for a raw PC triple: fold + one multiply, top bits.
+#[inline(always)]
+fn memo_index(ret0: usize, ret1: usize, ret2: usize) -> usize {
+    let folded = ret0 ^ ret1.rotate_left(21) ^ ret2.rotate_left(42);
+    ((folded as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize & (MEMO_ENTRIES - 1)
+}
+
 /// Maximum distance from the current stack pointer to a valid frame pointer
 /// (8 MB — the typical thread stack size on Linux).
 const MAX_FP_DISTANCE: usize = 8_000_000;
@@ -366,6 +433,11 @@ const MAX_FP_DISTANCE: usize = 8_000_000;
 /// Walks exactly 3 frames up the call stack via inline assembly, collects the
 /// return addresses (instruction pointers), and folds them into a `u64` using
 /// a bitwise XOR-shift mixing function.
+///
+/// A per-thread direct-mapped memo keyed on the raw walked PC triple (C5)
+/// short-circuits repeat call sites: the guarded frame walk still runs, but
+/// PC normalization (module table) and the mix are skipped on a hit.
+/// Hashes are bit-identical either way.
 ///
 /// # Returns
 ///
@@ -387,14 +459,15 @@ pub fn fast_stack_hash() -> u64 {
         return SENTINEL_HASH;
     }
 
-    // One OnceLock acquire-load per call after first init; see module doc.
-    let modules = module_table().entries();
-
-    let mut ips: [u64; NUM_FRAMES] = [0; NUM_FRAMES];
+    // Raw 3-frame walk: guarded frame-pointer derefs and integer math only —
+    // no module-table work yet. Raw (per-run) PCs are collected first so
+    // they can key the memo; normalization to the ASLR-stable form and the
+    // mix only run on a memo miss.
+    let mut raw: [usize; NUM_FRAMES] = [0; NUM_FRAMES];
     let mut current_fp = fp;
     let mut collected = 0usize;
 
-    for ips_slot in ips.iter_mut() {
+    for slot in raw.iter_mut() {
         // Re-validate the frame pointer before each dereference.
         if !is_valid_fp(current_fp, sp) {
             break;
@@ -409,9 +482,7 @@ pub fn fast_stack_hash() -> u64 {
             break;
         }
 
-        // ASLR-stable: hash the (module identity, offset) form of the PC,
-        // not its absolute (per-run) virtual address.
-        *ips_slot = normalize_pc_with(return_addr as u64, modules);
+        *slot = return_addr;
         collected += 1;
 
         if next_fp == 0 || next_fp == current_fp {
@@ -422,6 +493,68 @@ pub fn fast_stack_hash() -> u64 {
 
     if collected == 0 {
         return SENTINEL_HASH;
+    }
+
+    // C5 memo probe: a hit skips the module-table normalization and the
+    // mix. Sound by construction — see `MemoEntry`.
+    let idx = memo_index(raw[0], raw[1], raw[2]);
+    let cached = HASH_MEMO.with(|memo| {
+        let e = &memo[idx];
+        if e.ret0.get() == raw[0] && e.ret1.get() == raw[1] && e.ret2.get() == raw[2] {
+            Some(e.hash.get())
+        } else {
+            None
+        }
+    });
+    if let Some(hash) = cached {
+        // 1/256 sampled cross-check: with the full-triple key this must
+        // always pass (normalize+mix are pure); a failure means the memo
+        // store/probe itself regressed.
+        #[cfg(debug_assertions)]
+        {
+            let n = MEMO_SAMPLE.with(|c| {
+                let n = c.get().wrapping_add(1);
+                c.set(n);
+                n
+            });
+            if n & 0xFF == 0 {
+                debug_assert_eq!(
+                    hash,
+                    normalize_and_mix(&raw, collected),
+                    "C5 memo corrupted: cached hash diverged from fresh normalize+mix"
+                );
+            }
+        }
+        return hash;
+    }
+
+    let hash = normalize_and_mix(&raw, collected);
+    if hash != SENTINEL_HASH {
+        HASH_MEMO.with(|memo| {
+            let e = &memo[idx];
+            e.ret0.set(raw[0]);
+            e.ret1.set(raw[1]);
+            e.ret2.set(raw[2]);
+            e.hash.set(hash);
+        });
+    }
+    hash
+}
+
+/// ASLR-stable normalization + mix over an already-walked raw PC array.
+/// Bit-identical to the pre-C5 single-pass implementation — exported
+/// `.lohalloc` models key on these exact hash values, so any change here
+/// silently invalidates saved models.
+#[inline]
+fn normalize_and_mix(raw: &[usize; NUM_FRAMES], collected: usize) -> u64 {
+    // One OnceLock acquire-load per call after first init; see module doc.
+    let modules = module_table().entries();
+
+    let mut ips: [u64; NUM_FRAMES] = [0; NUM_FRAMES];
+    // ASLR-stable: hash the (module identity, offset) form of each PC,
+    // not its absolute (per-run) virtual address.
+    for (ip, &pc) in ips.iter_mut().zip(&raw[..collected]) {
+        *ip = normalize_pc_with(pc as u64, modules);
     }
 
     mix_hash(&ips[..collected])
@@ -603,6 +736,35 @@ mod tests {
         // be non-zero (not the sentinel).
         let h = fast_stack_hash();
         assert_ne!(h, SENTINEL_HASH, "hash should be non-zero for valid stack");
+    }
+
+    #[test]
+    fn memo_hit_equals_full_walk() {
+        // C5: the first call from a site takes the full-walk (miss) path and
+        // populates the memo; later calls from the same site take the memo
+        // hit path. Both must yield the identical hash — run enough
+        // iterations that the debug-mode 1/256 sampled cross-check also
+        // fires at least once (it panics on an aliased entry).
+        let first = fast_stack_hash();
+        for _ in 0..1024 {
+            assert_eq!(
+                fast_stack_hash(),
+                first,
+                "memo hit must be bit-identical to the full walk"
+            );
+        }
+    }
+
+    #[test]
+    fn memo_index_stays_in_range() {
+        for &(r0, r1, r2) in &[
+            (0usize, 0usize, 0usize),
+            (0x7fff_dead_bee0, 0x1000_4242, 0),
+            (usize::MAX, usize::MAX, usize::MAX),
+            (0x10, 0x7fff_ffff_ffff, 0x4000_0000),
+        ] {
+            assert!(memo_index(r0, r1, r2) < MEMO_ENTRIES);
+        }
     }
 
     #[test]

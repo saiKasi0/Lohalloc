@@ -10,6 +10,23 @@
 //! recoverable from the size class the caller returns at dealloc time. This is
 //! a Phase 1 implementation: simple, correct, alignment-clean. Phase 2 adds
 //! the telemetry hooks on top without changing the free-list structure.
+//!
+//! # Stripe agnosticism (Ladder 4 C4)
+//!
+//! `lib.rs` shards the central backend into `[Mutex<Slab>; K]` stripes,
+//! with both allocs and frees using the calling thread's stripe. Unlike
+//! Buddy (whose frees must reach the exact `Buddy` tracking the block's
+//! region bitmap — see `buddy.rs`'s stripe-safety note), a `Slab` free is
+//! a pure intrusive-list push with no region lookup, no bitmap, and no
+//! coalescing, so a block carved by stripe A and freed into stripe B's
+//! list is fully usable from B — regions stay mapped for the whole
+//! instance's lifetime regardless of which stripe's `Vec` holds them, and
+//! block↔class fidelity is carried by the caller (header `slab_class` or
+//! the segment registry), not by the serving stripe. That's why C4 needs
+//! no region→stripe registry: cross-stripe migration is harmless by
+//! construction. Consequence to keep true: `Slab` must never gain
+//! per-region free accounting (e.g. per-region block counts for region
+//! reclamation) without revisiting the striped routing in `lib.rs`.
 
 use crate::system;
 use lohalloc_core::{align_up, slab_class_for, SLAB_SIZE_CLASSES};

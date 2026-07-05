@@ -171,17 +171,18 @@ fn run_lohalloc(workload: &str, ops: usize) -> bool {
         }
     }
 
-    // Read the tune config for our OWN freeze-policy decision. We use the
-    // *uncached* loader, not `config()`/`load_from_env()`: because Lohalloc
-    // is this binary's `#[global_allocator]`, the language runtime already
-    // allocated (and thus locked `tune::config()` to defaults) before main
-    // ran — so the freeze knobs below must come from a fresh env/file read,
-    // not the poisoned OnceLock. (The reward-shaping knobs genuinely cannot
-    // apply in a global-allocator build for the same reason; that's the
-    // documented limitation — the sweep tunes via `latency_profile`'s
-    // private instance, and production tuning is the cabi/LD_PRELOAD path
-    // where the config loads before the first allocation.)
-    let cfg = lohalloc_alloc::tune::load_config_uncached();
+    // Install the env/file tune config process-wide (T1). Historically this
+    // binary could only read the config privately (`load_config_uncached`)
+    // because `tune::config()` was a `OnceLock` the runtime's pre-`main`
+    // allocations had already locked to defaults. `load_from_env` is now an
+    // AtomicPtr *upgrade*, so this call both returns the config for our
+    // freeze-policy decision below AND makes the reward-shaping knobs
+    // (`ucb_c`, `t_ref_ns`, `frag_weight`, …) genuinely apply to this
+    // global-allocator build's training traffic — `LOHALLOC_TUNE` now
+    // behaves uniformly across the C/C++/Rust benchmark matrix. (The few
+    // dozen pre-`main` runtime allocations still trained on defaults;
+    // their call sites are disjoint from workload traffic.)
+    let cfg = *lohalloc_alloc::tune::load_from_env();
 
     let freeze_after = if model_loaded {
         None

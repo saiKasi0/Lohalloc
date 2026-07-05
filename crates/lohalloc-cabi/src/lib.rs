@@ -311,41 +311,72 @@ extern "C" fn report_pht_misses_at_exit() {
 /// by calling exported symbols directly via `dlsym`, which doesn't trigger
 /// std's own internal allocations the same way).
 fn with_freeze_check(f: impl FnOnce() -> *mut c_void) -> *mut c_void {
-    // Steady-state fast path (Ladder 4 C6). The re-entrancy depth guard
-    // exists solely to make `ensure_model_loaded` and `maybe_auto_freeze`
-    // top-level-only. Once `FREEZE_FIRED` is set, `ensure_model_loaded` has
-    // completed (the model-loaded path sets the flag inside its own
-    // `OnceLock`; the auto-freeze path only runs after `ensure_model_loaded`
-    // in the same call) and `maybe_auto_freeze` is a no-op forever after —
-    // so nothing needs protecting and the whole guard collapses to a bare
-    // call behind one relaxed load. This is the common case for every
-    // inference/frozen benchmark row, replacing three TLS `.with()` accesses
-    // (plus a `OnceLock` load) per malloc with a single atomic load.
-    if FREEZE_FIRED.load(Ordering::Relaxed) {
-        return f();
-    }
-    // Pre-freeze path: one combined TLS access to read-and-bump the depth
-    // (was two separate `.with()` calls).
+    // `f()` is called from exactly ONE unconditional source location below
+    // — load-bearing, not stylistic; see the long comment at that call.
+    //
+    // A prior "steady-state fast path" version (Ladder 4 C6) branched on
+    // `FREEZE_FIRED` to skip straight to `return f();`, falling through to
+    // a SECOND, textually different `let ptr = f();` on the slow path.
+    // Once inlined, `f`'s generic closure body got compiled at BOTH source
+    // positions — two physically different call instructions, hence two
+    // different return addresses for what should be one logical call
+    // site. `topology::fast_stack_hash()`'s 3-frame walk captures exactly
+    // that return address, so every allocation on the fast path computed
+    // a DIFFERENT hash than the same call site computed while training
+    // (which only ever takes the slow path). A model-loaded run reaches
+    // the fast path from its second allocation onward, while every entry
+    // in the frozen table was learned entirely on the slow path — so
+    // essentially every inference-mode allocation missed the perfect-hash
+    // table and fell through to `default_backend_for_size`, silently
+    // defeating the per-call-site Decision Engine in every model-loaded
+    // benchmark row (`LOHALLOC_DEBUG=1`'s `pht_misses` sat at ~100%, not
+    // ~0 as documented).
+    //
+    // A first fix attempt kept ONE syntactic call to `f()` but still
+    // re-checked `!frozen` (the same `FREEZE_FIRED` load's boolean) in an
+    // `if` AFTER the call, to skip `maybe_auto_freeze`/the TLS reset. That
+    // reintroduced the identical bug one level more subtly: LLVM's jump
+    // threading proved the second `if` was redundant with the first on
+    // each incoming edge and duplicated the merge block per predecessor —
+    // reconstructing two physical call sites for `f()` despite the single
+    // source line (confirmed empirically: raw frame dumps showed only the
+    // nearest frame diverging, starting at the second allocation of every
+    // model-loaded run, identical symptom to the original bug). The
+    // robust fix is structural, not a matter of counting source-level
+    // `f()` statements: nothing may branch on `FREEZE_FIRED` (or anything
+    // provably correlated with it) on *either side* of the call. Below,
+    // `ensure_model_loaded`/`maybe_auto_freeze` are called unconditionally
+    // and rely entirely on their OWN internal idempotency (a `OnceLock`
+    // and an internal `FREEZE_FIRED` check, respectively) to be cheap
+    // once already frozen — this reintroduces the TLS depth read/write on
+    // every call (the cost C6 removed), which is the accepted price of a
+    // hash that's actually stable across the training→inference
+    // transition. Do not reintroduce any post-call branch on freeze state.
     let depth = IN_ALLOC_FN.with(|c| {
         let d = c.get();
         c.set(d + 1);
         d
     });
-    // Model load must happen before the first top-level allocation is
-    // served, and — like `maybe_auto_freeze` below — only while the depth
-    // bump is active, so its own nested allocations skip this layer.
-    if depth == 0 {
+    // A call is only truly top-level if BOTH depth counters agree: this
+    // library's export depth (`IN_ALLOC_FN`) *and* the allocator's
+    // internal guard (`Lohalloc::thread_inside_allocator`). The second
+    // check is deadlock #4's defense-in-depth: a nested malloc triggered
+    // by allocator *internals* (e.g. training's `record_latency`
+    // inserting a `BTreeMap` node while the `state` Mutex is held) can
+    // arrive through an entry point that never bumped `IN_ALLOC_FN` —
+    // `free` was exactly that — and freezing from such a context re-locks
+    // a Mutex this same thread already holds. `top_level` is about
+    // re-entrancy depth, not freeze state, so guarding these two calls on
+    // it does not reintroduce the branch-correlation bug above: `f()`
+    // itself remains unconditional regardless of `top_level`.
+    let top_level = depth == 0 && !lohalloc_alloc::Lohalloc::thread_inside_allocator();
+    if top_level {
         ensure_model_loaded();
     }
+
     let ptr = f();
-    // Guard must still be held (depth+1) through `maybe_auto_freeze()`
-    // itself, not just around `f()` — its first-ever call reads
-    // LOHALLOC_FREEZE_AFTER via `std::env::var`, which can trigger its own
-    // nested allocation (std's internal env-access lock initializing).
-    // Resetting the depth before this call would make that nested
-    // allocation look like a fresh top-level call, re-entering the exact
-    // same non-reentrant `Once` this guard exists to protect.
-    if !ptr.is_null() && depth == 0 {
+
+    if !ptr.is_null() && top_level {
         maybe_auto_freeze();
     }
     IN_ALLOC_FN.with(|c| c.set(depth));
@@ -378,7 +409,31 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
     let p = ptr as *mut u8;
     // Fused ownership-check + free: one 48-byte header read instead of the
     // two the separate `owns()` → `dealloc_raw()` sequence paid.
-    if !unsafe { ALLOC.try_dealloc_raw(p) } {
+    //
+    // Deadlock #4 guard (pre-freeze only; the `FREEZE_FIRED` branch mirrors
+    // `with_freeze_check`'s steady-state fast path): dealloc internals can
+    // themselves malloc — training's `record_latency` inserts a `BTreeMap`
+    // node while holding the `state` Mutex, and in this cdylib that nested
+    // Rust allocation re-enters our *exported* `malloc`. Without a depth
+    // bump here that nested call looked top-level, and when `MALLOC_COUNT`
+    // crossed `LOHALLOC_FREEZE_AFTER` on exactly such a call,
+    // `maybe_auto_freeze` → `freeze()` re-locked the `state` Mutex this
+    // same thread already held — reproduced as an all-threads futex_wait
+    // hang in the Docker mt-mixed train+export leg. Second layer:
+    // `with_freeze_check` also consults `Lohalloc::thread_inside_allocator`.
+    let owned = if FREEZE_FIRED.load(Ordering::Relaxed) {
+        unsafe { ALLOC.try_dealloc_raw(p) }
+    } else {
+        let depth = IN_ALLOC_FN.with(|c| {
+            let d = c.get();
+            c.set(d + 1);
+            d
+        });
+        let owned = unsafe { ALLOC.try_dealloc_raw(p) };
+        IN_ALLOC_FN.with(|c| c.set(depth));
+        owned
+    };
+    if !owned {
         if let Some(real_free) = libc_free() {
             unsafe { real_free(ptr) };
         }

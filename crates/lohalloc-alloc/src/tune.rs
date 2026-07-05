@@ -50,8 +50,6 @@
 //! | `freeze_after`      | (none)  | op-count threshold; the env var `LOHALLOC_FREEZE_AFTER` (read by `lohalloc-cabi`) takes precedence over this key |
 //! | `reward_batch`      | 16      | latency samples averaged per bandit reward update; de-quantizes the ARM ~42ns `Instant` tick floor. `1` = pre-Ladder-4 per-op behavior |
 
-use std::sync::OnceLock;
-
 /// How the training→inference transition is triggered (consumed by
 /// `lohalloc-cabi`'s auto-freeze and `native_workload`'s driver — the
 /// allocator itself never freezes spontaneously).
@@ -88,8 +86,11 @@ pub struct TrainingConfig {
     pub reward_batch: u32,
 }
 
-impl Default for TrainingConfig {
-    fn default() -> Self {
+impl TrainingConfig {
+    /// Compile-time defaults — the single source of truth (`Default`
+    /// delegates here). `const` so the `DEFAULTS` static [`config`] falls
+    /// back to before [`load_from_env`] runs needs no runtime init.
+    pub const fn defaults_const() -> Self {
         Self {
             ucb_c: 2.0,
             hysteresis: 0.15,
@@ -101,6 +102,12 @@ impl Default for TrainingConfig {
             freeze_after: None,
             reward_batch: 16,
         }
+    }
+}
+
+impl Default for TrainingConfig {
+    fn default() -> Self {
+        Self::defaults_const()
     }
 }
 
@@ -229,25 +236,36 @@ fn build_config(file_text: Option<&str>, env_pairs: &[(String, String)]) -> Trai
     cfg
 }
 
-static CONFIG: OnceLock<TrainingConfig> = OnceLock::new();
+/// The installed config (T1). Null until [`load_from_env`] runs; readers
+/// fall back to `DEFAULTS`. An `AtomicPtr` *upgrade* rather than a
+/// `OnceLock` — same publish pattern as `Lohalloc::frozen_table` — because
+/// a `OnceLock` here had a real startup-ordering bug: in a
+/// `#[global_allocator]` binary the language runtime allocates before
+/// `main`, and the bandit's per-allocation [`config`] read locked the
+/// `OnceLock` to defaults forever, silently ignoring `LOHALLOC_TUNE` /
+/// `LOHALLOC_<KEY>` for the whole process. With the pointer upgrade,
+/// pre-`main` allocations run on defaults (harmless — a handful of
+/// runtime-init call sites) and `main`'s [`load_from_env`] genuinely takes
+/// effect for all workload traffic.
+static CONFIG_PTR: core::sync::atomic::AtomicPtr<TrainingConfig> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Fallback returned by [`config`] before [`load_from_env`] installs one.
+static DEFAULTS: TrainingConfig = TrainingConfig::defaults_const();
 
 /// The process-wide training config. Never does I/O: returns what
-/// [`load_from_env`] installed, or the defaults if it was never called.
-///
-/// **Startup-ordering caveat (global-allocator / interposed builds):** the
-/// bandit's `select()` reads this on every training-mode allocation, so the
-/// *first-ever* allocation locks the `OnceLock`. Under an interposed
-/// allocator that first allocation happens inside `lohalloc-cabi`'s
-/// bootstrap-guarded `ensure_model_loaded`, which calls [`load_from_env`]
-/// first — correct. But in a plain `#[global_allocator]` binary the
-/// language runtime allocates *before* `main`, locking the config to
-/// defaults before `main` can call [`load_from_env`]. Such binaries that
-/// need a file/env-driven config value at the *harness* layer (e.g.
-/// `native_workload`'s freeze policy) must read it with
-/// [`load_config_uncached`] instead of trusting [`config`].
+/// [`load_from_env`] installed, or the defaults if it was never called
+/// (yet) — one `Acquire` load either way.
 #[inline]
 pub fn config() -> &'static TrainingConfig {
-    CONFIG.get_or_init(TrainingConfig::default)
+    let ptr = CONFIG_PTR.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        &DEFAULTS
+    } else {
+        // SAFETY: only ever set by `load_from_env` to a `Box::leak`ed
+        // TrainingConfig — 'static and immutable once published.
+        unsafe { &*ptr }
+    }
 }
 
 /// Read `LOHALLOC_TUNE` + `LOHALLOC_<KEY>` into a fresh `TrainingConfig`
@@ -277,14 +295,25 @@ pub fn load_config_uncached() -> TrainingConfig {
 }
 
 /// Load the config from `LOHALLOC_TUNE` (optional file) + `LOHALLOC_<KEY>`
-/// env overrides and install it as the process-wide config. Idempotent:
-/// only the first call (or a prior [`config`] call) wins — call it during
-/// process bootstrap, before any training traffic.
+/// env overrides and install it as the process-wide config — an *upgrade*:
+/// unlike the old `OnceLock` version, this works even after pre-`main`
+/// allocations already read [`config`]'s defaults (the
+/// `#[global_allocator]` poisoning case — see `CONFIG_PTR`'s doc). Later
+/// calls win over earlier ones; each installed config is `Box::leak`ed
+/// (bounded by the number of calls, which is once per process in every
+/// real caller — the same accepted-leak pattern as `reset_to_training`'s
+/// frozen table).
 ///
 /// **Must run inside a bootstrap-guarded context under an interposed
-/// allocator** (see the module doc's re-entrancy contract).
+/// allocator** (see the module doc's re-entrancy contract), or from plain
+/// `main` in a global-allocator binary.
 pub fn load_from_env() -> &'static TrainingConfig {
-    CONFIG.get_or_init(load_config_uncached)
+    let cfg: &'static TrainingConfig = Box::leak(Box::new(load_config_uncached()));
+    CONFIG_PTR.store(
+        cfg as *const TrainingConfig as *mut TrainingConfig,
+        std::sync::atomic::Ordering::Release,
+    );
+    cfg
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +328,28 @@ mod tests {
         list.iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn load_from_env_upgrades_after_config_was_read() {
+        // The global-allocator poisoning scenario (T1): config() is read
+        // first (as pre-main runtime allocations do), THEN load_from_env
+        // runs — the upgrade must take effect. The old OnceLock stayed
+        // locked to defaults forever in this exact sequence.
+        let before = *config();
+        std::env::set_var("LOHALLOC_UCB_C", "1.25");
+        let loaded = load_from_env();
+        std::env::remove_var("LOHALLOC_UCB_C");
+        assert_eq!(loaded.ucb_c, 1.25);
+        assert_eq!(
+            config().ucb_c,
+            1.25,
+            "config() must reflect a post-first-read load_from_env (was {before:?})"
+        );
+        // Restore process-global state for concurrently-running tests
+        // (env already cleared, so this reinstalls the defaults).
+        let restored = load_from_env();
+        assert_eq!(restored.ucb_c, TrainingConfig::default().ucb_c);
     }
 
     #[test]

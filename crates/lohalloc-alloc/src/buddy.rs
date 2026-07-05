@@ -40,16 +40,37 @@
 //! buddy pair never spans two regions — `addr ^ block_size(o)` computed on
 //! the absolute address stays inside the block's own region.
 //!
-//! ## Known limitation: header order-inflation
+//! ## Stripe safety under central sharding (Ladder 4 C3)
 //!
-//! The shim prepends a 48-byte `Header` to every allocation, so a request
-//! for an exact power of two (e.g. 32 KiB) arrives here as 32 KiB + 48 and
-//! rounds up to the *next* order (64 KiB block) — 2× internal fragmentation
-//! for pow2-sized requests, the worst case. This is inherent to inline
-//! headers + pow2 buddy blocks; fixing it would require out-of-band
-//! metadata (a different allocator design). The multi-block regions above
-//! remove the *syscall* cost of that inflation; the memory cost remains and
-//! is documented in the Phase 6 bench notes.
+//! `lib.rs` shards the central backend into `[Mutex<Buddy>; K]` stripes.
+//! Each `Buddy` instance is completely unaware of this — no code in this
+//! file changed behavior for it — because the region-boundary argument
+//! above is also a stripe-boundary argument: a region is mapped by exactly
+//! one stripe (registered region-base → stripe in `RegionRegistry` *before*
+//! any block from it is handed out; see `refill`'s `register` callback),
+//! all of a block's split-buddies and merge-partners live inside its own
+//! region, and coalescing never crosses a region boundary. Therefore
+//! coalescing can never need state from another stripe, and routing every
+//! free to the region's owning stripe (which `lib.rs` does via the
+//! registry) is sufficient for full correctness — there is no cross-stripe
+//! metadata, ever, and merge-on-spill is untouched.
+//!
+//! ## Header order-inflation (training only, since J1)
+//!
+//! The shim prepends a 48-byte `Header` to every *training-mode*
+//! allocation, so a request for an exact power of two (e.g. 32 KiB)
+//! arrives here as 32 KiB + 48 and rounds up to the *next* order (64 KiB
+//! block) — 2× internal fragmentation for pow2-sized requests. Ladder 4 J1
+//! removed this in **inference**: a `load()`-booted instance serves Buddy
+//! header-free (see `record_orders`/the per-region order map, and
+//! `lib.rs::buddy_headerless`), so pow2 requests get exact-order blocks
+//! and fresh untouched blocks are never written to at all (the header
+//! write was one minor page fault per fresh block — measured as ~18× more
+//! faults than jemalloc on adv-mixed before J1). Training keeps headers
+//! because dealloc-side reward attribution needs `hash`/`size_class_hint`.
+//! One residual: the routing gate compares `total` (request + pad), so an
+//! exact-1 MiB request still routes to System even headerless — accepted,
+//! the SystemCache path outperforms there anyway.
 
 use crate::system;
 use lohalloc_core::{round_up_pow2, MIN_ALIGN};
@@ -62,7 +83,7 @@ const MIN_BLOCK: usize = MIN_ALIGN;
 /// Maximum order index. Order `o` holds blocks of size `MIN_BLOCK << o`.
 /// We cap at `BUDDY_MAX`, which is 1 MiB — requests above that go to the System
 /// Fallback directly (whole-page `mmap`).
-const MAX_ORDER: usize = {
+pub(crate) const MAX_ORDER: usize = {
     let mut o = 0;
     let mut s = MIN_BLOCK;
     while s < lohalloc_core::BUDDY_MAX {
@@ -76,7 +97,7 @@ const MAX_ORDER: usize = {
 /// (1 MiB) blocks per `mmap`. Must be a power-of-two multiple of
 /// `BUDDY_MAX` so (a) whole top-order blocks tile it exactly and (b) the
 /// region-alignment argument in `free_order`'s coalescing invariant holds.
-const REGION_BYTES: usize = 4 * lohalloc_core::BUDDY_MAX;
+pub(crate) const REGION_BYTES: usize = 4 * lohalloc_core::BUDDY_MAX;
 
 /// log2(MIN_BLOCK), so a block index inside a region is
 /// `(addr - base) >> (MIN_BLOCK_SHIFT + order)`.
@@ -99,6 +120,36 @@ const ORDER_BIT_OFFSET: [usize; NUM_ORDERS + 1] = {
 
 /// `u64` words needed for one region's free bitmap.
 const BITMAP_WORDS: usize = ORDER_BIT_OFFSET[NUM_ORDERS].div_ceil(64);
+
+/// J1 headerless mode: granularity of the per-region **order map** — one
+/// byte per `MIN_HEADERLESS_ORDER`-sized (16 KiB) slot recording the buddy
+/// order of the live block starting there. Blocks below this order are
+/// never served headerless (routing sends ≤ `SLAB_MAX` to the Slab; the
+/// rare slab-exhausted fallthrough of a smaller size is rejected by the
+/// headerless gate in `lib.rs` and lands on System instead).
+pub(crate) const MIN_HEADERLESS_ORDER: usize = 10;
+
+/// Order-map slots per region (256 for 4 MiB / 16 KiB).
+const ORDER_MAP_SLOTS: usize = REGION_BYTES >> (MIN_BLOCK_SHIFT + MIN_HEADERLESS_ORDER);
+
+/// `u64` words the order map occupies beside the bitmap in each region's
+/// metadata carve.
+const ORDER_MAP_WORDS: usize = ORDER_MAP_SLOTS.div_ceil(8);
+
+/// One region's full out-of-band metadata: free bitmap + order map.
+const METADATA_WORDS: usize = BITMAP_WORDS + ORDER_MAP_WORDS;
+
+/// Order-map slot index for a block address inside its region.
+#[inline]
+pub(crate) fn order_map_slot(addr: usize, region_base: usize) -> usize {
+    (addr - region_base) >> (MIN_BLOCK_SHIFT + MIN_HEADERLESS_ORDER)
+}
+
+/// Block size in bytes for a buddy order (`MIN_BLOCK << order`).
+#[inline]
+pub(crate) fn block_size_of(order: usize) -> usize {
+    block_size(order)
+}
 
 /// Intrusive doubly-linked free-list node living at the head of each free
 /// block. Doubly-linked (unlike the original singly-linked version) so
@@ -154,6 +205,14 @@ struct Region {
     /// kernel-zeroed) at first use. (No `bytes` field: every region is
     /// exactly `REGION_BYTES`.)
     bitmap: *mut u64,
+    /// J1: `ORDER_MAP_SLOTS` order bytes carved immediately after the
+    /// bitmap (same metadata block, same lifetime guarantees). Written at
+    /// block hand-out when `record_orders` is on; read lock-free by
+    /// `lib.rs`'s headerless free dispatch via the address published in
+    /// `RegionRegistry` (each byte accessed as an `AtomicU8` — the
+    /// cross-thread hand-off is ordered by pointer publication, the atomic
+    /// keeps it TSAN-clean and UB-free).
+    order_map: *mut u8,
     _mapping: system::Mapping,
 }
 
@@ -231,6 +290,11 @@ pub struct Buddy {
     /// Backing storage for regions' bitmaps, batched `BITMAP_BATCH` at a
     /// time (see `BitmapBatch`'s doc) instead of one `mmap` per region.
     bitmap_batches: Vec<BitmapBatch>,
+    /// J1: when set (headerless inference, flipped once by `lib.rs` inside
+    /// `load()` under this stripe's lock), every block hand-out records
+    /// its order in the region's order map so `free(ptr)` can recover it
+    /// without a header. One branch per alloc when off.
+    record_orders: bool,
 }
 
 impl Default for Buddy {
@@ -248,23 +312,46 @@ impl Buddy {
             regions: Vec::new(),
             last_region: 0,
             bitmap_batches: Vec::new(),
+            record_orders: false,
         }
+    }
+
+    /// Enable order recording for headerless serving (J1). Called by
+    /// `lib.rs`'s `load()` under this stripe's lock, only on an untouched
+    /// stripe (`region_count() == 0`), so every region this stripe will
+    /// ever carve records orders from its first block.
+    pub(crate) fn set_record_orders(&mut self) {
+        debug_assert!(
+            self.regions.is_empty(),
+            "record_orders must be enabled before any region exists"
+        );
+        self.record_orders = true;
     }
 
     /// Allocate `size` bytes, aligned to at least `MIN_ALIGN`. Returns `None`
     /// if `size` exceeds `BUDDY_MAX` (the shim routes those to the System
     /// backend).
     ///
+    /// `register` is called with each fresh region's base *before* any block
+    /// from that region can be returned (see `refill`); returning `false`
+    /// discards the region and fails the allocation. Striped callers
+    /// (Ladder 4 C3) use it to record region → stripe ownership; standalone
+    /// use passes `&mut |_| true`.
+    ///
     /// # Safety contract for the caller
     /// The returned pointer is valid until `dealloc` is called with the same
     /// pointer and the same `size`. Reading/writing beyond the rounded block
     /// size is UB.
-    pub fn alloc(&mut self, size: usize) -> Option<*mut u8> {
+    pub fn alloc(
+        &mut self,
+        size: usize,
+        register: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> Option<*mut u8> {
         if size == 0 || size > lohalloc_core::BUDDY_MAX {
             return None;
         }
         let order = order_for(size)?;
-        let block = self.alloc_order(order)?;
+        let block = self.alloc_order(order, register)?;
         Some(block)
     }
 
@@ -295,11 +382,16 @@ impl Buddy {
     /// than requested — the first time `alloc_order` returns `None` (only
     /// possible on genuine System exhaustion; a healthy `refill()` never
     /// partially fails). Returns the number of pointers written to `out`.
-    pub(crate) fn alloc_order_batch(&mut self, order: usize, out: &mut [*mut u8]) -> usize {
+    pub(crate) fn alloc_order_batch(
+        &mut self,
+        order: usize,
+        out: &mut [*mut u8],
+        register: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> usize {
         debug_assert!(order <= MAX_ORDER);
         let mut n = 0;
         while n < out.len() {
-            match self.alloc_order(order) {
+            match self.alloc_order(order, register) {
                 Some(block) => {
                     out[n] = block;
                     n += 1;
@@ -333,7 +425,11 @@ impl Buddy {
     /// needed. Free blocks are found in this priority: per-order pointer
     /// cache (no block-memory touch) → intrusive list → lazy coalesce of
     /// everything freed so far → fresh region.
-    fn alloc_order(&mut self, order: usize) -> Option<*mut u8> {
+    fn alloc_order(
+        &mut self,
+        order: usize,
+        register: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> Option<*mut u8> {
         debug_assert!(order <= MAX_ORDER);
 
         loop {
@@ -357,7 +453,7 @@ impl Buddy {
                 // workloads (free-then-realloc at the same order) merged
                 // as far as they can go — a miss here just means genuine
                 // growth, so map more memory.
-                self.refill()?;
+                self.refill(register)?;
                 continue;
             }
 
@@ -386,6 +482,17 @@ impl Buddy {
                 o -= 1;
                 let buddy = (b + block_size(o)) as *mut u8;
                 self.stash_free(buddy, o, region_idx);
+            }
+            // J1: record the handed-out block's order so a headerless
+            // `free(ptr)` can recover it from the address alone. Atomic
+            // store (Relaxed) — see `Region::order_map`'s doc.
+            if self.record_orders && order >= MIN_HEADERLESS_ORDER {
+                let region = &self.regions[region_idx];
+                let slot = order_map_slot(b, region.base as usize);
+                unsafe {
+                    (*(region.order_map.add(slot) as *const core::sync::atomic::AtomicU8))
+                        .store(order as u8, core::sync::atomic::Ordering::Relaxed);
+                }
             }
             return Some(b as *mut u8);
         }
@@ -580,13 +687,16 @@ impl Buddy {
     /// Hands out `BITMAP_WORDS` zeroed words for a freshly refilled region,
     /// allocating a new batch `mmap` only every `BITMAP_BATCH` regions
     /// instead of on every single one (see `BitmapBatch`'s doc).
-    fn alloc_bitmap(&mut self) -> Option<*mut u64> {
+    /// Returns `(bitmap, order_map)` — one region's metadata carve. The
+    /// order map lives immediately after the bitmap words (J1); both come
+    /// zeroed from the batch `mmap`.
+    fn alloc_bitmap(&mut self) -> Option<(*mut u64, *mut u8)> {
         let need_new_batch = match self.bitmap_batches.last() {
             Some(b) => b.used >= BITMAP_BATCH,
             None => true,
         };
         if need_new_batch {
-            let bytes = BITMAP_WORDS * BITMAP_BATCH * 8;
+            let bytes = METADATA_WORDS * BITMAP_BATCH * 8;
             let mapping = system::alloc_pages(bytes, 8)?;
             let base = mapping.as_ptr() as *mut u64;
             self.bitmap_batches.push(BitmapBatch {
@@ -597,15 +707,28 @@ impl Buddy {
         }
         // Just pushed if empty/exhausted, so this is always Some.
         let batch = self.bitmap_batches.last_mut().unwrap();
-        let ptr = unsafe { batch.base.add(batch.used * BITMAP_WORDS) };
+        let ptr = unsafe { batch.base.add(batch.used * METADATA_WORDS) };
         batch.used += 1;
-        Some(ptr)
+        let order_map = unsafe { ptr.add(BITMAP_WORDS) } as *mut u8;
+        Some((ptr, order_map))
     }
 
-    fn refill(&mut self) -> Option<()> {
+    fn refill(&mut self, register: &mut dyn FnMut(usize, usize) -> bool) -> Option<()> {
         let region = system::alloc_pages(REGION_BYTES, REGION_BYTES)?;
-        let bitmap = self.alloc_bitmap()?;
         let base = region.as_ptr();
+        let (bitmap, order_map) = self.alloc_bitmap()?;
+        // Register the region BEFORE carving it into blocks: once a block
+        // has been handed out, its eventual free must be able to resolve
+        // the region (striped callers: to the owning stripe; headerless
+        // callers additionally: to this order map), so a region that can't
+        // be registered must never contribute a block. Dropping `region`
+        // here unmaps it — the refill fails cleanly and the caller falls
+        // through to the System backend. (The metadata carve above is not
+        // reclaimed on failure — a few hundred bytes inside a shared batch
+        // mmap, bounded by registry capacity.)
+        if !register(base as usize, order_map as usize) {
+            return None;
+        }
         // Keep `regions` sorted by base so lookups can binary-search. Refill
         // is rare (once per 4 MiB), so the O(n) insert shift is noise.
         let idx = self
@@ -616,6 +739,7 @@ impl Buddy {
             Region {
                 base,
                 bitmap,
+                order_map,
                 _mapping: region,
             },
         );
@@ -655,6 +779,12 @@ impl Buddy {
 
 #[cfg(test)]
 impl Buddy {
+    /// Test-only `alloc` without region registration (standalone `Buddy`
+    /// use — no stripes, so every region trivially "registers").
+    fn alloc_t(&mut self, size: usize) -> Option<*mut u8> {
+        self.alloc(size, &mut |_, _| true)
+    }
+
     /// Test-only read-only region lookup (mirrors `region_index_of` without
     /// mutating the last-hit cache).
     fn region_index_for_test(&self, addr: usize) -> Option<usize> {
@@ -774,7 +904,7 @@ mod tests {
     #[test]
     fn alloc_and_free_roundtrip() {
         let mut b = Buddy::new();
-        let p = b.alloc(100).expect("alloc 100");
+        let p = b.alloc_t(100).expect("alloc 100");
         assert!(!p.is_null());
         assert!(is_aligned(p as usize, MIN_ALIGN));
         unsafe { core::ptr::write_bytes(p, 0x7E, 100) };
@@ -787,14 +917,14 @@ mod tests {
         // can satisfy a single block of the next order without a new region.
         let mut b = Buddy::new();
         let before = b.region_count();
-        let p1 = b.alloc(64).expect("alloc 64 #1");
-        let p2 = b.alloc(64).expect("alloc 64 #2");
+        let p1 = b.alloc_t(64).expect("alloc 64 #1");
+        let p2 = b.alloc_t(64).expect("alloc 64 #2");
         assert!(b.region_count() > before, "expected a refill");
         unsafe { b.dealloc(p1, 64) };
         unsafe { b.dealloc(p2, 64) };
         // Coalesced block should now satisfy a 128-byte request without mapping.
         let before2 = b.region_count();
-        let p3 = b.alloc(128).expect("alloc 128 after coalesce");
+        let p3 = b.alloc_t(128).expect("alloc 128 after coalesce");
         assert_eq!(
             b.region_count(),
             before2,
@@ -806,8 +936,8 @@ mod tests {
     #[test]
     fn neighbors_do_not_overlap() {
         let mut b = Buddy::new();
-        let p1 = b.alloc(64).expect("a1");
-        let p2 = b.alloc(64).expect("a2");
+        let p1 = b.alloc_t(64).expect("a1");
+        let p2 = b.alloc_t(64).expect("a2");
         let a1 = p1 as usize;
         let a2 = p2 as usize;
         let bs = round_up_pow2(64).max(MIN_BLOCK);
@@ -823,7 +953,7 @@ mod tests {
     #[test]
     fn min_block_alignment() {
         let mut b = Buddy::new();
-        let p = b.alloc(1).expect("alloc 1");
+        let p = b.alloc_t(1).expect("alloc 1");
         assert!(is_aligned(p as usize, MIN_BLOCK));
         unsafe { b.dealloc(p, 1) };
     }
@@ -831,8 +961,8 @@ mod tests {
     #[test]
     fn rejects_oversize() {
         let mut b = Buddy::new();
-        assert!(b.alloc(0).is_none());
-        assert!(b.alloc(lohalloc_core::BUDDY_MAX + 1).is_none());
+        assert!(b.alloc_t(0).is_none());
+        assert!(b.alloc_t(lohalloc_core::BUDDY_MAX + 1).is_none());
     }
 
     #[test]
@@ -841,7 +971,7 @@ mod tests {
         let mut live = Vec::new();
         for _ in 0..5 {
             for _ in 0..4 {
-                live.push(b.alloc(64).expect("alloc"));
+                live.push(b.alloc_t(64).expect("alloc"));
             }
             for p in live.drain(..) {
                 unsafe { b.dealloc(p, 64) };
@@ -860,14 +990,14 @@ mod tests {
         let mut b = Buddy::new();
         let mut live = Vec::new();
         for _ in 0..per_region {
-            live.push(b.alloc(top).expect("top-order alloc"));
+            live.push(b.alloc_t(top).expect("top-order alloc"));
         }
         assert_eq!(
             b.region_count(),
             1,
             "first {per_region} blocks share one region"
         );
-        live.push(b.alloc(top).expect("overflow top-order alloc"));
+        live.push(b.alloc_t(top).expect("overflow top-order alloc"));
         assert_eq!(b.region_count(), 2, "next block needs a second region");
         for p in live.drain(..) {
             unsafe { b.dealloc(p, top) };
@@ -887,7 +1017,7 @@ mod tests {
         let target_regions = BITMAP_BATCH * 2 + 3; // spans 3 separate batches
         let mut live = Vec::new();
         for _ in 0..(target_regions * per_region) {
-            live.push(b.alloc(top).expect("top-order alloc"));
+            live.push(b.alloc_t(top).expect("top-order alloc"));
         }
         assert_eq!(b.region_count(), target_regions);
         b.check_invariants();
@@ -904,14 +1034,14 @@ mod tests {
         // and a subsequent top-order alloc must reuse without a refill.
         let top = lohalloc_core::BUDDY_MAX;
         let mut b = Buddy::new();
-        let p1 = b.alloc(top).expect("top #1");
-        let p2 = b.alloc(top).expect("top #2");
+        let p1 = b.alloc_t(top).expect("top #1");
+        let p2 = b.alloc_t(top).expect("top #2");
         assert_eq!(b.region_count(), 1);
         unsafe {
             b.dealloc(p1, top);
             b.dealloc(p2, top);
         }
-        let p3 = b.alloc(top).expect("top after frees");
+        let p3 = b.alloc_t(top).expect("top after frees");
         assert_eq!(b.region_count(), 1, "reuse must not map a new region");
         unsafe { b.dealloc(p3, top) };
     }
@@ -926,7 +1056,7 @@ mod tests {
         // the order-2 free list in non-address order, so a later coalesce
         // has to unlink from the middle.
         let ps: Vec<_> = (0..6)
-            .map(|i| b.alloc(64).unwrap_or_else(|| panic!("a{i}")))
+            .map(|i| b.alloc_t(64).unwrap_or_else(|| panic!("a{i}")))
             .collect();
         unsafe {
             b.dealloc(ps[1], 64);
@@ -938,9 +1068,9 @@ mod tests {
         }
         // Everything freed and (partially) coalesced: allocate a spread of
         // sizes to walk the surviving lists.
-        let q1 = b.alloc(64).expect("post-churn 64");
-        let q2 = b.alloc(128).expect("post-churn 128");
-        let q3 = b.alloc(64).expect("post-churn 64 #2");
+        let q1 = b.alloc_t(64).expect("post-churn 64");
+        let q2 = b.alloc_t(128).expect("post-churn 128");
+        let q3 = b.alloc_t(64).expect("post-churn 64 #2");
         unsafe {
             b.dealloc(q1, 64);
             b.dealloc(q2, 128);
@@ -958,7 +1088,7 @@ mod tests {
         let sizes = [16, 64, 200, 1024, 8192, 65536];
         let mut live = Vec::new();
         for &sz in &sizes {
-            live.push((b.alloc(sz).expect("alloc"), sz));
+            live.push((b.alloc_t(sz).expect("alloc"), sz));
             b.check_invariants();
         }
         // Free every other one, then the rest — exercises both plain frees
@@ -989,7 +1119,7 @@ mod tests {
         // 64 KiB blocks: REGION/64KiB = 64 of them fill the region exactly.
         let n = REGION_BYTES / (64 * 1024);
         for i in 0..n {
-            small.push(b.alloc(64 * 1024).unwrap_or_else(|| panic!("small {i}")));
+            small.push(b.alloc_t(64 * 1024).unwrap_or_else(|| panic!("small {i}")));
         }
         assert_eq!(b.region_count(), 1);
         for p in small.drain(..) {
@@ -1001,7 +1131,7 @@ mod tests {
         // coalesced most of this region by now (lazy, not batched) — the
         // top-order request finds a fully-merged block waiting, or at
         // worst finishes the job; either way, no new region.
-        let big = b.alloc(top).expect("coalesced top-order block");
+        let big = b.alloc_t(top).expect("coalesced top-order block");
         assert_eq!(
             b.region_count(),
             1,
@@ -1021,14 +1151,14 @@ mod tests {
         let mut ptrs = Vec::new();
         let count = ORDER_CACHE * 2 + 7;
         for i in 0..count {
-            ptrs.push(b.alloc(4096).unwrap_or_else(|| panic!("alloc {i}")));
+            ptrs.push(b.alloc_t(4096).unwrap_or_else(|| panic!("alloc {i}")));
         }
         for p in ptrs.drain(..) {
             unsafe { b.dealloc(p, 4096) };
         }
         b.check_invariants();
         for i in 0..count {
-            ptrs.push(b.alloc(4096).unwrap_or_else(|| panic!("realloc {i}")));
+            ptrs.push(b.alloc_t(4096).unwrap_or_else(|| panic!("realloc {i}")));
         }
         b.check_invariants();
         for p in ptrs {
@@ -1048,7 +1178,7 @@ mod tests {
         let order = order_for(64 * 1024).unwrap();
 
         let mut buf = [core::ptr::null_mut::<u8>(); 6];
-        let n = b.alloc_order_batch(order, &mut buf);
+        let n = b.alloc_order_batch(order, &mut buf, &mut |_, _| true);
         assert_eq!(n, 6, "a fresh Buddy should satisfy a small batch in full");
         b.check_invariants();
 
@@ -1066,7 +1196,7 @@ mod tests {
 
         // The freed batch must be fully reusable afterwards.
         let mut buf2 = [core::ptr::null_mut::<u8>(); 6];
-        let n2 = b.alloc_order_batch(order, &mut buf2);
+        let n2 = b.alloc_order_batch(order, &mut buf2, &mut |_, _| true);
         assert_eq!(n2, 6);
         b.check_invariants();
         unsafe { b.dealloc_order_batch(order, &buf2) };
@@ -1082,7 +1212,7 @@ mod tests {
         let sizes = [16, 32, 64, 128, 256, 512, 1024];
         for round in 0..100 {
             for &sz in &sizes {
-                if let Some(p) = b.alloc(sz) {
+                if let Some(p) = b.alloc_t(sz) {
                     pool.push((p, sz));
                 }
             }

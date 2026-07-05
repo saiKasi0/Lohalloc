@@ -150,9 +150,144 @@ impl SegmentRegistry {
     }
 }
 
+/// Insert-only, lock-free **buddy region → stripe** registry (Ladder 4 C3).
+///
+/// Same table, same soundness story as [`SegmentRegistry`] (see its module
+/// and method docs — publish ordering, saturation semantics, single-writer
+/// insert discipline), but keyed on `buddy::REGION_BYTES`-aligned region
+/// bases and valued with the index of the `[Mutex<Buddy>; K]` stripe that
+/// owns the region. Frees resolve their owning stripe from
+/// `ptr & !(REGION_BYTES - 1)` alone — O(1), no lock, exact (never "best
+/// effort": a block must only ever be freed into the stripe whose `Buddy`
+/// tracks its region's bitmap).
+///
+/// Capacity is the shared `CAPACITY` (1024): at 4 MiB per region that
+/// covers 4 GiB of live buddy memory before saturation. Saturation is
+/// handled *at allocation time* — `Buddy::refill` registers a fresh region
+/// **before** carving it and fails the refill (unmapping the region) if
+/// registration fails, so no block from an unregistered region can ever
+/// reach a caller. A free-side lookup miss therefore indicates a foreign
+/// pointer bug, not saturation, and is debug-asserted.
+///
+/// Reentrancy note (the Ladder-4 standing rule): `insert` is called while
+/// a stripe's `Mutex<Buddy>` is held. That is safe **only** because this
+/// table is fixed-size embedded atomics — it can never allocate. Do not
+/// replace it with a growable structure.
+///
+/// Besides the stripe, each entry carries the region's **order-map base**
+/// (Ladder 4 J1): the per-region out-of-band array holding each live
+/// block's buddy order, which lets a headerless `free(ptr)` recover
+/// `(stripe, order)` from the address alone with one probe and **no stripe
+/// lock**. Both payload words are written before the key is published via
+/// the `Release` CAS — the exact ordering rule `SegmentRegistry::insert`'s
+/// doc derives from the ARM64 key-before-val SIGSEGV.
+pub struct RegionRegistry {
+    /// `0` = empty; region bases are nonzero and `REGION_BYTES`-aligned.
+    keys: [AtomicUsize; CAPACITY],
+    /// Owning `[Mutex<Buddy>]` stripe index.
+    stripes: [AtomicU8; CAPACITY],
+    /// Address of the region's order map (`REGION_BYTES >> 14` order
+    /// bytes, one per 16 KiB slot), or 0 for none.
+    maps: [AtomicUsize; CAPACITY],
+}
+
+impl Default for RegionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RegionRegistry {
+    pub const fn new() -> Self {
+        Self {
+            keys: [EMPTY_KEY; CAPACITY],
+            stripes: [EMPTY_VAL; CAPACITY],
+            maps: [EMPTY_KEY; CAPACITY],
+        }
+    }
+
+    /// Register `base` (a fresh `REGION_BYTES`-aligned region base) as
+    /// owned by `stripe`, with its order map at `map`. Returns `false` on
+    /// saturation — the caller must then discard the region (see the type
+    /// doc). Same single-writer + payload-before-publish discipline as
+    /// [`SegmentRegistry::insert`].
+    #[must_use]
+    pub fn insert(&self, base: usize, stripe: u8, map: usize) -> bool {
+        debug_assert!(base != 0, "region base must be nonzero");
+        let mut idx = SegmentRegistry::slot_for(base);
+        for _ in 0..CAPACITY {
+            let existing = self.keys[idx].load(Ordering::Acquire);
+            if existing == base {
+                return true; // already registered
+            }
+            if existing == 0 {
+                // Payloads BEFORE the key publish (see the type doc).
+                self.stripes[idx].store(stripe, Ordering::Relaxed);
+                self.maps[idx].store(map, Ordering::Relaxed);
+                match self.keys[idx].compare_exchange(0, base, Ordering::Release, Ordering::Relaxed)
+                {
+                    Ok(_) => return true,
+                    Err(actual) if actual == base => return true,
+                    Err(_) => {} // lost a theoretical race; advance
+                }
+            }
+            idx = (idx + 1) & (CAPACITY - 1);
+        }
+        false // Saturated.
+    }
+
+    /// Owning stripe for `base` (already masked to the region base by the
+    /// caller), or `None` for a pointer in no registered region.
+    #[inline]
+    pub fn lookup(&self, base: usize) -> Option<u8> {
+        self.lookup_full(base).map(|(stripe, _)| stripe)
+    }
+
+    /// `(stripe, order_map_base)` for `base`, or `None` on a miss.
+    #[inline]
+    pub fn lookup_full(&self, base: usize) -> Option<(u8, usize)> {
+        let mut idx = SegmentRegistry::slot_for(base);
+        for _ in 0..CAPACITY {
+            let k = self.keys[idx].load(Ordering::Acquire);
+            if k == 0 {
+                return None;
+            }
+            if k == base {
+                return Some((
+                    self.stripes[idx].load(Ordering::Acquire),
+                    self.maps[idx].load(Ordering::Acquire),
+                ));
+            }
+            idx = (idx + 1) & (CAPACITY - 1);
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn region_registry_roundtrips_stripe_and_map() {
+        let r = RegionRegistry::new();
+        assert!(r.insert(0x40_0000, 2, 0xDEAD_0000));
+        assert_eq!(r.lookup(0x40_0000), Some(2));
+        assert_eq!(r.lookup_full(0x40_0000), Some((2, 0xDEAD_0000)));
+        assert_eq!(r.lookup_full(0x80_0000), None);
+        // Duplicate insert is a no-op keeping the original payloads.
+        assert!(r.insert(0x40_0000, 3, 0xBEEF_0000));
+        assert_eq!(r.lookup_full(0x40_0000), Some((2, 0xDEAD_0000)));
+    }
+
+    #[test]
+    fn region_registry_saturation_reports_failure() {
+        let r = RegionRegistry::new();
+        for i in 0..CAPACITY {
+            assert!(r.insert(0x1000_0000 + i * 0x40_0000, (i % 4) as u8, i));
+        }
+        assert!(!r.insert(0x1000_0000 + CAPACITY * 0x40_0000, 0, 0));
+    }
 
     #[test]
     fn insert_then_lookup_hits() {
