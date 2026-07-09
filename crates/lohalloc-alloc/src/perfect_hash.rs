@@ -55,15 +55,28 @@
 //!
 //! # Serialization (`.lohalloc` model file)
 //!
-//! `serialize()` / `deserialize()` implement a compact binary format:
+//! [`FrozenRouting::serialize`] / [`FrozenRouting::deserialize`] implement a
+//! compact binary format:
 //!
 //! ```text
 //! [8 bytes]  magic:     0x434f4c4c41484f4c  (LE bytes spell "LOHALLOC")
-//! [4 bytes]  version:   u32 (2)
-//! [4 bytes]  entry_count: u32
-//! [N × 12]   entries:   (hash: u64 le, backend: u8, size_class: u8, _pad: [u8; 2])
-//! [8 bytes]  checksum:  XOR of all hash values
+//! [4 bytes]  version:   u32 (3)
+//! [4 bytes]  main_count: u32
+//! [4 bytes]  distilled_count: u32
+//! [N × 12]   main entries:      (hash: u64 le, backend: u8, size_class: u8, _pad: [u8; 2])
+//! [M × 12]   distilled entries: same layout
+//! [8 bytes]  checksum:  XOR of all hash values (main AND distilled)
 //! ```
+//!
+//! **v3** (Ladder 6): the file carries *two* tables. `main` keys on the full
+//! 3-frame `combine_hash_size_class(caller_pc, size_class)` exactly as v2
+//! did; `distilled` keys on `combine_hash_size_class(one_frame_hash,
+//! size_class)` for the call sites freeze-time analysis proved route
+//! identically across every observed 3-frame context — the pinnable subset
+//! served by the Inference pin cache without a full stack walk. v1/v2 files
+//! are rejected outright (same rationale as the v2 bump: models are
+//! per-binary and regenerated per run, never migrated — a silently
+//! half-loaded model is worse than a loud reject).
 //!
 //! **v2** (Phase 6): `hash` is `state::combine_hash_size_class(caller_pc,
 //! size_class)`, not the raw call-site hash — v1 keyed the frozen table on
@@ -92,10 +105,12 @@ use lohalloc_core::Backend;
 /// "LOHALLOC".
 const MAGIC: u64 = 0x434f4c4c41484f4c;
 
-/// Current serialization format version. Bumped to 2 in Phase 6: `hash` is
-/// now `combine_hash_size_class(caller_pc, size_class)` rather than a raw
-/// call-site hash — see the module doc's "Serialization" section.
-const VERSION: u32 = 2;
+/// Current serialization format version. Bumped to 3 in Ladder 6: the file
+/// now carries a second (distilled 1-frame) table — see the module doc's
+/// "Serialization" section. v2 keyed `hash` on
+/// `combine_hash_size_class(caller_pc, size_class)` (unchanged for the main
+/// table); v1 keyed on the raw call-site hash.
+const VERSION: u32 = 3;
 
 /// One routing entry: a combined `(hash, size_class)` key
 /// (`state::combine_hash_size_class`) mapped to the backend that won the
@@ -430,117 +445,165 @@ impl PerfectHashTable {
         out
     }
 
-    /// Serialize the routing table to a `.lohalloc` binary byte vector.
+    /// Serialize this table alone as a full v3 `.lohalloc` byte vector with
+    /// an **empty distilled section** — the convenience used by
+    /// forced-routing test models (`lohalloc-bench`'s `forced_model_bytes`)
+    /// and unit tests, which only ever exercise main-table routing.
+    /// Production models are serialized via [`FrozenRouting::serialize`].
+    pub fn serialize(&self) -> Vec<u8> {
+        FrozenRouting {
+            main: self.clone(),
+            distilled: PerfectHashTable::from_entries(Vec::new()),
+        }
+        .serialize()
+    }
+
+    /// Deserialize a v3 `.lohalloc` byte slice and keep only the **main**
+    /// table — test/back-compat convenience mirroring [`Self::serialize`].
+    /// Production loads go through [`FrozenRouting::deserialize`].
+    pub fn deserialize(data: &[u8]) -> Option<Self> {
+        FrozenRouting::deserialize(data).map(|r| r.main)
+    }
+}
+
+/// The complete frozen decision plane: the classic 3-frame-keyed `main`
+/// table plus the Ladder-6 `distilled` table of 1-frame-keyed entries for
+/// call sites whose routing is provably context-independent (every observed
+/// 3-frame context agrees). `distilled` is what licenses the Inference pin
+/// cache to serve a site from just its raw leaf return address.
+///
+/// `Clone` for the same reason `PerfectHashTable` is: `freeze()`/`load()`
+/// publish an immutable copy through a lock-free `AtomicPtr`.
+#[derive(Clone)]
+pub struct FrozenRouting {
+    /// Keys: `combine_hash_size_class(3-frame caller_pc hash, size_class)`.
+    pub main: PerfectHashTable,
+    /// Keys: `combine_hash_size_class(1-frame hash, size_class)`; strict
+    /// subset of sites (unambiguous only), possibly empty.
+    pub distilled: PerfectHashTable,
+}
+
+impl FrozenRouting {
+    /// Serialize both tables to a v3 `.lohalloc` binary byte vector.
     ///
     /// Entries are written sorted by hash so the output is deterministic
-    /// (independent of which construction seed the MPHF landed on) — MPHF
+    /// (independent of which construction seed each MPHF landed on) — MPHF
     /// metadata is rebuilt at `deserialize()` time, never serialized.
     pub fn serialize(&self) -> Vec<u8> {
-        let entries = self.entries(); // already sorted by hash
+        let main = self.main.entries(); // already sorted by hash
+        let distilled = self.distilled.entries();
 
-        // 8 (magic) + 4 (version) + 4 (count) + entries * 12 + 8 (checksum)
-        let mut buf = Vec::with_capacity(16 + entries.len() * 12 + 8);
+        // magic(8) + version(4) + counts(4+4) + entries*12 + checksum(8)
+        let mut buf = Vec::with_capacity(20 + (main.len() + distilled.len()) * 12 + 8);
 
-        // Magic.
         buf.extend_from_slice(&MAGIC.to_le_bytes());
-        // Version.
         buf.extend_from_slice(&VERSION.to_le_bytes());
-        // Entry count.
-        let count = entries.len() as u32;
-        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(&(main.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(distilled.len() as u32).to_le_bytes());
 
-        // Entries.
         let mut checksum: u64 = 0;
-        for (hash, size_class, backend) in &entries {
-            buf.extend_from_slice(&hash.to_le_bytes());
-            buf.push(*backend as u8);
-            buf.push(*size_class);
-            buf.extend_from_slice(&[0u8; 2]); // padding
-            checksum ^= hash;
+        for section in [&main, &distilled] {
+            for (hash, size_class, backend) in section.iter() {
+                buf.extend_from_slice(&hash.to_le_bytes());
+                buf.push(*backend as u8);
+                buf.push(*size_class);
+                buf.extend_from_slice(&[0u8; 2]); // padding
+                checksum ^= hash;
+            }
         }
 
-        // Checksum.
         buf.extend_from_slice(&checksum.to_le_bytes());
-
         buf
     }
 
-    /// Deserialize a `.lohalloc` binary byte slice into a `PerfectHashTable`.
+    /// Deserialize a v3 `.lohalloc` binary byte slice.
     ///
-    /// Returns `None` if the data is malformed (bad magic, bad version,
-    /// truncated, or checksum mismatch).
+    /// Returns `None` if the data is malformed: bad magic, non-v3 version
+    /// (v1/v2 files are rejected outright — see the module doc), truncated,
+    /// or checksum mismatch.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        // Minimum size: magic(8) + version(4) + count(4) + checksum(8) = 24
-        if data.len() < 24 {
+        // Minimum size: magic(8) + version(4) + counts(8) + checksum(8) = 28
+        if data.len() < 28 {
             return None;
         }
 
         let mut pos = 0;
 
-        // Magic.
         let magic = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
         pos += 8;
         if magic != MAGIC {
             return None;
         }
 
-        // Version.
         let version = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?);
         pos += 4;
         if version != VERSION {
             return None;
         }
 
-        // Entry count.
-        let count = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        let main_count = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        pos += 4;
+        let distilled_count = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
         pos += 4;
 
-        // Check total size.
-        let expected_len = 16 + count * 12 + 8;
+        let expected_len = 20 + (main_count.checked_add(distilled_count)?) * 12 + 8;
         if data.len() < expected_len {
             return None;
         }
 
-        // Entries.
-        let mut entries = Vec::with_capacity(count);
         let mut checksum: u64 = 0;
-        for _ in 0..count {
-            let hash = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
-            pos += 8;
-            let backend_byte = data[pos];
-            let size_class = data[pos + 1];
-            pos += 4; // backend(1) + size_class(1) + padding(2)
+        let mut read_section = |pos: &mut usize, count: usize| -> Option<Vec<Entry>> {
+            let mut entries = Vec::with_capacity(count);
+            for _ in 0..count {
+                let hash = u64::from_le_bytes(data[*pos..*pos + 8].try_into().ok()?);
+                *pos += 8;
+                let backend_byte = data[*pos];
+                let size_class = data[*pos + 1];
+                *pos += 4; // backend(1) + size_class(1) + padding(2)
 
-            let backend = match backend_byte {
-                0 => Backend::Slab,
-                1 => Backend::Buddy,
-                2 => Backend::System,
-                3 => Backend::Arena,
-                _ => return None,
-            };
+                let backend = match backend_byte {
+                    0 => Backend::Slab,
+                    1 => Backend::Buddy,
+                    2 => Backend::System,
+                    3 => Backend::Arena,
+                    _ => return None,
+                };
 
-            entries.push(Entry {
-                hash,
-                backend,
-                size_class,
-            });
-            checksum ^= hash;
-        }
+                entries.push(Entry {
+                    hash,
+                    backend,
+                    size_class,
+                });
+                checksum ^= hash;
+            }
+            Some(entries)
+        };
 
-        // Checksum.
+        let main_entries = read_section(&mut pos, main_count)?;
+        let distilled_entries = read_section(&mut pos, distilled_count)?;
+
         let stored_checksum = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
         if stored_checksum != checksum {
             return None;
         }
 
-        // Rebuild the MPHF from the parsed triples. Also re-applies
-        // last-wins dedup in case the file carries duplicate hashes.
-        Some(Self::from_entries(
+        Some(Self {
+            main: PerfectHashTable::rebuild(main_entries),
+            distilled: PerfectHashTable::rebuild(distilled_entries),
+        })
+    }
+}
+
+impl PerfectHashTable {
+    /// Rebuild the MPHF from parsed wire entries (re-applies last-wins
+    /// dedup in case the file carries duplicate hashes).
+    fn rebuild(entries: Vec<Entry>) -> Self {
+        Self::from_entries(
             entries
                 .into_iter()
                 .map(|e| (e.hash, e.size_class, e.backend))
                 .collect(),
-        ))
+        )
     }
 }
 
@@ -803,21 +866,28 @@ mod tests {
     }
 
     #[test]
-    fn serialized_bytes_are_sorted_and_v2() {
+    fn serialized_bytes_are_sorted_and_v3() {
         let table = make_table(&[
             (300, Backend::Arena),
             (100, Backend::Slab),
             (200, Backend::Buddy),
         ]);
         let bytes = table.serialize();
-        // Exact v2 layout: magic, version, count, 12-byte entries, checksum.
-        assert_eq!(bytes.len(), 16 + 3 * 12 + 8);
+        // Exact v3 layout: magic, version, main count, distilled count,
+        // 12-byte entries, checksum. `PerfectHashTable::serialize` emits an
+        // empty distilled section.
+        assert_eq!(bytes.len(), 20 + 3 * 12 + 8);
         assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), MAGIC);
-        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 3);
         assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 3);
+        assert_eq!(
+            u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            0,
+            "empty distilled section"
+        );
         let mut prev = 0u64;
         for i in 0..3 {
-            let off = 16 + i * 12;
+            let off = 20 + i * 12;
             let hash = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
             assert!(hash > prev || i == 0, "entries must be sorted by hash");
             prev = hash;
@@ -829,18 +899,20 @@ mod tests {
             assert_eq!(bytes[off + 10..off + 12], [0, 0], "padding");
         }
         assert_eq!(prev, 300);
-        let checksum = u64::from_le_bytes(bytes[52..60].try_into().unwrap());
+        let checksum = u64::from_le_bytes(bytes[56..64].try_into().unwrap());
         assert_eq!(checksum, 100 ^ 200 ^ 300);
     }
 
     #[test]
     fn duplicate_hashes_in_wire_format_dedup_last_wins() {
-        // Hand-craft a valid v2 buffer containing hash 7 twice: first as
-        // Slab (0), then as Arena (3). Deserialize must keep the later one.
+        // Hand-craft a valid v3 buffer containing hash 7 twice in the main
+        // section: first as Slab (0), then as Arena (3). Deserialize must
+        // keep the later one.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&MAGIC.to_le_bytes());
         bytes.extend_from_slice(&VERSION.to_le_bytes());
-        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // main count
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // distilled count
         for backend_byte in [0u8, 3u8] {
             bytes.extend_from_slice(&7u64.to_le_bytes());
             bytes.push(backend_byte);
@@ -852,6 +924,46 @@ mod tests {
         let table = PerfectHashTable::deserialize(&bytes).expect("deserialize");
         assert_eq!(table.len(), 1);
         assert_eq!(table.lookup(7), Some(Backend::Arena));
+    }
+
+    #[test]
+    fn deserialize_rejects_v2_files() {
+        // A v2 file (single-table layout, version = 2) must be rejected
+        // loudly, not half-loaded: v2 has no distilled count field, so
+        // parsing it as v3 would misinterpret the first entry's bytes.
+        let table = make_table(&[(1, Backend::Slab), (2, Backend::Buddy)]);
+        let mut bytes = table.serialize();
+        bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert!(PerfectHashTable::deserialize(&bytes).is_none());
+        assert!(FrozenRouting::deserialize(&bytes).is_none());
+    }
+
+    #[test]
+    fn frozen_routing_roundtrip_preserves_both_sections() {
+        // The Ladder-6 production path: main + non-empty distilled must both
+        // survive serialize → deserialize bit-exactly (entry-wise).
+        let routing = FrozenRouting {
+            main: PerfectHashTable::from_entries(vec![
+                (0x1111, 0, Backend::Slab),
+                (0x2222, 3, Backend::Arena),
+                (0x3333, 12, Backend::Buddy),
+            ]),
+            distilled: PerfectHashTable::from_entries(vec![
+                (0xAAAA, 0, Backend::Slab),
+                (0xBBBB, 3, Backend::Arena),
+            ]),
+        };
+        let bytes = routing.serialize();
+        let restored = FrozenRouting::deserialize(&bytes).expect("roundtrip");
+        assert_eq!(restored.main.entries(), routing.main.entries());
+        assert_eq!(restored.distilled.entries(), routing.distilled.entries());
+        // The two tables answer independently: a distilled key is not in
+        // main and vice versa.
+        assert_eq!(restored.main.lookup(0xAAAA), None);
+        assert_eq!(restored.distilled.lookup(0xAAAA), Some(Backend::Slab));
+        assert_eq!(restored.distilled.lookup(0x1111), None);
+        // Deterministic output.
+        assert_eq!(restored.serialize(), bytes);
     }
 
     #[test]

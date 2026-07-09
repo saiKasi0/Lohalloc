@@ -71,20 +71,137 @@ const CENTRAL_CACHE: usize = 64;
 ///    when a class's recycled mass exceeds the cache, which steady churn
 ///    never does.
 pub struct Slab {
-    /// `free_heads[i]` is the head of the **intrusive overflow** free list
-    /// for `SLAB_SIZE_CLASSES[i]` — the only tier that reads/writes block
-    /// memory; reached only past `CENTRAL_CACHE` recycled blocks per class.
+    /// Header-carrying blocks: the training / GUI path and every pre-`load()`
+    /// startup allocation. Served by `alloc_class`/`alloc_batch` (refilled by
+    /// `refill`), freed by `dealloc_class`/`dealloc_batch`.
+    header: Tiers,
+    /// Header-free blocks (Ladder 5 `slab_headerless`; J4-A): carved from
+    /// registered `SEGMENT_SIZE` segments (`refill_segment`) and recovered by
+    /// address on free. Served by `alloc_class_headerless`/
+    /// `alloc_batch_headerless`, freed by `dealloc_headerless`/
+    /// `dealloc_batch_headerless`. **Physically disjoint** from `header`: this
+    /// is what lets a `load()`-booted instance serve headerless while pre-load
+    /// header blocks still sit safely on `header`. The headerless alloc path
+    /// can never pop a header block — which would corrupt on free (its segment
+    /// isn't registry-registered, so `dealloc` would read `ptr - HEADER_SIZE`
+    /// as a header the user has since overwritten).
+    hl: Tiers,
+    /// Owning handles to the page regions we carved blocks from (both
+    /// flavors). Held alive so the memory stays mapped for the lifetime of the
+    /// allocator.
+    regions: Vec<system::Mapping>,
+}
+
+/// One per-class set of no-touch recycle tiers plus the bump-carve cursor —
+/// the state that was inlined into `Slab` before J4-A split header and
+/// header-free blocks into two physically separate flavors (see `Slab::hl`).
+/// All the block-memory-touching / arithmetic pop+push logic lives here once
+/// and is shared by both flavors; `Slab` owns the region mappings and the
+/// refill paths that feed each flavor's carve cursor.
+struct Tiers {
+    /// Intrusive overflow free-list head per class — the only tier that
+    /// reads/writes block memory; reached only past `CENTRAL_CACHE` recycled
+    /// blocks per class.
     free_heads: [Option<*mut FreeNode>; NUM_CLASSES],
     /// Hot no-touch tier: per-class stacks of recycled block pointers.
     cache: [[*mut u8; CENTRAL_CACHE]; NUM_CLASSES],
     cache_len: [u16; NUM_CLASSES],
-    /// Bump cursors into each class's active fresh region (`cursor == end`
+    /// Bump cursor into this flavor's active fresh region (`cursor == end`
     /// = exhausted). Strides are `MIN_ALIGN`-aligned at refill time.
     carve_cursor: [usize; NUM_CLASSES],
     carve_end: [usize; NUM_CLASSES],
-    /// Owning handles to the page regions we carved blocks from. Held alive so
-    /// the memory stays mapped for the lifetime of the allocator.
-    regions: Vec<system::Mapping>,
+}
+
+impl Tiers {
+    const fn new() -> Self {
+        Self {
+            free_heads: [None; NUM_CLASSES],
+            cache: [[core::ptr::null_mut(); CENTRAL_CACHE]; NUM_CLASSES],
+            cache_len: [0; NUM_CLASSES],
+            carve_cursor: [0; NUM_CLASSES],
+            carve_end: [0; NUM_CLASSES],
+        }
+    }
+
+    /// Pop one block from the no-touch pointer cache (recycled). `None` = the
+    /// cache is empty for this class.
+    #[inline]
+    fn pop_untouched(&mut self, class: usize) -> Option<*mut u8> {
+        let n = self.cache_len[class];
+        if n > 0 {
+            self.cache_len[class] = n - 1;
+            return Some(self.cache[class][(n - 1) as usize]);
+        }
+        None
+    }
+
+    /// Bump-carve one fresh block, if this flavor's active region has any.
+    #[inline]
+    fn pop_carve(&mut self, class: usize) -> Option<*mut u8> {
+        let cur = self.carve_cursor[class];
+        if cur == self.carve_end[class] {
+            return None;
+        }
+        let stride = align_up(SLAB_SIZE_CLASSES[class], lohalloc_core::MIN_ALIGN);
+        self.carve_cursor[class] = cur + stride;
+        Some(cur as *mut u8)
+    }
+
+    /// Pop one recycled block from the intrusive overflow list (the only pop
+    /// that touches block memory).
+    #[inline]
+    fn pop_intrusive(&mut self, class: usize) -> Option<*mut u8> {
+        let block = self.free_heads[class].take()?;
+        let node = unsafe { &mut *block };
+        self.free_heads[class] = node.next;
+        Some(block as *mut u8)
+    }
+
+    /// Recycled-only pop (cache → intrusive), never the carve cursor — the
+    /// per-flavor core of the cross-stripe steal primitive.
+    #[inline]
+    fn pop_recycled(&mut self, class: usize) -> Option<*mut u8> {
+        self.pop_untouched(class)
+            .or_else(|| self.pop_intrusive(class))
+    }
+
+    /// One pop across all tiers in preference order (cache → intrusive →
+    /// carve). Recycled-before-fresh keeps RSS bounded; the intrusive tier
+    /// sits before the carve so overflow mass drains instead of stranding.
+    #[inline]
+    fn pop_any(&mut self, class: usize) -> Option<*mut u8> {
+        self.pop_recycled(class).or_else(|| self.pop_carve(class))
+    }
+
+    /// Return a block of `class` to this flavor's tiers: no-touch cache first,
+    /// intrusive overflow only past `CENTRAL_CACHE`.
+    ///
+    /// # Safety
+    /// `ptr` must be a block of exactly this class, from this flavor, not
+    /// double-freed.
+    unsafe fn dealloc_class(&mut self, ptr: *mut u8, class: usize) {
+        let n = self.cache_len[class];
+        if (n as usize) < CENTRAL_CACHE {
+            self.cache[class][n as usize] = ptr;
+            self.cache_len[class] = n + 1;
+            return;
+        }
+        let node = ptr as *mut FreeNode;
+        unsafe {
+            (*node).next = self.free_heads[class].take();
+        }
+        self.free_heads[class] = Some(node);
+    }
+
+    /// Point this flavor's carve cursor at a fresh `[base, end)` region. Only
+    /// valid when the class's carve tier is already exhausted (the callers
+    /// assert this, so no partially-carved region is abandoned).
+    #[inline]
+    fn set_carve(&mut self, class: usize, base: usize, end: usize) {
+        debug_assert_eq!(self.carve_cursor[class], self.carve_end[class]);
+        self.carve_cursor[class] = base;
+        self.carve_end[class] = end;
+    }
 }
 
 /// Number of slab size classes (compile-time constant so `new()` can be const).
@@ -109,59 +226,10 @@ impl Default for Slab {
 impl Slab {
     pub const fn new() -> Self {
         Self {
-            free_heads: [None; NUM_CLASSES],
-            cache: [[core::ptr::null_mut(); CENTRAL_CACHE]; NUM_CLASSES],
-            cache_len: [0; NUM_CLASSES],
-            carve_cursor: [0; NUM_CLASSES],
-            carve_end: [0; NUM_CLASSES],
+            header: Tiers::new(),
+            hl: Tiers::new(),
             regions: Vec::new(),
         }
-    }
-
-    /// Pop one block from the no-touch tiers: pointer cache first
-    /// (recycled), then the carve cursor (fresh, arithmetic only). `None`
-    /// means both are empty for this class — the caller tries the
-    /// intrusive overflow list, then refills.
-    #[inline]
-    fn pop_untouched(&mut self, class: usize) -> Option<*mut u8> {
-        let n = self.cache_len[class];
-        if n > 0 {
-            self.cache_len[class] = n - 1;
-            return Some(self.cache[class][(n - 1) as usize]);
-        }
-        None
-    }
-
-    /// Bump-carve one fresh block, if the class's active region has any.
-    #[inline]
-    fn pop_carve(&mut self, class: usize) -> Option<*mut u8> {
-        let cur = self.carve_cursor[class];
-        if cur == self.carve_end[class] {
-            return None;
-        }
-        let stride = align_up(SLAB_SIZE_CLASSES[class], lohalloc_core::MIN_ALIGN);
-        self.carve_cursor[class] = cur + stride;
-        Some(cur as *mut u8)
-    }
-
-    /// Pop one recycled block from the intrusive overflow list (the only
-    /// pop that touches block memory).
-    #[inline]
-    fn pop_intrusive(&mut self, class: usize) -> Option<*mut u8> {
-        let block = self.free_heads[class].take()?;
-        let node = unsafe { &mut *block };
-        self.free_heads[class] = node.next;
-        Some(block as *mut u8)
-    }
-
-    /// One pop across all tiers in preference order (cache → intrusive →
-    /// carve). Recycled-before-fresh keeps RSS bounded; the intrusive tier
-    /// sits before the carve so overflow mass drains instead of stranding.
-    #[inline]
-    fn pop_any(&mut self, class: usize) -> Option<*mut u8> {
-        self.pop_untouched(class)
-            .or_else(|| self.pop_intrusive(class))
-            .or_else(|| self.pop_carve(class))
     }
 
     /// Allocate a block of `size` bytes (rounded up to the nearest slab class),
@@ -184,7 +252,7 @@ impl Slab {
     pub fn alloc_class(&mut self, class: usize) -> Option<*mut u8> {
         debug_assert!(class < NUM_CLASSES);
         loop {
-            if let Some(block) = self.pop_any(class) {
+            if let Some(block) = self.header.pop_any(class) {
                 return Some(block);
             }
             // Refill: map a region and point the class's carve cursor at it
@@ -201,7 +269,7 @@ impl Slab {
         let mut n = 0;
         let mut refilled = false;
         while n < out.len() {
-            match self.pop_any(class) {
+            match self.header.pop_any(class) {
                 Some(block) => {
                     out[n] = block;
                     n += 1;
@@ -218,22 +286,35 @@ impl Slab {
     }
 
     /// Pop up to `out.len()` **recycled** blocks (cache + intrusive tiers
-    /// only — never the carve cursor, never a refill). Ladder 5 Phase 3:
-    /// this is the cross-stripe steal primitive. Under striped centrals, a
-    /// producer/consumer split (mt-xfree) migrates every freed block to the
-    /// consumer's stripe while the producer's stripe carves fresh segments
-    /// forever — recycled mass piles up unreachable. `lib.rs`'s miss path
-    /// now tries its own stripe's recycled tier, then *steals* from the
-    /// other stripes' recycled tiers (try_lock, one stripe at a time),
-    /// and only then carves fresh — recycled-anywhere beats fresh-anywhere.
-    pub fn alloc_batch_recycled(&mut self, class: usize, out: &mut [*mut u8]) -> usize {
+    /// only — never the carve cursor, never a refill) from the requested
+    /// flavor's tiers. Ladder 5 Phase 3: this is the cross-stripe steal
+    /// primitive. Under striped centrals, a producer/consumer split
+    /// (mt-xfree) migrates every freed block to the consumer's stripe while
+    /// the producer's stripe carves fresh segments forever — recycled mass
+    /// piles up unreachable. `lib.rs`'s miss path now tries its own stripe's
+    /// recycled tier, then *steals* from the other stripes' recycled tiers
+    /// (try_lock, one stripe at a time), and only then carves fresh —
+    /// recycled-anywhere beats fresh-anywhere.
+    ///
+    /// J4-A: `headerless` selects which flavor's recycled mass to drain. A
+    /// headerless refill must never be handed a header block (it would corrupt
+    /// on free — see `Slab::hl`), and a header refill must never be handed a
+    /// headerless one, so the steal stays strictly within one flavor.
+    pub fn alloc_batch_recycled(
+        &mut self,
+        class: usize,
+        out: &mut [*mut u8],
+        headerless: bool,
+    ) -> usize {
         debug_assert!(class < NUM_CLASSES);
+        let tiers = if headerless {
+            &mut self.hl
+        } else {
+            &mut self.header
+        };
         let mut n = 0;
         while n < out.len() {
-            match self
-                .pop_untouched(class)
-                .or_else(|| self.pop_intrusive(class))
-            {
+            match tiers.pop_recycled(class) {
                 Some(block) => {
                     out[n] = block;
                     n += 1;
@@ -261,35 +342,51 @@ impl Slab {
         unsafe { self.dealloc_class(ptr, class) };
     }
 
-    /// Free a block of an already-known `class` — see [`Self::alloc_class`].
+    /// Free a **header-flavored** block of an already-known `class` — see
+    /// [`Self::alloc_class`].
     ///
     /// # Safety
-    /// `ptr` must be a block of exactly this class, not double-freed.
+    /// `ptr` must be a header block of exactly this class, not double-freed.
     pub unsafe fn dealloc_class(&mut self, ptr: *mut u8, class: usize) {
         debug_assert!(class < NUM_CLASSES);
-        // No-touch hot tier first (J3-slab); intrusive push only past
-        // CENTRAL_CACHE recycled blocks for this class.
-        let n = self.cache_len[class];
-        if (n as usize) < CENTRAL_CACHE {
-            self.cache[class][n as usize] = ptr;
-            self.cache_len[class] = n + 1;
-            return;
-        }
-        let node = ptr as *mut FreeNode;
-        unsafe {
-            (*node).next = self.free_heads[class].take();
-        }
-        self.free_heads[class] = Some(node);
+        unsafe { self.header.dealloc_class(ptr, class) };
     }
 
-    /// Push a whole batch of `class` blocks back in one locked visit — the
+    /// Push a whole batch of **header-flavored** `class` blocks back in one
+    /// locked visit — the magazine flush path.
+    ///
+    /// # Safety
+    /// Every pointer must be a header block of exactly this class, not
+    /// double-freed.
+    pub unsafe fn dealloc_batch(&mut self, class: usize, blocks: &[*mut u8]) {
+        for &b in blocks {
+            unsafe { self.header.dealloc_class(b, class) };
+        }
+    }
+
+    /// Free a **header-free** block of `class` (J4-A): returns it to the `hl`
+    /// tiers, never the header tiers. Used only by `lib.rs`'s
+    /// `slab_dealloc_headerless` — a headerless block on the header tiers
+    /// could be handed to the header alloc/steal path and served with a stale
+    /// offset, corrupting on the next free (see `Slab::hl`).
+    ///
+    /// # Safety
+    /// `ptr` must be a headerless block of exactly this class, not
+    /// double-freed.
+    pub unsafe fn dealloc_headerless(&mut self, ptr: *mut u8, class: usize) {
+        debug_assert!(class < NUM_CLASSES);
+        unsafe { self.hl.dealloc_class(ptr, class) };
+    }
+
+    /// Batch counterpart of [`Self::dealloc_headerless`] — the headerless
     /// magazine flush path.
     ///
     /// # Safety
-    /// Every pointer must be a block of exactly this class, not double-freed.
-    pub unsafe fn dealloc_batch(&mut self, class: usize, blocks: &[*mut u8]) {
+    /// Every pointer must be a headerless block of exactly this class, not
+    /// double-freed.
+    pub unsafe fn dealloc_batch_headerless(&mut self, class: usize, blocks: &[*mut u8]) {
         for &b in blocks {
-            unsafe { self.dealloc_class(b, class) };
+            unsafe { self.hl.dealloc_class(b, class) };
         }
     }
 
@@ -300,30 +397,26 @@ impl Slab {
     /// base in the ownership registry (`registry::SegmentRegistry`) before
     /// any block from it can be validly recovered on the dealloc side.
     ///
-    /// Blocks from a headerless-mode region are otherwise ordinary slab
-    /// blocks: they flow through the same free list, `dealloc_class`, and
-    /// magazine layer as header-carrying blocks. The two flavors are never
-    /// mixed within one class's free list in practice, because a
-    /// `Lohalloc` instance either serves every class headerless from its
-    /// very first allocation or not at all — see `lib.rs`'s
-    /// `slab_headerless`, set only by `load()` (never by a live-trained
-    /// `freeze()`), so a headerless-eligible instance's Slab starts, and
-    /// stays, completely empty of header-carrying blocks.
-    /// `try_register(base)` must attempt to record `base` in the caller's
-    /// segment ownership registry and report whether it succeeded — see
-    /// `refill_segment`'s doc for why a failed registration must prevent
-    /// this segment's blocks from ever reaching the free list.
+    /// Blocks from a headerless-mode segment live on the **`hl` flavor's**
+    /// tiers (J4-A), physically disjoint from the header tiers, so the two
+    /// flavors are never mixed within one class's free list even after a
+    /// `load()` onto a Slab that already served header blocks at startup — the
+    /// property that made the old whole-instance `slab_headerless`
+    /// pristine-check unnecessary. `try_register(base)` must attempt to record
+    /// `base` in the caller's segment ownership registry and report whether it
+    /// succeeded — see `refill_segment`'s doc for why a failed registration
+    /// must prevent this segment's blocks from ever reaching the free list.
     pub fn alloc_class_headerless(
         &mut self,
         class: usize,
         try_register: &mut dyn FnMut(usize) -> bool,
     ) -> Option<(*mut u8, Option<usize>)> {
         debug_assert!(class < NUM_CLASSES);
-        if let Some(block) = self.pop_any(class) {
+        if let Some(block) = self.hl.pop_any(class) {
             return Some((block, None));
         }
         let new_base = self.refill_segment(class, try_register)?;
-        let block = self.pop_carve(class)?;
+        let block = self.hl.pop_carve(class)?;
         Some((block, Some(new_base)))
     }
 
@@ -345,7 +438,7 @@ impl Slab {
         debug_assert!(class < NUM_CLASSES);
         let mut n = 0;
         while n < out.len() {
-            match self.pop_any(class) {
+            match self.hl.pop_any(class) {
                 Some(block) => {
                     out[n] = block;
                     n += 1;
@@ -395,14 +488,13 @@ impl Slab {
         let stride = align_up(SLAB_SIZE_CLASSES[class], lohalloc_core::MIN_ALIGN);
         let n = SEGMENT_SIZE / stride;
 
-        // J3-slab: point the class's carve cursor at the fresh segment
-        // instead of threading a FreeNode into every block (which touched
-        // — and faulted — every page of the segment at map time). Only
-        // called when every tier is empty, so no partially-carved segment
-        // is ever abandoned.
-        debug_assert_eq!(self.carve_cursor[class], self.carve_end[class]);
-        self.carve_cursor[class] = base as usize;
-        self.carve_end[class] = base as usize + n * stride;
+        // J3-slab: point the **headerless** flavor's carve cursor at the fresh
+        // segment instead of threading a FreeNode into every block (which
+        // touched — and faulted — every page of the segment at map time). Only
+        // called when the hl carve tier is empty, so no partially-carved
+        // segment is ever abandoned.
+        self.hl
+            .set_carve(class, base as usize, base as usize + n * stride);
         self.regions.push(region);
         Some(base as usize)
     }
@@ -422,11 +514,11 @@ impl Slab {
         let usable = region.usable();
         let n = usable / stride;
 
-        // Only called when every tier (cache, intrusive, carve) is empty
-        // for this class, so no partially-carved region is abandoned.
-        debug_assert_eq!(self.carve_cursor[class], self.carve_end[class]);
-        self.carve_cursor[class] = base as usize;
-        self.carve_end[class] = base as usize + n * stride;
+        // Only called when the header flavor's tiers (cache, intrusive,
+        // carve) are all empty for this class, so no partially-carved region
+        // is abandoned.
+        self.header
+            .set_carve(class, base as usize, base as usize + n * stride);
         self.regions.push(region);
         Some(())
     }
@@ -484,6 +576,79 @@ mod tests {
         let mut s = Slab::new();
         // Above SLAB_MAX.
         assert!(s.alloc(1 << 17).is_none());
+    }
+
+    /// J4-A core soundness: after the Slab has served and freed header blocks
+    /// (the pre-`load()` startup state), the headerless alloc path must never
+    /// hand one of them back — a header block served header-free corrupts on
+    /// its next free (its segment isn't registry-registered, so `dealloc`
+    /// reads `ptr - HEADER_SIZE` as a header the user overwrote).
+    #[test]
+    fn headerless_path_never_returns_a_header_block() {
+        let mut s = Slab::new();
+        let class = 0;
+        let mut header_blocks = Vec::new();
+        for _ in 0..8 {
+            header_blocks.push(s.alloc_class(class).expect("header alloc"));
+        }
+        for &b in &header_blocks {
+            unsafe { s.dealloc_class(b, class) };
+        }
+        let mut reg = |_base: usize| true;
+        for _ in 0..8 {
+            let (block, _) = s
+                .alloc_class_headerless(class, &mut reg)
+                .expect("headerless alloc");
+            assert!(
+                !header_blocks.contains(&block),
+                "headerless path returned a header block {block:?}"
+            );
+        }
+    }
+
+    /// The two flavors recycle strictly within their own tiers: a header free
+    /// is only re-served by the header path, a headerless free only by the
+    /// headerless path — they never cross.
+    #[test]
+    fn header_and_headerless_frees_stay_on_their_own_tiers() {
+        let mut s = Slab::new();
+        let class = 1;
+        let mut reg = |_base: usize| true;
+        let h = s.alloc_class(class).expect("header alloc");
+        let (l, _) = s
+            .alloc_class_headerless(class, &mut reg)
+            .expect("headerless alloc");
+        assert_ne!(h, l);
+        unsafe { s.dealloc_class(h, class) };
+        unsafe { s.dealloc_headerless(l, class) };
+        let h2 = s.alloc_class(class).expect("header realloc");
+        let (l2, _) = s
+            .alloc_class_headerless(class, &mut reg)
+            .expect("headerless realloc");
+        assert_eq!(h2, h, "header path did not recycle its own block");
+        assert_eq!(l2, l, "headerless path did not recycle its own block");
+    }
+
+    /// A headerless block round-trips on the `hl` cache tier (recycled, not a
+    /// fresh segment) and is safe to write across its whole class stride.
+    #[test]
+    fn headerless_round_trip_reuses_hl_tiers() {
+        let mut s = Slab::new();
+        let class = 2;
+        let mut reg = |_base: usize| true;
+        let (a, _) = s
+            .alloc_class_headerless(class, &mut reg)
+            .expect("headerless alloc");
+        unsafe { core::ptr::write_bytes(a, 0xAB, SLAB_SIZE_CLASSES[class]) };
+        unsafe { s.dealloc_headerless(a, class) };
+        let (b, new_base) = s
+            .alloc_class_headerless(class, &mut reg)
+            .expect("headerless realloc");
+        assert_eq!(a, b, "freed headerless block was not recycled");
+        assert!(
+            new_base.is_none(),
+            "a recycled headerless alloc must not map a fresh segment"
+        );
     }
 
     fn is_aligned_to(ptr: *mut u8, align: usize) -> bool {

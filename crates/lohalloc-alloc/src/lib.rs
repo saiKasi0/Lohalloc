@@ -302,16 +302,20 @@ pub struct Lohalloc {
     /// thread's magazine can always tell "my instance's blocks" from a
     /// previous instance's (whose regions may already be unmapped).
     magazine_id: AtomicU64,
-    /// Lock-free copy of the frozen `PerfectHashTable`, published by
+    /// Lock-free copy of the frozen decision plane (`FrozenRouting`: main
+    /// 3-frame table + Ladder-6 distilled 1-frame table, published together
+    /// as ONE pointer so the pair can never tear), published by
     /// `freeze()`/`load()` (null while in Training mode). The Inference
     /// alloc fast path loads this pointer instead of taking the `state`
     /// Mutex — before this existed, *every* allocation serialized on that
     /// global lock even in frozen mode, which showed up directly in the
-    /// Phase 6 cross-allocator numbers. The pointed-to table is immutable
+    /// Phase 6 cross-allocator numbers. The pointed-to tables are immutable
     /// and deliberately leaked on `reset_to_training()` (a concurrent
     /// reader may still hold `&*table`; a full RCU scheme is overkill for
     /// a GUI dev button, and leakage is bounded by freeze/reset cycles).
-    frozen_table: AtomicPtr<perfect_hash::PerfectHashTable>,
+    /// The pointer value doubles as the pin cache's validity tag — see
+    /// `PIN_CACHE`.
+    frozen_table: AtomicPtr<perfect_hash::FrozenRouting>,
     /// One-way latch: `true` only for an instance that was booted straight
     /// into Inference via `load()` (never for one that trained live and
     /// later called `freeze()`). Gates the header-free Slab fast path —
@@ -441,6 +445,36 @@ fn record_fallthrough() {
     FALLTHROUGH_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Ladder 6 pin-cache observability. `PIN_MISSES` is ungated like
+/// `PHT_MISSES` (a true miss happens roughly once per (site, size_class)
+/// per cache residency — cold by construction, and it's the counter that
+/// verifies population actually happens on a model-loaded run). Hit-side
+/// counters (`PIN_HITS`, `PIN_NEGATIVE`) would false-share one cache line
+/// on ~100% of pinned allocations — exactly the Ladder-4 C1 lesson — so
+/// they're gated behind `route-metrics`/`test`.
+static PIN_MISSES: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(feature = "route-metrics", test))]
+static PIN_HITS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(feature = "route-metrics", test))]
+static PIN_NEGATIVE: AtomicU64 = AtomicU64::new(0);
+
+/// Record a pin-cache hit (site served without a stack walk). No-op unless
+/// `route-metrics`/`test` — hit-path counters false-share (see above).
+#[inline(always)]
+fn record_pin_hit() {
+    #[cfg(any(feature = "route-metrics", test))]
+    PIN_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a pin-cache negative hit (known-unpinnable site took the full
+/// path without re-probing the distilled table). No-op unless
+/// `route-metrics`/`test`.
+#[inline(always)]
+fn record_pin_negative() {
+    #[cfg(any(feature = "route-metrics", test))]
+    PIN_NEGATIVE.fetch_add(1, Ordering::Relaxed);
+}
+
 impl Default for Lohalloc {
     fn default() -> Self {
         Self::new()
@@ -519,7 +553,6 @@ impl Lohalloc {
         // First use: claim a fresh id. Racing threads may both claim; the
         // CAS loser adopts the winner's id, and the loser's id is simply
         // skipped (the counter is monotonic, gaps are fine).
-        static NEXT_MAGAZINE_ID: AtomicU64 = AtomicU64::new(1);
         let fresh = NEXT_MAGAZINE_ID.fetch_add(1, Ordering::Relaxed);
         match self
             .magazine_id
@@ -529,7 +562,27 @@ impl Lohalloc {
             Err(winner) => winner,
         }
     }
+
+    /// J4-A: claim a fresh magazine owner id and publish it, so every thread's
+    /// per-thread magazine discards any blocks cached under the previous id on
+    /// its next use (`magazine::ensure_owner`). Called by `load()` at the
+    /// training→headerless transition: the magazine may hold pre-load header
+    /// blocks, and the post-load headerless alloc path pops from that same
+    /// magazine — a header block popped there would be served header-free and
+    /// corrupt on its next free. The discarded blocks are the only memory
+    /// J4-A ever abandons (bounded: ≤ magazine cap per class per live thread,
+    /// one-time — no other thread is running yet in the model-load deployment
+    /// pattern).
+    fn invalidate_magazines(&self) {
+        let fresh = NEXT_MAGAZINE_ID.fetch_add(1, Ordering::Relaxed);
+        self.magazine_id.store(fresh, Ordering::Relaxed);
+    }
 }
+
+/// Process-wide monotonic source of magazine owner ids (never 0; gaps from
+/// racing claimants are fine). Bumped once per instance's first slab use and
+/// again by `Lohalloc::invalidate_magazines` at each `load()`.
+static NEXT_MAGAZINE_ID: AtomicU64 = AtomicU64::new(1);
 
 // SAFETY: backend state is guarded by `Mutex`; `mmap`/`munmap` are thread-safe.
 // Re-entrancy is broken by the thread-local guard (see `alloc`). The backends
@@ -581,6 +634,147 @@ struct ArenaSpan {
     epoch: Cell<u64>,
     cursor: Cell<usize>,
     end: Cell<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// Ladder 6: Inference pin cache — serve freeze-proven-unambiguous call sites
+// from the raw leaf return address alone (no frames-1-2 walk, no memo, no
+// normalize/mix, no main-table lookup). See `route_alloc`.
+// ---------------------------------------------------------------------------
+
+/// Slots in the per-thread direct-mapped pin cache. Indexed by the raw leaf
+/// return address ALONE — one slot serves *every* size class of a site via
+/// the per-sc verdict array below. 64 × 32 B = 2 KiB.
+///
+/// The first cut keyed slots on `(ret0, size_class)`; a mixed workload
+/// spraying ~15 size classes from one site then held ~15 colliding keys
+/// that ping-pong-evicted each other, so *every* allocation took the miss
+/// path (one-frame derivation + cold distilled lookup + a shared-cacheline
+/// miss-counter bump) — measured +24-41% on the adv-mixed/mt-mixed rows.
+/// Per-site slots make a site's verdicts coreside: adv-mixed occupies 1-2
+/// slots total and the miss path is genuinely once per (site, sc).
+const PIN_ENTRIES: usize = 64;
+
+/// Per-slot verdict-array width. `state::size_class_for` yields 0..=14
+/// (12 Slab classes, 2 Buddy, 1 System), so 16 covers every class; an
+/// out-of-range sc (impossible today) bypasses the cache entirely.
+const PIN_SC_SLOTS: usize = 16;
+
+/// Verdict byte: this size class has not been probed against the distilled
+/// table yet.
+const PIN_UNKNOWN: u8 = 0xFE;
+
+/// Verdict byte: probed, and the (site, size_class) is NOT pinnable — the
+/// negative cache that keeps non-distilled sites from re-paying the
+/// one-frame derivation + distilled lookup on every allocation. Values 0–3
+/// are `Backend as u8`.
+const PIN_NOT_PINNED: u8 = 0xFF;
+
+/// One pin-cache slot: a call site (raw leaf return address) plus one
+/// verdict byte per size class. `ret0 == 0` marks an empty slot
+/// (`walk_leaf` rejects zero return addresses before the cache is ever
+/// probed). `table` tags the `FrozenRouting` snapshot the verdicts were
+/// derived from: a probe under a different published pointer is a miss,
+/// which makes `reset_to_training()` / re-`load()` invalidation and
+/// multi-instance isolation automatic — no flush protocol, entries from a
+/// stale table or another `Lohalloc` instance simply never match. (Pointer
+/// equality after a free-reuse of the same address is impossible here:
+/// frozen tables are deliberately leaked, never freed — see
+/// `frozen_table`'s doc.)
+struct PinEntry {
+    table: Cell<*const perfect_hash::FrozenRouting>,
+    ret0: Cell<usize>,
+    states: [Cell<u8>; PIN_SC_SLOTS],
+}
+
+thread_local! {
+    /// Direct-mapped, dtor-free (plain `Cell`s, per the crate's TLS
+    /// invariant), const-initialized so first touch never allocates.
+    static PIN_CACHE: [PinEntry; PIN_ENTRIES] = const {
+        [const {
+            PinEntry {
+                table: Cell::new(core::ptr::null()),
+                ret0: Cell::new(0),
+                states: [const { Cell::new(PIN_UNKNOWN) }; PIN_SC_SLOTS],
+            }
+        }; PIN_ENTRIES]
+    };
+}
+
+/// Slot index for a raw leaf return address — same multiply-fold pattern
+/// as `topology`'s memo index.
+#[inline(always)]
+fn pin_index(ret0: usize) -> usize {
+    ((ret0 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize & (PIN_ENTRIES - 1)
+}
+
+/// Pin-cache probe outcome. `Pinned` short-circuits the whole decision
+/// plane; `NotPinned` runs the full path but skips re-populating;
+/// `Miss` runs the full path and then records this (site, sc) verdict.
+enum PinProbe {
+    Pinned(lohalloc_core::Backend),
+    NotPinned,
+    Miss,
+}
+
+#[inline(always)]
+fn pin_probe(table: *const perfect_hash::FrozenRouting, ret0: usize, size_class: u8) -> PinProbe {
+    if size_class as usize >= PIN_SC_SLOTS {
+        return PinProbe::NotPinned; // out-of-range sc: bypass, never store
+    }
+    PIN_CACHE.with(|cache| {
+        let e = &cache[pin_index(ret0)];
+        if e.ret0.get() != ret0 || e.table.get() != table {
+            return PinProbe::Miss;
+        }
+        match e.states[size_class as usize].get() {
+            PIN_UNKNOWN => PinProbe::Miss,
+            PIN_NOT_PINNED => PinProbe::NotPinned,
+            b => PinProbe::Pinned(pin_backend_from_u8(b)),
+        }
+    })
+}
+
+/// Decode a stored `Backend as u8` pin verdict (never `PIN_UNKNOWN` /
+/// `PIN_NOT_PINNED` when called — the probe matches those arms first).
+#[inline(always)]
+fn pin_backend_from_u8(b: u8) -> lohalloc_core::Backend {
+    match b {
+        0 => lohalloc_core::Backend::Slab,
+        1 => lohalloc_core::Backend::Buddy,
+        2 => lohalloc_core::Backend::System,
+        _ => lohalloc_core::Backend::Arena,
+    }
+}
+
+/// Record the distilled verdict for `(ret0, size_class)`. Claims the slot
+/// (resetting every size-class verdict) when it currently belongs to a
+/// different site or table snapshot; direct-mapped, so colliding *sites*
+/// still evict each other — but a site's own size classes never do.
+#[inline]
+fn pin_store(
+    table: *const perfect_hash::FrozenRouting,
+    ret0: usize,
+    size_class: u8,
+    pinned: Option<lohalloc_core::Backend>,
+) {
+    if size_class as usize >= PIN_SC_SLOTS {
+        return;
+    }
+    PIN_CACHE.with(|cache| {
+        let e = &cache[pin_index(ret0)];
+        if e.ret0.get() != ret0 || e.table.get() != table {
+            e.table.set(table);
+            e.ret0.set(ret0);
+            for s in &e.states {
+                s.set(PIN_UNKNOWN);
+            }
+        }
+        e.states[size_class as usize].set(match pinned {
+            Some(b) => b as u8,
+            None => PIN_NOT_PINNED,
+        });
+    });
 }
 
 /// Bytes CAS-reserved from the shared arena chunk per span refill: the
@@ -813,6 +1007,22 @@ impl Lohalloc {
                     if let Ok(mut slab) = self.slab[thread_stripe()].lock() {
                         unsafe { slab.dealloc(block, header.size) };
                     }
+                } else if self.slab_headerless.load(Ordering::Relaxed) {
+                    // J4-A: a `load()`-booted instance reserves the shared
+                    // per-thread magazine for the **headerless** flavor
+                    // (headerless allocs pop from it — see
+                    // `slab_block_headerless_via_magazine`). This block is a
+                    // header block (its segment missed every headerless
+                    // registry probe in `dealloc`, so it is one of the pre-load
+                    // startup allocations). It must NOT enter that magazine — a
+                    // later headerless alloc would pop it and serve it
+                    // header-free, corrupting it on the next free. Push it
+                    // straight to the Slab's header tiers, where it is retained
+                    // (never leaked) but never re-served, since the header
+                    // alloc path is dead once headerless is latched.
+                    if let Ok(mut slab) = self.slab[thread_stripe()].lock() {
+                        unsafe { slab.dealloc_class(block, class) };
+                    }
                 } else {
                     let owner = self.magazine_owner();
                     if !magazine::push(owner, class, block) {
@@ -901,16 +1111,88 @@ impl Lohalloc {
     /// elsewhere. Inference mode is a pure lookup with no reward
     /// bookkeeping, so it never pays the `now_ns()` cost.
     fn route_alloc(&self, size: usize, align: usize, pad: usize, total: usize) -> *mut u8 {
-        let hash = topology::fast_stack_hash();
-        self.route_alloc_inner(hash, size, align, pad, total)
+        // Ladder 6 walk split: read the leaf frame once; the raw ret0 feeds
+        // the Inference pin cache and the training-side 1-frame retention,
+        // the continuation completes the classic 3-frame hash.
+        // `finish_walk(walk_leaf())` is bit-identical to the old
+        // `fast_stack_hash()` (see topology.rs's composition test).
+        match topology::walk_leaf() {
+            Some((ret0, cont_fp, sp)) => {
+                // Pin-cache fast path (Inference only): a call site the
+                // freeze proved unambiguous is served from its raw leaf
+                // return address alone — no frames-1-2 walk, no memo, no
+                // normalize/mix, no main-table lookup. A mis-pin is
+                // impossible by construction (distillation admits a site
+                // only when every trained 3-frame context through it agrees
+                // on one backend), and even a hypothetical one would be a
+                // performance error, never a safety one: `dealloc` routes by
+                // header/registry regardless of which backend served the
+                // alloc. C6 discipline: this branch is entirely inside the
+                // allocator, after the cabi call site.
+                let table = self.frozen_table.load(Ordering::Acquire);
+                if !table.is_null() {
+                    let size_class = state::size_class_for(size);
+                    match pin_probe(table, ret0, size_class) {
+                        PinProbe::Pinned(backend) => {
+                            record_pin_hit();
+                            // Header hash = sentinel (0): in Inference the
+                            // header's hash is telemetry-only (no reward
+                            // bookkeeping), same degradation as a failed
+                            // frame-pointer guard.
+                            if let Some(ptr) =
+                                self.try_backend(backend, total, align, pad, 0, size_class)
+                            {
+                                record_route(backend);
+                                return ptr;
+                            }
+                            record_fallthrough();
+                            return self.route_by_size(
+                                total,
+                                align,
+                                pad,
+                                0,
+                                size_class,
+                                Some(backend),
+                            );
+                        }
+                        PinProbe::NotPinned => {
+                            // Known-unpinnable site: full path, skip the
+                            // distilled re-probe (the negative cache is what
+                            // keeps unpinnable sites at ~zero added cost).
+                            record_pin_negative();
+                        }
+                        PinProbe::Miss => {
+                            // Full path this time; derive the 1-frame key
+                            // once and remember the verdict either way.
+                            PIN_MISSES.fetch_add(1, Ordering::Relaxed);
+                            let one_frame = topology::one_frame_from_ret0(ret0);
+                            let key = state::combine_hash_size_class(one_frame, size_class);
+                            // SAFETY: `table` is non-null, immutable, and
+                            // never freed while published (leaked on reset —
+                            // see `frozen_table`'s doc).
+                            let pinned = unsafe { (*table).distilled.lookup(key) };
+                            pin_store(table, ret0, size_class, pinned);
+                        }
+                    }
+                }
+                let hash = topology::finish_walk(ret0, cont_fp, sp);
+                self.route_alloc_inner(hash, ret0, size, align, pad, total)
+            }
+            // Guard failure: same sentinel-hash degradation as before.
+            None => self.route_alloc_inner(0, 0, size, align, pad, total),
+        }
     }
 
     /// Shared implementation for `route_alloc`/`route_alloc_with_hash` —
     /// both differ only in how `hash` is obtained (stack walk vs.
-    /// caller-provided, for the replay engine).
+    /// caller-provided, for the replay engine). `ret0` is the raw leaf
+    /// return address from the walk (`0` = unknown: guard failure or the
+    /// replay path) — used only to derive the training-side 1-frame hash
+    /// for freeze-time distillation; never part of the routing key.
     fn route_alloc_inner(
         &self,
         hash: u64,
+        ret0: usize,
         size: usize,
         align: usize,
         pad: usize,
@@ -929,7 +1211,7 @@ impl Lohalloc {
             // and never freed while non-null (see `frozen_table`'s doc —
             // `reset_to_training` nulls the pointer and leaks the table).
             let key = state::combine_hash_size_class(hash, size_class);
-            let backend = match unsafe { (*table).lookup(key) } {
+            let backend = match unsafe { (*table).main.lookup(key) } {
                 Some(b) => b,
                 None => {
                     // Miss-only counter: the hit path pays nothing extra.
@@ -947,8 +1229,21 @@ impl Lohalloc {
             return self.route_by_size(total, align, pad, hash, size_class, Some(backend));
         }
 
+        // Only reached when no frozen table is published (Training, or the
+        // rare pre-publish window), so the 1-frame derivation is a
+        // training-only cost. Computed *before* taking the state lock; the
+        // module table is fixed-capacity and allocation-free, but keeping
+        // derivation out of the locked section is free discipline.
+        let one_frame = if ret0 != 0 {
+            topology::one_frame_from_ret0(ret0)
+        } else {
+            0
+        };
         let (recommended, is_training) = if let Ok(mut st) = self.state.lock() {
-            (Some(st.route(hash, size)), !st.is_inference())
+            (
+                Some(st.route_with_frame(hash, one_frame, size)),
+                !st.is_inference(),
+            )
         } else {
             (None, false)
         };
@@ -1051,7 +1346,7 @@ impl Lohalloc {
             let Ok(mut slab) = self.slab[stripe].lock() else {
                 return 0;
             };
-            let n = slab.alloc_batch_recycled(class, buf);
+            let n = slab.alloc_batch_recycled(class, buf, headerless);
             if n > 0 {
                 return n;
             }
@@ -1059,7 +1354,7 @@ impl Lohalloc {
         for k in 1..BACKEND_STRIPES {
             let s = (stripe + k) & (BACKEND_STRIPES - 1);
             if let Ok(mut slab) = self.slab[s].try_lock() {
-                let n = slab.alloc_batch_recycled(class, buf);
+                let n = slab.alloc_batch_recycled(class, buf, headerless);
                 if n > 0 {
                     return n;
                 }
@@ -1109,10 +1404,14 @@ impl Lohalloc {
         Some(buf[0])
     }
 
-    /// Return a raw, header-free Slab block of `class` to circulation.
-    /// Ordinary slab blocks once the class is known — reuses the existing
-    /// (header-agnostic) `Slab::dealloc_class`/`dealloc_batch` and the
-    /// existing magazine layer unchanged.
+    /// Return a raw, header-free Slab block of `class` to circulation. Uses
+    /// the shared magazine (which a `load()`-booted instance holds exclusively
+    /// for the headerless flavor — see `load()`'s `magazine_id` bump and the
+    /// header-block magazine bypass in `dealloc_with_header`), and on overflow
+    /// flushes to the Slab's **`hl`** tiers via `dealloc_headerless` /
+    /// `dealloc_batch_headerless` (J4-A) — never the header tiers, where the
+    /// steal/refill paths could hand a headerless block to the header alloc
+    /// path.
     fn slab_dealloc_headerless(&self, block: *mut u8, class: u8) {
         let class = class as usize;
         let owner = self.magazine_owner();
@@ -1124,8 +1423,8 @@ impl Lohalloc {
         let n = magazine::take(owner, class, &mut buf[..flush]);
         if let Ok(mut slab) = self.slab[thread_stripe()].lock() {
             unsafe {
-                slab.dealloc_batch(class, &buf[..n]);
-                slab.dealloc_class(block, class);
+                slab.dealloc_batch_headerless(class, &buf[..n]);
+                slab.dealloc_headerless(block, class);
             }
         }
     }
@@ -1943,8 +2242,8 @@ impl Lohalloc {
     /// clone + `Box` allocation take the `IN_ALLOC` bypass when this
     /// instance is the process's global allocator.
     fn publish_frozen_table(&self, state: &state::AllocatorState) {
-        if let Some(table) = state.routing_table() {
-            let leaked: *mut perfect_hash::PerfectHashTable = Box::leak(Box::new(table.clone()));
+        if let Some(routing) = state.routing() {
+            let leaked: *mut perfect_hash::FrozenRouting = Box::leak(Box::new(routing.clone()));
             self.frozen_table.store(leaked, Ordering::Release);
         }
     }
@@ -2019,26 +2318,24 @@ impl Lohalloc {
                     *state = s;
                     self.publish_frozen_table(&state);
                     self.frozen.store(true, Ordering::Release);
-                    // Header-free Slab is only safe if this instance's Slab
-                    // has never served a block yet (region_count() == 0) —
-                    // otherwise a class's free list could already hold
-                    // header-carrying blocks, and a later headerless refill
-                    // would mix flavors in that same list (see
-                    // `slab_headerless`'s doc). In the real usage pattern
-                    // (`lohalloc-cabi`'s `ensure_model_loaded`, always the
-                    // very first thing that touches a fresh instance) this
-                    // check always passes; it's a safety net for any other
-                    // caller, not a hot-path cost — `load()` is a rare,
-                    // one-time call.
-                    let all_stripes_untouched = self.slab.iter().all(|stripe| {
-                        stripe
-                            .lock()
-                            .map(|s| s.region_count() == 0)
-                            .unwrap_or(false)
-                    });
-                    if all_stripes_untouched {
-                        self.slab_headerless.store(true, Ordering::Release);
-                    }
+                    // J4-A: latch header-free Slab **unconditionally**. The
+                    // old code required a pristine Slab (`region_count() == 0`
+                    // on every stripe) so header and headerless blocks could
+                    // never share a class free list — but as the global
+                    // allocator the Rust runtime touches the Slab before
+                    // `main` (before `LOHALLOC_MODEL` is even read), so that
+                    // check always failed for exactly the slab-routed rows the
+                    // header-free path exists to speed up. The `Slab` now keeps
+                    // header and headerless blocks on physically separate
+                    // tiers (`Slab::hl`), so a touched Slab is safe: the
+                    // headerless alloc path can never pop a pre-load header
+                    // block. The per-thread magazine is the one shared surface,
+                    // so invalidate it here — every thread refills fresh
+                    // through the headerless path after this point (see
+                    // `invalidate_magazines`; pre-load header frees bypass the
+                    // magazine in `dealloc_with_header`).
+                    self.slab_headerless.store(true, Ordering::Release);
+                    self.invalidate_magazines();
                     // J1: same untouched-instance argument for Buddy. Flip
                     // each stripe's order-recording flag under its own lock
                     // BEFORE publishing the gate, so no block is ever
@@ -2096,12 +2393,62 @@ impl Lohalloc {
         self.slab_headerless.load(Ordering::Relaxed)
     }
 
+    /// True if serving Buddy allocations header-free (see `buddy_headerless`).
+    /// Test/introspection only.
+    pub fn is_buddy_headerless(&self) -> bool {
+        self.buddy_headerless.load(Ordering::Relaxed)
+    }
+
+    /// True if serving Arena allocations header-free (see `arena_headerless`).
+    /// Test/introspection only.
+    pub fn is_arena_headerless(&self) -> bool {
+        self.arena_headerless.load(Ordering::Relaxed)
+    }
+
     /// Process-wide count of Inference-mode routing lookups that missed the
     /// frozen table (and fell back to size-based routing). ~0 on a
     /// model-loaded run means the model's keys matched this process's call
     /// sites — the end-to-end proof that hashes are stable across runs.
     pub fn pht_miss_count() -> u64 {
         PHT_MISSES.load(Ordering::Relaxed)
+    }
+
+    /// Process-wide count of Inference pin-cache misses (each triggers one
+    /// distilled-table probe + slot store). Roughly `#(site, size_class)
+    /// pairs × cache-eviction churn` — small and stable on a healthy
+    /// model-loaded run. Ungated (miss-only, cold); the hit-side counters
+    /// are `route-metrics`-gated — see [`Self::pin_hit_count`].
+    pub fn pin_miss_count() -> u64 {
+        PIN_MISSES.load(Ordering::Relaxed)
+    }
+
+    /// Process-wide count of Inference allocations served straight from the
+    /// pin cache (no stack walk, no table lookup). Always `0` unless built
+    /// with `route-metrics` (or under test) — per-op hit counting would
+    /// false-share exactly like `ROUTE_COUNTS`.
+    pub fn pin_hit_count() -> u64 {
+        #[cfg(any(feature = "route-metrics", test))]
+        {
+            PIN_HITS.load(Ordering::Relaxed)
+        }
+        #[cfg(not(any(feature = "route-metrics", test)))]
+        {
+            0
+        }
+    }
+
+    /// Process-wide count of negative pin-cache hits (known-unpinnable site
+    /// took the full path without re-probing the distilled table). Always
+    /// `0` unless built with `route-metrics` (or under test).
+    pub fn pin_negative_count() -> u64 {
+        #[cfg(any(feature = "route-metrics", test))]
+        {
+            PIN_NEGATIVE.load(Ordering::Relaxed)
+        }
+        #[cfg(not(any(feature = "route-metrics", test)))]
+        {
+            0
+        }
     }
 
     /// Process-wide count of Inference-mode allocations actually served by
@@ -2197,7 +2544,9 @@ impl Lohalloc {
         total: usize,
         hash: u64,
     ) -> *mut u8 {
-        self.route_alloc_inner(hash, size, align, pad, total)
+        // Replay has no real stack context — `ret0 = 0` means these
+        // signatures are never distilled/pinned (deterministic replay).
+        self.route_alloc_inner(hash, 0, size, align, pad, total)
     }
 
     /// Allocate with a caller-provided hash **and** a strategy override
@@ -2550,6 +2899,221 @@ mod integration_tests {
     use super::*;
     use core::alloc::{GlobalAlloc, Layout};
 
+    // --- Ladder 6 pin-cache test helpers -------------------------------
+    //
+    // Each test gets its own `#[inline(never)]` leaf allocation site so
+    // training and probing share the exact raw leaf return address (one
+    // machine copy of the call instruction) while their *outer* frames
+    // differ — which is precisely the situation the 1-frame distillation
+    // generalizes over. Distinct helpers per test keep TLS pin slots and
+    // trained models independent.
+
+    // Two `#[inline(never)]` layers per site: the allocator body may inline
+    // into its immediate caller, making walked frame-0's return address
+    // point into that caller's *own* caller. The inner `pin_leaf_*` absorbs
+    // that inlining so frame-0's return target is the single call
+    // instruction inside `pin_site_*` — constant across training and
+    // probing — while frames 1-2 (pin_site_*'s callers) still differ, which
+    // is exactly the generalization distillation is supposed to license.
+
+    // The `assert!` after each call is load-bearing: a bare tail call
+    // (`pin_leaf_a(a, layout)` as the final expression) gets tail-call
+    // optimized into a jump with NO frame, so the stack walk would skip the
+    // helper entirely and frame-0's return address would land in the
+    // *caller* (which varies). Post-call work forces a real frame.
+
+    #[inline(never)]
+    fn pin_leaf_a(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = unsafe { a.alloc(layout) };
+        assert!(!p.is_null(), "pin leaf alloc failed");
+        p
+    }
+
+    #[inline(never)]
+    fn pin_site_a(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = pin_leaf_a(a, layout);
+        assert!(!p.is_null());
+        p
+    }
+
+    #[inline(never)]
+    fn pin_leaf_b(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = unsafe { a.alloc(layout) };
+        assert!(!p.is_null(), "pin leaf alloc failed");
+        p
+    }
+
+    #[inline(never)]
+    fn pin_site_b(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = pin_leaf_b(a, layout);
+        assert!(!p.is_null());
+        p
+    }
+
+    #[inline(never)]
+    fn pin_leaf_c(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = unsafe { a.alloc(layout) };
+        assert!(!p.is_null(), "pin leaf alloc failed");
+        p
+    }
+
+    #[inline(never)]
+    fn pin_site_c(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = pin_leaf_c(a, layout);
+        assert!(!p.is_null());
+        p
+    }
+
+    /// Train `site` on `a` for `n` alloc/dealloc rounds, freeze, export.
+    fn train_and_export(
+        a: &Lohalloc,
+        site: fn(&Lohalloc, Layout) -> *mut u8,
+        layout: Layout,
+        n: usize,
+    ) -> Vec<u8> {
+        for _ in 0..n {
+            let p = site(a, layout);
+            assert!(!p.is_null());
+            unsafe { a.dealloc(p, layout) };
+        }
+        a.freeze();
+        a.export().expect("export after freeze")
+    }
+
+    #[test]
+    fn pin_cache_hit_serves_distilled_backend_without_walk() {
+        let layout = Layout::from_size_align(256, 16).unwrap();
+        let trainer = Lohalloc::new();
+        let bytes = train_and_export(&trainer, pin_site_a, layout, 512);
+
+        // Single-site training must produce a distilled (pinnable) entry.
+        let st = state::AllocatorState::load(&bytes).expect("model parses");
+        let distilled = st.distilled_table().expect("inference").entries();
+        assert_eq!(
+            distilled.len(),
+            1,
+            "one site × one size class must distill to exactly one entry: {distilled:?}"
+        );
+        let pinned_backend = distilled[0].2;
+
+        let loaded = Lohalloc::new();
+        assert!(loaded.load(&bytes));
+
+        let hits_before = Lohalloc::pin_hit_count();
+        let misses_before = Lohalloc::pin_miss_count();
+
+        // First probe from the same leaf site: pin miss → populate; the
+        // rest must be pin hits (lower-bound asserts — the counters are
+        // process-wide and other tests run concurrently).
+        let mut ptrs = Vec::new();
+        for _ in 0..64 {
+            let p = pin_site_a(&loaded, layout);
+            assert!(!p.is_null());
+            ptrs.push(p);
+        }
+        assert!(
+            Lohalloc::pin_miss_count() > misses_before,
+            "first probe must miss and populate the slot"
+        );
+        assert!(
+            Lohalloc::pin_hit_count() >= hits_before + 32,
+            "subsequent probes must hit the pin cache"
+        );
+
+        // The pin-served allocations must land on the distilled backend
+        // (Buddy is excluded: a load()-booted headerless instance refuses
+        // sub-16KiB Buddy orders by design, so it would fall through).
+        if pinned_backend != lohalloc_core::Backend::Buddy {
+            assert_eq!(
+                unsafe { loaded.backend_for_ptr(*ptrs.last().unwrap()) },
+                Some(pinned_backend),
+                "pin hit must serve the distilled backend"
+            );
+        }
+
+        for p in ptrs {
+            unsafe { loaded.dealloc(p, layout) };
+        }
+    }
+
+    #[test]
+    fn pin_cache_negative_entry_covers_unpinnable_sites() {
+        // Main-only model (`PerfectHashTable::serialize` emits an empty
+        // distilled section) → every site is unpinnable → after the first
+        // (miss, populate-negative) probe, later allocations take the
+        // negative-hit arm: full routing path, no distilled re-probe.
+        let table = perfect_hash::PerfectHashTable::from_entries(vec![(
+            state::combine_hash_size_class(0xDEAD_BEEF, 3),
+            3,
+            lohalloc_core::Backend::Slab,
+        )]);
+        let loaded = Lohalloc::new();
+        assert!(loaded.load(&table.serialize()));
+
+        let layout = Layout::from_size_align(256, 16).unwrap();
+        let neg_before = Lohalloc::pin_negative_count();
+
+        let mut ptrs = Vec::new();
+        for _ in 0..32 {
+            let p = pin_site_b(&loaded, layout);
+            assert!(!p.is_null());
+            ptrs.push(p);
+        }
+        // 1 miss + ≥31 negative hits from this thread (lower bound under
+        // concurrent tests). A broken negative cache would take the Miss
+        // arm every time and never increment the negative counter.
+        assert!(
+            Lohalloc::pin_negative_count() >= neg_before + 31,
+            "unpinnable site must be served via the negative cache"
+        );
+
+        for p in ptrs {
+            unsafe { loaded.dealloc(p, layout) };
+        }
+    }
+
+    #[test]
+    fn pin_cache_table_tag_invalidates_across_reload() {
+        let layout = Layout::from_size_align(256, 16).unwrap();
+        let trainer = Lohalloc::new();
+        let bytes = train_and_export(&trainer, pin_site_c, layout, 512);
+
+        let loaded = Lohalloc::new();
+        assert!(loaded.load(&bytes));
+
+        // Populate the slot under the first published table.
+        let m0 = Lohalloc::pin_miss_count();
+        let p1 = pin_site_c(&loaded, layout);
+        let p2 = pin_site_c(&loaded, layout);
+        assert!(Lohalloc::pin_miss_count() > m0);
+        unsafe {
+            loaded.dealloc(p1, layout);
+            loaded.dealloc(p2, layout);
+        }
+
+        // Reset + reload: a NEW FrozenRouting pointer is published, so the
+        // stale slot's tag mismatches and the site must re-miss (then hit
+        // again) — no explicit flush anywhere.
+        loaded.reset_to_training();
+        assert!(loaded.load(&bytes), "reload after reset");
+        let m1 = Lohalloc::pin_miss_count();
+        let p3 = pin_site_c(&loaded, layout);
+        assert!(
+            Lohalloc::pin_miss_count() > m1,
+            "stale table tag must force a re-miss after reload"
+        );
+        let h0 = Lohalloc::pin_hit_count();
+        let p4 = pin_site_c(&loaded, layout);
+        assert!(
+            Lohalloc::pin_hit_count() > h0,
+            "repopulated slot must hit again"
+        );
+        unsafe {
+            loaded.dealloc(p3, layout);
+            loaded.dealloc(p4, layout);
+        }
+    }
+
     #[test]
     fn freeze_then_allocates_correctly() {
         // Create a Lohalloc instance, do some allocations (training), freeze,
@@ -2729,39 +3293,71 @@ mod integration_tests {
     }
 
     #[test]
-    fn load_after_prior_slab_activity_stays_header_based() {
-        // A live-trained instance (or one that otherwise already served a
-        // slab block) must NOT flip to headerless on a later `load()` —
-        // doing so would risk mixing header and headerless blocks in the
-        // same class's free list. Training-mode allocation always writes
-        // headers; that must remain true for every allocation this
-        // instance serves afterward too, even post-load().
+    fn load_enables_headerless_and_coexists_with_live_pre_load_header_blocks() {
+        // J4-A: `load()` now latches headerless *unconditionally*, even when
+        // the Slab already served header blocks before the model loaded (the
+        // global-allocator reality — the runtime touches the Slab before
+        // `main`). Header and headerless blocks live on physically separate
+        // tiers (`Slab::hl`), so pre-load header blocks kept LIVE across the
+        // boundary must (a) never be handed back by the headerless alloc path
+        // and (b) still free correctly afterward — no corruption, no mixing.
         let training_hash = 0x4EAD_0002u64;
         let size = 64usize;
         let alloc = Lohalloc::new();
         let layout = Layout::from_size_align(size, 16).unwrap();
 
-        // Training-mode traffic populates at least one Slab region.
+        // Training-mode traffic populates a Slab region; keep the blocks LIVE
+        // across load() (the hard case) and fill them so a mis-serve would be
+        // detectable as an overwrite.
+        let mut live_header = Vec::new();
         for _ in 0..20 {
             let ptr = unsafe { alloc.alloc_with_hash(layout, training_hash) };
             assert!(!ptr.is_null());
-            unsafe { alloc.dealloc_with_hash(ptr, layout) };
+            unsafe { core::ptr::write_bytes(ptr, 0xC5, size) };
+            live_header.push(ptr);
         }
         assert!(alloc.backend_counters().slab_region_count > 0);
 
         assert!(alloc.load(&slab_only_model(0x4EAD_0003u64, size)));
         assert!(
-            !alloc.is_slab_headerless(),
-            "load() must not enable headerless mode once the Slab has already served a block"
+            alloc.is_slab_headerless(),
+            "J4-A: load() must enable headerless even after prior Slab activity"
         );
 
-        // Allocations must still work correctly (header-based).
+        // Post-load allocations are served header-free and must never alias a
+        // still-live pre-load header block.
+        let mut new_hl = Vec::new();
+        for _ in 0..64 {
+            let ptr = unsafe { alloc.alloc_with_hash(layout, 0x4EAD_0003u64) };
+            assert!(!ptr.is_null());
+            assert!(
+                !live_header.contains(&ptr),
+                "headerless alloc handed back a live pre-load header block"
+            );
+            unsafe { core::ptr::write_bytes(ptr, 0x3A, size) };
+            new_hl.push(ptr);
+        }
+        // The pre-load header blocks were never overwritten by a headerless
+        // serve.
+        for &p in &live_header {
+            for i in 0..size {
+                assert_eq!(
+                    unsafe { *p.add(i) },
+                    0xC5,
+                    "pre-load header block corrupted"
+                );
+            }
+        }
+        // Both flavors free correctly (header blocks via the header path,
+        // headerless via the segment registry) and stay reusable.
+        for p in live_header {
+            unsafe { alloc.dealloc_with_hash(p, layout) };
+        }
+        for p in new_hl {
+            unsafe { alloc.dealloc_with_hash(p, layout) };
+        }
         let ptr = unsafe { alloc.alloc_with_hash(layout, 0x4EAD_0003u64) };
         assert!(!ptr.is_null());
-        assert_eq!(
-            unsafe { alloc.backend_for_ptr(ptr) },
-            Some(lohalloc_core::Backend::Slab)
-        );
         unsafe { alloc.dealloc_with_hash(ptr, layout) };
     }
 

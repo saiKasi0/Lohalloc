@@ -102,10 +102,12 @@ resource "aws_security_group" "bench" {
   }
 }
 
-# Resource 2/3: x86_64 instance.
+# Resource 2/3: x86_64 instance (skipped when enable_x86 = false, e.g.
+# ARM-only one-off runs via infra/cloud_bench.sh).
 resource "aws_instance" "bench_x86" {
+  count                  = var.enable_x86 ? 1 : 0
   ami                    = data.aws_ami.ubuntu_amd64.id
-  instance_type          = "c6i.large"
+  instance_type          = var.x86_instance_type
   vpc_security_group_ids = [aws_security_group.bench.id]
   user_data              = local.cloud_init
 
@@ -124,7 +126,7 @@ resource "aws_instance" "bench_x86" {
 # Resource 3/3: ARM64 instance.
 resource "aws_instance" "bench_arm64" {
   ami                    = data.aws_ami.ubuntu_arm64.id
-  instance_type          = "c6g.large"
+  instance_type          = var.arm_instance_type
   vpc_security_group_ids = [aws_security_group.bench.id]
   user_data              = local.cloud_init
 

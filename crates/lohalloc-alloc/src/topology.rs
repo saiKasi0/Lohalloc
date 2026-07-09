@@ -452,23 +452,67 @@ const MAX_FP_DISTANCE: usize = 8_000_000;
 /// guard ensures we never dereference an invalid pointer.
 #[inline(always)]
 pub fn fast_stack_hash() -> u64 {
+    match walk_leaf() {
+        Some((ret0, cont_fp, sp)) => finish_walk(ret0, cont_fp, sp),
+        None => SENTINEL_HASH,
+    }
+}
+
+/// The guarded frame-0 read: the shared prefix of the full 3-frame walk and
+/// the Ladder-6 pin-cache probe (which needs only the raw leaf return
+/// address). Returns `(ret0, cont_fp, sp)` where `cont_fp` is the frame
+/// pointer to continue walking frames 1–2 from, already normalized to `0`
+/// when the walk must stop there (null or self-looping next frame) — the
+/// continuation loop's `is_valid_fp` entry check rejects `0` uniformly.
+///
+/// `None` reproduces exactly the cases where [`fast_stack_hash`] returned
+/// `SENTINEL_HASH` before frame 1 was ever attempted: initial guard failure,
+/// unreadable frame 0, or a zero leaf return address.
+///
+/// `#[inline(always)]` is load-bearing: `read_sp_fp` reads the *current*
+/// frame's registers, so this must inline into the same position
+/// `fast_stack_hash`'s old prologue occupied for the walked frames (and thus
+/// the produced hashes) to stay identical.
+#[inline(always)]
+pub(crate) fn walk_leaf() -> Option<(usize, usize, usize)> {
     let (sp, fp) = read_sp_fp();
 
     // Heuristic guard on the initial frame pointer.
     if !is_valid_fp(fp, sp) {
-        return SENTINEL_HASH;
+        return None;
     }
 
+    let (next_fp, ret0) = read_frame(fp)?;
+    if ret0 == 0 {
+        return None;
+    }
+
+    let cont_fp = if next_fp == 0 || next_fp == fp {
+        0
+    } else {
+        next_fp
+    };
+    Some((ret0, cont_fp, sp))
+}
+
+/// Continue the raw walk over frames 1–2 from [`walk_leaf`]'s output, then
+/// run the C5 memo probe and (on a miss) the ASLR-stable normalize + mix.
+/// `fast_stack_hash() == finish_walk(walk_leaf())` by construction — the two
+/// halves are the old single body split at the frame-0/frame-1 boundary.
+#[inline(always)]
+pub(crate) fn finish_walk(ret0: usize, cont_fp: usize, sp: usize) -> u64 {
     // Raw 3-frame walk: guarded frame-pointer derefs and integer math only —
     // no module-table work yet. Raw (per-run) PCs are collected first so
     // they can key the memo; normalization to the ASLR-stable form and the
     // mix only run on a memo miss.
-    let mut raw: [usize; NUM_FRAMES] = [0; NUM_FRAMES];
-    let mut current_fp = fp;
-    let mut collected = 0usize;
+    let mut raw: [usize; NUM_FRAMES] = [ret0, 0, 0];
+    let mut current_fp = cont_fp;
+    let mut collected = 1usize;
 
-    for slot in raw.iter_mut() {
-        // Re-validate the frame pointer before each dereference.
+    for slot in raw[1..].iter_mut() {
+        // Re-validate the frame pointer before each dereference. `cont_fp ==
+        // 0` (leaf said stop) fails the direction check, so the loop is
+        // skipped entirely — same as the old `break` after frame 0.
         if !is_valid_fp(current_fp, sp) {
             break;
         }
@@ -489,10 +533,6 @@ pub fn fast_stack_hash() -> u64 {
             break;
         }
         current_fp = next_fp;
-    }
-
-    if collected == 0 {
-        return SENTINEL_HASH;
     }
 
     // C5 memo probe: a hit skips the module-table normalization and the
@@ -555,17 +595,20 @@ pub fn fast_stack_hash() -> u64 {
 /// normalize + one mix, cheaper than a memo probe.
 #[inline(always)]
 pub fn one_frame_hash() -> u64 {
-    let (sp, fp) = read_sp_fp();
-    if !is_valid_fp(fp, sp) {
-        return SENTINEL_HASH;
+    match walk_leaf() {
+        Some((ret0, _cont_fp, _sp)) => one_frame_from_ret0(ret0),
+        None => SENTINEL_HASH,
     }
-    let ret0 = match read_frame(fp) {
-        Some((_next_fp, ret)) if ret != 0 => ret,
-        _ => return SENTINEL_HASH,
-    };
-    // Same module table + normalization + mixer the 3-frame path uses, so a
-    // 1-frame hash computed here at Inference is bit-identical to the one the
-    // training path stored for this site (see `AllocatorState`/`freeze`).
+}
+
+/// The 1-frame hash for an already-walked raw leaf return address — the
+/// shared derivation used by both the training path (which retains it per
+/// Signature for freeze-time distillation) and the Inference pin-cache
+/// population path. Same module table + normalization + mixer the 3-frame
+/// path uses, so the value is ASLR-stable and identical across the
+/// train/export/load pipeline for the same binary.
+#[inline]
+pub(crate) fn one_frame_from_ret0(ret0: usize) -> u64 {
     let modules = module_table().entries();
     mix_hash(&[normalize_pc_with(ret0 as u64, modules)])
 }
@@ -793,6 +836,19 @@ mod tests {
         let h2 = one_frame_hash();
         assert_eq!(h1, h2, "1-frame hash must be deterministic for a site");
         assert_ne!(h1, SENTINEL_HASH, "1-frame hash should be non-sentinel");
+    }
+
+    #[test]
+    fn walk_split_composition_matches_fast_stack_hash() {
+        // Ladder 6 walk split: `fast_stack_hash` must equal
+        // `finish_walk(walk_leaf())` when both run from the same frame (same
+        // fp → same ret0 → same continuation). Guards against the two halves
+        // drifting apart (e.g. a guard-order change in one but not the
+        // other).
+        let (ret0, cont_fp, sp) = walk_leaf().expect("real stack walks");
+        let composed = finish_walk(ret0, cont_fp, sp);
+        assert_eq!(composed, fast_stack_hash());
+        assert_ne!(composed, SENTINEL_HASH);
     }
 
     #[test]

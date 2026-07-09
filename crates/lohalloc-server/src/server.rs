@@ -1421,8 +1421,8 @@ async fn kill_all_simulations_handler(State(state): State<AppState>) -> Response
 /// so the server crate doesn't need to keep a private `Lohalloc` instance
 /// alive purely to enumerate entries.
 fn decode_routing_entries(bytes: &[u8]) -> Vec<(u64, String)> {
-    // magic(8) + version(4) + count(4) + checksum(8) = 24
-    if bytes.len() < 24 {
+    // magic(8) + version(4) + counts(4+4) + checksum(8) = 28
+    if bytes.len() < 28 {
         return Vec::new();
     }
     let mut pos = 0;
@@ -1435,33 +1435,47 @@ fn decode_routing_entries(bytes: &[u8]) -> Vec<(u64, String)> {
     }
 
     let version = read_u32_le(bytes, &mut pos);
-    if version != 2 {
+    if version != 3 {
         return Vec::new();
     }
 
-    let count = read_u32_le(bytes, &mut pos) as usize;
-    let expected_len = 16 + count * 12 + 8;
+    // v3 (Ladder 6) carries two sections: main (3-frame keys) + distilled
+    // (1-frame pinnable subset). The GUI's routing matrix is keyed on the
+    // main-table hashes, so only the main section is surfaced here; the
+    // distilled entries still participate in the checksum below.
+    let main_count = read_u32_le(bytes, &mut pos) as usize;
+    let distilled_count = read_u32_le(bytes, &mut pos) as usize;
+    let expected_len = 20 + main_count.saturating_add(distilled_count) * 12 + 8;
     if bytes.len() < expected_len {
         return Vec::new();
     }
 
-    let mut entries = Vec::with_capacity(count);
+    let mut entries = Vec::with_capacity(main_count);
     let mut checksum: u64 = 0;
-    for _ in 0..count {
-        let hash = read_u64_le(bytes, &mut pos);
-        let backend_byte = *bytes.get(pos).unwrap_or(&0);
-        // size_class lives at pos+1 — decoded implicitly by the pos += 4
-        // skip below; not currently surfaced (see doc comment above).
-        pos += 4; // backend(1) + size_class(1) + padding(2)
-        let backend = match backend_byte {
-            0 => "slab",
-            1 => "buddy",
-            2 => "system",
-            3 => "arena",
-            _ => return Vec::new(),
+    for section in 0..2 {
+        let count = if section == 0 {
+            main_count
+        } else {
+            distilled_count
         };
-        entries.push((hash, backend.to_string()));
-        checksum ^= hash;
+        for _ in 0..count {
+            let hash = read_u64_le(bytes, &mut pos);
+            let backend_byte = *bytes.get(pos).unwrap_or(&0);
+            // size_class lives at pos+1 — decoded implicitly by the pos += 4
+            // skip below; not currently surfaced (see doc comment above).
+            pos += 4; // backend(1) + size_class(1) + padding(2)
+            let backend = match backend_byte {
+                0 => "slab",
+                1 => "buddy",
+                2 => "system",
+                3 => "arena",
+                _ => return Vec::new(),
+            };
+            if section == 0 {
+                entries.push((hash, backend.to_string()));
+            }
+            checksum ^= hash;
+        }
     }
 
     let stored_checksum = read_u64_le(bytes, &mut pos);

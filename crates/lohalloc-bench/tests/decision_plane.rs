@@ -187,14 +187,20 @@ fn combo_slab_arena_sites_diverge_after_training() {
 #[ignore = "timing-dependent Layer 2 test — see module doc; run with --release -- --ignored"]
 fn adv_exhaust_bandit_learns_to_avoid_full_arena() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    // Train a fresh instance on a workload that never frees (so Arena
-    // exhausts after ~4096 allocations at this size), letting the bandit
-    // freely choose backends the whole time (no forced model). If the
-    // recommended-arm latency measurement correctly attributes the
-    // fallthrough cost to Arena when it's full, the bandit should learn to
-    // route this Signature elsewhere well before training ends.
+    // Train a fresh instance on a workload that never frees, letting the
+    // bandit freely choose backends the whole time (no forced model). The
+    // arena CHAINS 1 MiB chunks up to a 32 MiB cap (it used to be a single
+    // 1 MiB region — the old 30k op count stopped ~100k allocations short
+    // of the cap, so the bandit was *correctly* still choosing Arena and
+    // this test failed for the wrong reason). Training-mode arena blocks
+    // carry the 48-byte header, so each ~208 B request consumes 256 B:
+    // exhaustion hits at ~131k allocations, leaving ~40k post-exhaustion
+    // ops for the bandit to learn from. If the recommended-arm latency
+    // measurement correctly attributes the fallthrough cost to Arena when
+    // it's full, the bandit should learn to route this Signature elsewhere
+    // well before training ends.
     let harness = HarnessDriver::new();
-    let ptrs = workloads::workload_exhaust_no_free(&harness, hashes::W_ADV_EXHAUST, 30_000);
+    let ptrs = workloads::workload_exhaust_no_free(&harness, hashes::W_ADV_EXHAUST, 170_000);
 
     harness.alloc.freeze();
     assert!(harness.alloc.is_inference());

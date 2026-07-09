@@ -37,16 +37,22 @@ fi
 RUN_DIR="results/$(date +%Y%m%dT%H%M%S)"
 echo "== Run directory: $RUN_DIR =="
 
-echo "== Running Rust criterion + latency_profile suite =="
+# EVERY benchmark available — the full suite:
+#   make bench          latency_profile + criterion (backend_micro,
+#                       hypothesis, inference_overhead, comparison ×4 baselines)
+#   make bench-native-host   native C/C++/Rust hyperfine (the 41 vs-jemalloc rows)
+#   make bench-cache-host    cachegrind D1/LL miss-rate simulation
+#   make bench-report        aggregate -> report + graphs
+echo "== [1/4] Rust criterion + latency_profile suite (make bench) =="
 make bench RUN_DIR="$RUN_DIR"
 
-echo "== Running native (LD_PRELOAD) cross-allocator timing suite =="
+echo "== [2/4] Native (LD_PRELOAD) cross-allocator timing suite =="
 make bench-native-host RUN_DIR="$RUN_DIR"
 
-echo "== Running native cachegrind cache-miss suite =="
+echo "== [3/4] Native cachegrind cache-miss suite =="
 make bench-cache-host RUN_DIR="$RUN_DIR"
 
-echo "== Aggregating =="
+echo "== [4/4] Aggregating =="
 make bench-report RUN_DIR="$RUN_DIR"
 
 echo "Done. $RUN_DIR is ready for retrieval (scp)."

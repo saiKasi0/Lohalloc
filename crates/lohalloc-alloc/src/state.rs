@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 use lohalloc_core::{slab_class_for, Backend, Signature};
 
 use crate::bandit::BanditPolicy;
-use crate::perfect_hash::PerfectHashTable;
+use crate::perfect_hash::{FrozenRouting, PerfectHashTable};
 
 /// Compute a compact `size_class` for the given allocation size.
 ///
@@ -139,8 +139,10 @@ pub enum AllocatorState {
         pending: PendingRewards,
     },
     /// Frozen mode: the bandit's weights have collapsed into a read-only
-    /// `PerfectHashTable`. The hot path is a single O(1) MPHF lookup.
-    Inference { routing_table: PerfectHashTable },
+    /// `PerfectHashTable`s. The hot path is a single O(1) MPHF lookup
+    /// (against `routing.main`); `routing.distilled` carries the Ladder-6
+    /// 1-frame-keyed pinnable subset consumed by the Inference pin cache.
+    Inference { routing: FrozenRouting },
 }
 
 impl Default for AllocatorState {
@@ -181,16 +183,24 @@ impl AllocatorState {
     ///   default backend determined by size class (Slab for small, Buddy
     ///   for medium, System for large).
     pub fn route(&mut self, hash: u64, size: usize) -> Backend {
+        self.route_with_frame(hash, 0, size)
+    }
+
+    /// [`route`](Self::route) plus the J2/Ladder-6 one-frame hash for this
+    /// call site (`0` = unknown, e.g. the replay path). Training retains it
+    /// per Signature so `freeze()` can distill unambiguous sites into the
+    /// 1-frame pin table; Inference ignores it entirely.
+    pub fn route_with_frame(&mut self, hash: u64, one_frame: u64, size: usize) -> Backend {
         match self {
             Self::Training { bandit, .. } => {
                 let size_class = size_class_for(size);
                 let sig = Signature::new(hash, size_class);
-                bandit.select(sig)
+                bandit.select_with_frame(sig, one_frame, crate::tune::config())
             }
-            Self::Inference { routing_table } => {
+            Self::Inference { routing } => {
                 // Hash-and-jump: O(1) minimal perfect hash lookup. Zero allocations.
                 let key = combine_hash_size_class(hash, size_class_for(size));
-                if let Some(backend) = routing_table.lookup(key) {
+                if let Some(backend) = routing.main.lookup(key) {
                     return backend;
                 }
                 // Key not in the frozen table → fall back to size-based default.
@@ -284,20 +294,26 @@ impl AllocatorState {
     pub fn freeze(&mut self) {
         match self {
             Self::Training { bandit, .. } => {
-                let entries = bandit
-                    .freeze()
-                    .into_iter()
-                    .map(|(key, size_class, backend)| {
-                        (
-                            key,
-                            size_class,
-                            clamp_backend_for_size_class(size_class, backend),
-                        )
-                    })
-                    .collect();
-                let table = PerfectHashTable::from_entries(entries);
+                // Same per-size-class clamp for both tables: a distilled
+                // entry must never license a backend the main table would
+                // have clamped away (the pin cache serves straight from
+                // distilled with no further checks).
+                let clamp = |triples: Vec<(u64, u8, lohalloc_core::Backend)>| {
+                    triples
+                        .into_iter()
+                        .map(|(key, size_class, backend)| {
+                            (
+                                key,
+                                size_class,
+                                clamp_backend_for_size_class(size_class, backend),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let main = PerfectHashTable::from_entries(clamp(bandit.freeze()));
+                let distilled = PerfectHashTable::from_entries(clamp(bandit.distill()));
                 *self = Self::Inference {
-                    routing_table: table,
+                    routing: FrozenRouting { main, distilled },
                 };
             }
             Self::Inference { .. } => {
@@ -342,7 +358,7 @@ impl AllocatorState {
     /// still in Training mode.
     pub fn export(&self) -> Option<Vec<u8>> {
         match self {
-            Self::Inference { routing_table } => Some(routing_table.serialize()),
+            Self::Inference { routing } => Some(routing.serialize()),
             Self::Training { .. } => None,
         }
     }
@@ -350,18 +366,32 @@ impl AllocatorState {
     /// Deserialize a `.lohalloc` model file and start directly in Inference
     /// mode — a pre-optimized heap from boot.
     ///
-    /// Returns `None` if the data is malformed (bad magic, checksum, etc.).
+    /// Returns `None` if the data is malformed (bad magic, non-v3 version,
+    /// checksum, etc.).
     pub fn load(data: &[u8]) -> Option<Self> {
-        let routing_table = PerfectHashTable::deserialize(data)?;
-        Some(Self::Inference { routing_table })
+        let routing = FrozenRouting::deserialize(data)?;
+        Some(Self::Inference { routing })
     }
 
-    /// Borrow the frozen routing table (Inference mode only). Used by
-    /// `Lohalloc::freeze()`/`load()` to publish a lock-free copy for the
-    /// Inference alloc fast path.
+    /// Borrow the frozen main routing table (Inference mode only) —
+    /// introspection (e.g. `model_dump`). The lock-free hot-path copy is
+    /// published from [`Self::routing`].
     pub fn routing_table(&self) -> Option<&PerfectHashTable> {
+        self.routing().map(|r| &r.main)
+    }
+
+    /// Borrow the frozen distilled (1-frame pinnable) table (Inference mode
+    /// only) — introspection counterpart of [`Self::routing_table`].
+    pub fn distilled_table(&self) -> Option<&PerfectHashTable> {
+        self.routing().map(|r| &r.distilled)
+    }
+
+    /// Borrow the complete frozen decision plane (Inference mode only).
+    /// Used by `Lohalloc::freeze()`/`load()` to publish a lock-free copy
+    /// for the Inference alloc fast path.
+    pub fn routing(&self) -> Option<&FrozenRouting> {
         match self {
-            Self::Inference { routing_table } => Some(routing_table),
+            Self::Inference { routing } => Some(routing),
             Self::Training { .. } => None,
         }
     }

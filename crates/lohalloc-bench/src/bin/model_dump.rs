@@ -46,7 +46,7 @@ fn main() -> ExitCode {
     };
 
     let entries = table.entries();
-    println!("# {} entries", entries.len());
+    println!("# {} entries (main, 3-frame keys)", entries.len());
     println!("# hash size_class backend");
     let mut by_backend: BTreeMap<&'static str, usize> = BTreeMap::new();
     for (hash, size_class, backend) in &entries {
@@ -58,6 +58,27 @@ fn main() -> ExitCode {
     for backend in Backend::ALL {
         let name = backend.as_str();
         println!("#   {name}: {}", by_backend.get(name).copied().unwrap_or(0));
+    }
+
+    // Ladder 6: the distilled (1-frame pinnable) section — the sites the
+    // Inference pin cache may serve without a full stack walk. Empty for
+    // hand-built forced models and for workloads whose sites are ambiguous.
+    if let Some(distilled) = state.distilled_table() {
+        let d = distilled.entries();
+        println!("# {} entries (distilled, 1-frame pinnable keys)", d.len());
+        let mut d_by_backend: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for (hash, size_class, backend) in &d {
+            println!("{hash:#018x} {size_class} {} [pin]", backend.as_str());
+            *d_by_backend.entry(backend.as_str()).or_insert(0) += 1;
+        }
+        println!("# distilled summary:");
+        for backend in Backend::ALL {
+            let name = backend.as_str();
+            println!(
+                "#   {name}: {}",
+                d_by_backend.get(name).copied().unwrap_or(0)
+            );
+        }
     }
 
     // Sanity flag matching `clamp_backend_for_size_class`'s invariant: no

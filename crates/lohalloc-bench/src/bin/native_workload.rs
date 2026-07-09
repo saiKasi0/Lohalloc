@@ -233,6 +233,27 @@ fn run_lohalloc(workload: &str, ops: usize) -> bool {
             "native_workload: pht_misses={} (model_loaded={model_loaded} froze_during_run={froze_during_run})",
             ga::global_lohalloc_pht_misses()
         );
+        let (pin_misses, pin_hits, pin_negative) = ga::global_lohalloc_pin_counters();
+        eprintln!(
+            "native_workload: pin_misses={pin_misses} pin_hits={pin_hits} \
+             pin_negative={pin_negative} (hits/negative read 0 without route-metrics)"
+        );
+        // Per-backend frozen-path service counts (0 without route-metrics):
+        // the route-diagnosis view that exposed the Ladder-6 pin-vs-main
+        // routing divergence.
+        eprintln!(
+            "native_workload: served slab={} buddy={} system={} arena={} fallthrough={}",
+            ga::global_lohalloc_route_count(lohalloc_core::Backend::Slab),
+            ga::global_lohalloc_route_count(lohalloc_core::Backend::Buddy),
+            ga::global_lohalloc_route_count(lohalloc_core::Backend::System),
+            ga::global_lohalloc_route_count(lohalloc_core::Backend::Arena),
+            ga::global_lohalloc_fallthroughs(),
+        );
+        // Touch-cost diagnostic (J4): did the header-free fast path latch on?
+        // It only does if the backend was untouched at model-load time — and
+        // as the global allocator, process startup may have touched it first.
+        let (slab_hl, buddy_hl, arena_hl) = ga::global_lohalloc_headerless();
+        eprintln!("native_workload: headerless slab={slab_hl} buddy={buddy_hl} arena={arena_hl}");
     }
     ok
 }

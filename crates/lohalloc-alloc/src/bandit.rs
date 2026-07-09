@@ -103,6 +103,14 @@ struct SignatureStats {
     /// [`BanditPolicy::is_converged`]); costs one increment-or-reset per
     /// selection.
     stable_count: u32,
+    /// The J2 one-frame (leaf-return-address) topological hash for this
+    /// Signature, captured at `select` time (`0` = unknown, e.g. the replay
+    /// path which only supplies a full stack hash). Two Signatures that share
+    /// a leaf call site but sit under different 3-frame contexts carry the
+    /// *same* `one_frame`; `freeze` distills the sites where every such
+    /// context agrees on one backend into the cheap 1-frame routing table
+    /// (see [`BanditPolicy::freeze`]).
+    one_frame: u64,
 }
 
 impl SignatureStats {
@@ -117,6 +125,7 @@ impl SignatureStats {
             total_pulls: 4, // Each arm starts with 1 pull.
             last_choice: None,
             stable_count: 0,
+            one_frame: 0,
         }
     }
 }
@@ -162,12 +171,33 @@ impl BanditPolicy {
 
     /// [`select`](Self::select) with an explicit config — the testable
     /// core (unit tests can't safely mutate the process-wide `OnceLock`
-    /// under parallel execution).
+    /// under parallel execution). Records no J2 one-frame hash (`0`), so
+    /// sites selected only through this path are never distilled.
     pub fn select_with(&mut self, sig: Signature, cfg: &TrainingConfig) -> Backend {
+        self.select_with_frame(sig, 0, cfg)
+    }
+
+    /// [`select_with`](Self::select_with) plus the J2 one-frame topological
+    /// hash for this call site (`one_frame == 0` means "unknown", identical
+    /// to `select_with`). The production alloc path
+    /// (`state::AllocatorState::route`) supplies it so `freeze` can build the
+    /// distilled 1-frame table; the replay path passes `0`.
+    pub fn select_with_frame(
+        &mut self,
+        sig: Signature,
+        one_frame: u64,
+        cfg: &TrainingConfig,
+    ) -> Backend {
         let entry = self
             .stats
             .entry(sig)
             .or_insert_with(|| SignatureStats::new(&cfg.baseline_rewards));
+        // A given Signature always maps to one leaf call site, so `one_frame`
+        // is constant for it; only overwrite when we actually have one, so a
+        // later replay-style `0` never erases a real hash.
+        if one_frame != 0 {
+            entry.one_frame = one_frame;
+        }
         let total = entry.total_pulls as f64;
 
         let mut best = Backend::Slab;
@@ -312,6 +342,50 @@ impl BanditPolicy {
             .collect()
     }
 
+    /// J2 distillation: the subset of call sites that route *unambiguously*
+    /// at one frame of context. Grouping every observed Signature by its
+    /// `(one_frame, size_class)`, a group qualifies only when **every**
+    /// 3-frame context in it resolves to the same best backend — then a
+    /// single distilled entry keyed `combine_hash_size_class(one_frame,
+    /// size_class)` can stand in for all of them, letting Inference route
+    /// that site from just the leaf return address (the pin-hot-sites inline
+    /// cache) without the full 3-frame walk or the main-table lookup.
+    ///
+    /// Sites with `one_frame == 0` (unknown — the replay path) and ambiguous
+    /// groups (a shared wrapper whose callers genuinely want different
+    /// backends) are omitted; those still route through the full 3-frame main
+    /// table, so distillation never changes a routing decision, it only makes
+    /// the unambiguous ones cheaper to reach. Returned as the same
+    /// `(combined_key, size_class, backend)` triples `freeze` uses.
+    pub fn distill(&self) -> Vec<(u64, u8, Backend)> {
+        // (one_frame, size_class) -> agreed backend so far, or None once a
+        // conflicting backend proves the group ambiguous.
+        let mut groups: BTreeMap<(u64, u8), Option<Backend>> = BTreeMap::new();
+        for (sig, stats) in self.stats.iter() {
+            if stats.one_frame == 0 {
+                continue; // unknown leaf hash → cannot distill
+            }
+            let best = backend_from_index(Self::best_arm_index(stats));
+            groups
+                .entry((stats.one_frame, sig.size_class))
+                .and_modify(|agreed| {
+                    if *agreed != Some(best) {
+                        *agreed = None; // conflicting context → ambiguous
+                    }
+                })
+                .or_insert(Some(best));
+        }
+        groups
+            .into_iter()
+            .filter_map(|((one_frame, size_class), agreed)| {
+                agreed.map(|backend| {
+                    let key = crate::state::combine_hash_size_class(one_frame, size_class);
+                    (key, size_class, backend)
+                })
+            })
+            .collect()
+    }
+
     /// Collapse the bandit into a flat `(caller_pc, best_backend)` snapshot
     /// for the GUI's live "training progress" view
     /// (`state::AllocatorState::routing_snapshot`), *not* the frozen
@@ -399,6 +473,41 @@ mod tests {
         );
         // After one select, the signature should be tracked.
         assert_eq!(bandit.len(), 1);
+    }
+
+    #[test]
+    fn distill_keeps_unambiguous_omits_ambiguous_and_unknown() {
+        let cfg = crate::tune::config();
+        let mut bandit = BanditPolicy::new();
+        const LEAF_A: u64 = 0xAAAA_0001;
+        const LEAF_B: u64 = 0xBBBB_0002;
+
+        // Two distinct 3-frame contexts sharing leaf LEAF_A, both converging
+        // on Buddy → the (LEAF_A, sc0) group is unambiguous → distilled.
+        for h in [0x1001u64, 0x1002] {
+            let s = Signature::new(h, 0);
+            bandit.select_with_frame(s, LEAF_A, cfg);
+            bandit.update(s, Backend::Buddy, 5.0);
+        }
+        // Two contexts sharing leaf LEAF_B but wanting different backends →
+        // ambiguous group → omitted from the distilled table.
+        let sc = Signature::new(0x2001, 0);
+        bandit.select_with_frame(sc, LEAF_B, cfg);
+        bandit.update(sc, Backend::Slab, 5.0);
+        let sd = Signature::new(0x2002, 0);
+        bandit.select_with_frame(sd, LEAF_B, cfg);
+        bandit.update(sd, Backend::Arena, 5.0);
+        // A site with no known leaf hash (replay path) → never distilled.
+        let se = Signature::new(0x3001, 0);
+        bandit.select(se);
+        bandit.update(se, Backend::Buddy, 5.0);
+
+        let distilled = bandit.distill();
+        assert_eq!(distilled.len(), 1, "only the unambiguous group distills");
+        let (key, size_class, backend) = distilled[0];
+        assert_eq!(key, crate::state::combine_hash_size_class(LEAF_A, 0));
+        assert_eq!(size_class, 0);
+        assert_eq!(backend, Backend::Buddy);
     }
 
     #[test]

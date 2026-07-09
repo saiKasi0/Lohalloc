@@ -14,3 +14,21 @@ variable "ssh_allowed_cidr" {
   type        = string
   default     = "0.0.0.0/0"
 }
+
+variable "arm_instance_type" {
+  description = "Instance type for the ARM64 benchmark instance. Defaults to the CI baseline (c6g.large); override for one-off runs on bigger Graviton hardware (e.g. c8g.4xlarge)."
+  type        = string
+  default     = "c6g.large"
+}
+
+variable "x86_instance_type" {
+  description = "Instance type for the x86_64 benchmark instance (when enabled)."
+  type        = string
+  default     = "c6i.large"
+}
+
+variable "enable_x86" {
+  description = "Provision the x86_64 instance. CI runs both architectures (true); ARM-only one-off runs (infra/cloud_bench.sh) set this false so a single instance is billed."
+  type        = bool
+  default     = true
+}

@@ -74,6 +74,42 @@ pub fn global_lohalloc_pht_misses() -> u64 {
     lohalloc_alloc::Lohalloc::pht_miss_count()
 }
 
+/// Ladder 6 pin-cache counters `(misses, hits, negative)`. Misses are
+/// always counted (cold path); hits/negative read `0` unless
+/// `lohalloc-alloc` was built with `route-metrics`.
+#[cfg(feature = "alloc-lohalloc")]
+pub fn global_lohalloc_pin_counters() -> (u64, u64, u64) {
+    (
+        lohalloc_alloc::Lohalloc::pin_miss_count(),
+        lohalloc_alloc::Lohalloc::pin_hit_count(),
+        lohalloc_alloc::Lohalloc::pin_negative_count(),
+    )
+}
+
+/// Frozen-path per-backend service count (0 without `route-metrics`).
+#[cfg(feature = "alloc-lohalloc")]
+pub fn global_lohalloc_route_count(backend: lohalloc_core::Backend) -> u64 {
+    lohalloc_alloc::Lohalloc::route_count(backend)
+}
+
+/// Frozen-path fallthrough count (0 without `route-metrics`).
+#[cfg(feature = "alloc-lohalloc")]
+pub fn global_lohalloc_fallthroughs() -> u64 {
+    lohalloc_alloc::Lohalloc::fallthrough_count()
+}
+
+/// Whether the global instance latched each backend's header-free fast path
+/// on `load()` `(slab, buddy, arena)`. Diagnostic for the touch-cost story:
+/// these only latch if the backend was untouched at model-load time.
+#[cfg(feature = "alloc-lohalloc")]
+pub fn global_lohalloc_headerless() -> (bool, bool, bool) {
+    (
+        ALLOC.is_slab_headerless(),
+        ALLOC.is_buddy_headerless(),
+        ALLOC.is_arena_headerless(),
+    )
+}
+
 /// Human-readable label for whichever allocator this build selected. Used to
 /// tag criterion baselines and latency-profile output so results are
 /// self-describing.
