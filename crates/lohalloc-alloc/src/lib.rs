@@ -499,6 +499,39 @@ fn record_pin_negative() {
     PIN_NEGATIVE.fetch_add(1, Ordering::Relaxed);
 }
 
+/// J5-bisect slab central-refill observability (route-metrics/test only —
+/// these sit on the magazine-miss path, cold enough to count but the same
+/// false-sharing rule as the pin counters applies). Instrumentation for the
+/// "stripe widening lengthened the sibling-stripe scan" hypothesis:
+/// `SLAB_CENTRAL_REFILLS` counts magazine-miss refills reaching the central
+/// slab, `SLAB_SIBLING_STEPS` the total sibling-stripe try_lock probes those
+/// refills performed, `SLAB_SIBLING_HITS` how many refills a sibling
+/// actually served. steps/refill ≈ stripe_count−1 with hits ≈ 0 = pure
+/// scan waste (the single-thread signature).
+#[cfg(any(feature = "route-metrics", test))]
+static SLAB_CENTRAL_REFILLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(feature = "route-metrics", test))]
+static SLAB_SIBLING_STEPS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(feature = "route-metrics", test))]
+static SLAB_SIBLING_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one central refill and its sibling-scan outcome in a single call
+/// (one to three `fetch_add`s per magazine miss, not per op). No-op unless
+/// `route-metrics`/`test`.
+#[inline(always)]
+fn record_slab_central_refill(_steps: u64, _sibling_hit: bool) {
+    #[cfg(any(feature = "route-metrics", test))]
+    {
+        SLAB_CENTRAL_REFILLS.fetch_add(1, Ordering::Relaxed);
+        if _steps > 0 {
+            SLAB_SIBLING_STEPS.fetch_add(_steps, Ordering::Relaxed);
+        }
+        if _sibling_hit {
+            SLAB_SIBLING_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 impl Default for Lohalloc {
     fn default() -> Self {
         Self::new()
@@ -523,28 +556,87 @@ pub(crate) const MAX_STRIPES: usize = 32;
 pub(crate) const MIN_STRIPES: usize = 8;
 
 /// The active-stripe mask (`active_count - 1`), latched on first use.
-/// 0 = unlatched (a mask can never legitimately be 0: the floor is 8).
-static STRIPE_MASK: AtomicUsize = AtomicUsize::new(0);
+/// `usize::MAX` = unlatched. (The sentinel used to be 0 back when the floor
+/// guaranteed mask >= 7; the `LOHALLOC_STRIPES` override below can legally
+/// produce mask 0 — a single stripe — so 0 is now a real value.)
+static STRIPE_MASK: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Allocation-free read of the `LOHALLOC_STRIPES` override. Uses
+/// `libc::getenv` + a manual ASCII parse because this runs *inside* the
+/// allocator (first-allocation latch, `IN_ALLOC` possibly active, possibly
+/// pre-`main` under `#[global_allocator]`/LD_PRELOAD): `std::env::var`
+/// allocates a `String` and takes std's internal env lock — the documented
+/// re-entrancy deadlock class (see lohalloc-cabi's `LOHALLOC_FREEZE_AFTER`
+/// history). `getenv` isn't guaranteed safe against concurrent `setenv`,
+/// but nothing in this process mutates the environment and the latch reads
+/// once. `None` = unset, empty, non-numeric, `0`, or overflow — all treated
+/// as "no override" (silently: eprintln! allocates, and we're on the alloc
+/// path).
+fn stripe_override() -> Option<usize> {
+    // SAFETY: NUL-terminated literal; getenv returns NULL or a pointer into
+    // the C environment, valid for the duration of this read (no setenv in
+    // this process).
+    let p = unsafe { libc::getenv(b"LOHALLOC_STRIPES\0".as_ptr().cast()) };
+    if p.is_null() {
+        return None;
+    }
+    let mut n: usize = 0;
+    let mut i = 0isize;
+    loop {
+        // SAFETY: walking the NUL-terminated C string returned by getenv.
+        let b = unsafe { *p.offset(i) } as u8;
+        if b == 0 {
+            break;
+        }
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+        i += 1;
+    }
+    if i == 0 || n == 0 {
+        return None; // empty value or explicit 0: treat as unset
+    }
+    Some(n)
+}
+
+/// Pure latch computation, split out so it is unit-testable without touching
+/// the process-global `STRIPE_MASK` latch.
+///
+/// - `Some(n)` (explicit `LOHALLOC_STRIPES` override, bisect/diagnostic use):
+///   rounded up to a power of two, capped at `MAX_STRIPES`, floor **1** — an
+///   explicit override is definitionally opting out of the certified
+///   configuration, and the 1-stripe cell is the strongest mechanism probe
+///   (sibling scan degenerates to an empty range).
+/// - `None` (production): today's formula, unchanged —
+///   `next_pow2(ncpus).clamp(MIN_STRIPES, MAX_STRIPES)`.
+fn stripe_count(override_n: Option<usize>, ncpus: usize) -> usize {
+    match override_n {
+        Some(n) => n.next_power_of_two().min(MAX_STRIPES),
+        None => ncpus.next_power_of_two().clamp(MIN_STRIPES, MAX_STRIPES),
+    }
+}
 
 /// Active stripe count as a mask, scaled to the host: `next_pow2(ncpus)`
-/// clamped to `[MIN_STRIPES, MAX_STRIPES]`, minus 1. Latched once — a racy
-/// double-init computes the identical value, so a plain relaxed
-/// load/store is enough (same pattern as `magazine_id`). Reads after the
-/// latch are a single shared (never-again-written) atomic load; the J4-B
-/// lesson that stripes must track the *actual* concurrency is what this
-/// generalizes: the old `BACKEND_STRIPES = 8` const was hardwired to the
-/// benched t8 and left a 16-vCPU host 2:1-contended at t16.
+/// clamped to `[MIN_STRIPES, MAX_STRIPES]`, minus 1 — overridable via
+/// `LOHALLOC_STRIPES` (bisect/diagnostic knob; see `stripe_count`). Latched
+/// once — a racy double-init computes the identical value (getenv is stable
+/// for the process), so a plain relaxed load/store is enough (same pattern
+/// as `magazine_id`). Reads after the latch are a single shared
+/// (never-again-written) atomic load; the J4-B lesson that stripes must
+/// track the *actual* concurrency is what this generalizes: the old
+/// `BACKEND_STRIPES = 8` const was hardwired to the benched t8 and left a
+/// 16-vCPU host 2:1-contended at t16.
 #[inline]
 pub(crate) fn stripe_mask() -> usize {
     let m = STRIPE_MASK.load(Ordering::Relaxed);
-    if m != 0 {
+    if m != usize::MAX {
         return m;
     }
     let ncpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(MIN_STRIPES);
-    let count = ncpus.next_power_of_two().clamp(MIN_STRIPES, MAX_STRIPES);
-    let mask = count - 1;
+    let mask = stripe_count(stripe_override(), ncpus) - 1;
     STRIPE_MASK.store(mask, Ordering::Relaxed);
     mask
 }
@@ -1411,19 +1503,24 @@ impl Lohalloc {
             };
             let n = slab.alloc_batch_recycled(class, buf, headerless);
             if n > 0 {
+                record_slab_central_refill(0, false);
                 return n;
             }
         }
         let mask = stripe_mask();
+        let mut steps: u64 = 0;
         for k in 1..=mask {
+            steps += 1;
             let s = (stripe + k) & mask;
             if let Ok(mut slab) = self.slab[s].try_lock() {
                 let n = slab.alloc_batch_recycled(class, buf, headerless);
                 if n > 0 {
+                    record_slab_central_refill(steps, true);
                     return n;
                 }
             }
         }
+        record_slab_central_refill(steps, false);
         let Ok(mut slab) = self.slab[stripe].lock() else {
             return 0;
         };
@@ -2288,9 +2385,14 @@ impl Lohalloc {
         // kept all and the storm cost 3.98×; the volume split is the good
         // half of both). See its doc.
         let demote_arena = self.arena_epoch.load(Ordering::Relaxed) == 0;
+        // The heavy/light threshold comes from the `demote_fraction` tune
+        // key (default = the certified 0.10 const; bisect knob:
+        // LOHALLOC_DEMOTE_FRACTION). `tune::config()` is one atomic load,
+        // no I/O — safe under the realloc guard.
+        let demote_fraction = crate::tune::config().demote_fraction;
         Self::with_realloc_guard(|| {
             if let Ok(mut state) = self.state.lock() {
-                state.freeze(demote_arena);
+                state.freeze(demote_arena, demote_fraction);
                 self.publish_frozen_table(&state);
             }
         });
@@ -2494,6 +2596,14 @@ impl Lohalloc {
         PHT_MISSES.load(Ordering::Relaxed)
     }
 
+    /// The latched active stripe count (latching it now if this is the first
+    /// touch). Introspection for bisect/diagnostic runs — pairs with the
+    /// `LOHALLOC_STRIPES` override so a run can verify which configuration
+    /// it actually executed under.
+    pub fn active_stripes() -> usize {
+        stripe_mask() + 1
+    }
+
     /// Process-wide count of Inference pin-cache misses (each triggers one
     /// distilled-table probe + slot store). Roughly `#(site, size_class)
     /// pairs × cache-eviction churn` — small and stable on a healthy
@@ -2529,6 +2639,25 @@ impl Lohalloc {
         #[cfg(not(any(feature = "route-metrics", test)))]
         {
             0
+        }
+    }
+
+    /// Process-wide `(central_refills, sibling_steps, sibling_hits)` for the
+    /// slab magazine-miss path (see `SLAB_CENTRAL_REFILLS`'s doc — the
+    /// J5-bisect sibling-scan instrumentation). All `0` unless built with
+    /// `route-metrics` (or under test).
+    pub fn slab_refill_counts() -> (u64, u64, u64) {
+        #[cfg(any(feature = "route-metrics", test))]
+        {
+            (
+                SLAB_CENTRAL_REFILLS.load(Ordering::Relaxed),
+                SLAB_SIBLING_STEPS.load(Ordering::Relaxed),
+                SLAB_SIBLING_HITS.load(Ordering::Relaxed),
+            )
+        }
+        #[cfg(not(any(feature = "route-metrics", test)))]
+        {
+            (0, 0, 0)
         }
     }
 
@@ -4219,6 +4348,9 @@ mod integration_tests {
         // is a mask) scaled to the host core count, floored at MIN_STRIPES
         // (preserves the certified ≤8-thread behavior byte-identically) and
         // ceilinged at MAX_STRIPES (the const array size).
+        // NOTE: assumes LOHALLOC_STRIPES is unset in the test environment —
+        // an exported override latches the process-global mask below
+        // MIN_STRIPES and legitimately fails the range assert.
         let mask = stripe_mask();
         let count = mask + 1;
         assert!(
@@ -4230,6 +4362,27 @@ mod integration_tests {
         assert_eq!(stripe_mask(), mask);
         // Thread stripes always land inside the active set.
         assert!(thread_stripe() <= mask);
+    }
+
+    #[test]
+    fn stripe_count_default_pins_certified_formula() {
+        // The unset path must stay byte-identical to the pre-override
+        // formula: next_pow2(ncpus).clamp(MIN_STRIPES, MAX_STRIPES).
+        for (ncpus, want) in [(1, 8), (4, 8), (8, 8), (10, 16), (16, 16), (64, 32)] {
+            assert_eq!(stripe_count(None, ncpus), want, "ncpus={ncpus}");
+        }
+    }
+
+    #[test]
+    fn stripe_count_override_rounds_pow2_floor1_cap_max() {
+        // Explicit override: pow2 round-up, floor 1 (opting out of the
+        // certified floor is the point — 1-stripe is the strongest
+        // sibling-scan mechanism probe), cap MAX_STRIPES.
+        for (n, want) in [(1, 1), (2, 2), (3, 4), (8, 8), (16, 16), (31, 32), (33, 32)] {
+            assert_eq!(stripe_count(Some(n), 999), want, "override={n}");
+        }
+        // ncpus is ignored when an override is present.
+        assert_eq!(stripe_count(Some(4), 64), 4);
     }
 
     #[test]

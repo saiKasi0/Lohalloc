@@ -307,11 +307,17 @@ impl AllocatorState {
     /// deterministically. Workloads that genuinely reset (GUI/replay) keep
     /// everything.
     ///
+    /// `demote_fraction` is the heavy/light threshold. Production passes the
+    /// `demote_fraction` tune key (default [`ARENA_DEMOTE_VOLUME_FRACTION`]);
+    /// it's a parameter (not a `tune::config()` read here) so tests can pin
+    /// it without racing the process-global config. `0.0` demotes every
+    /// Arena verdict (J4-C blanket); `> 1.0` never demotes.
+    ///
     /// # Panics
     ///
     /// Panics if called when already in Inference mode. `freeze()` is a
     /// one-way transition.
-    pub fn freeze(&mut self, demote_arena: bool) {
+    pub fn freeze(&mut self, demote_arena: bool, demote_fraction: f64) {
         match self {
             Self::Training { bandit, .. } => {
                 // Same per-size-class clamp for both tables: a distilled
@@ -327,8 +333,7 @@ impl AllocatorState {
                         .into_iter()
                         .map(|(key, size_class, backend, pulls)| {
                             let heavy = total_all > 0
-                                && (pulls as f64 / total_all as f64)
-                                    >= ARENA_DEMOTE_VOLUME_FRACTION;
+                                && (pulls as f64 / total_all as f64) >= demote_fraction;
                             (
                                 key,
                                 size_class,
@@ -547,6 +552,11 @@ pub(crate) fn shaped_reward(
 /// signatures sit far below 10% each (~117 arena allocs / 200k mixed ops).
 /// The gap between the two cases is orders of magnitude, so the exact
 /// value is not delicate — 0.10 sits comfortably between them.
+///
+/// Since J5's bisect knobs this const is the *default* of the
+/// `demote_fraction` tune key (`LOHALLOC_DEMOTE_FRACTION`), which is what
+/// production `Lohalloc::freeze()` actually passes to
+/// [`AllocatorState::freeze`].
 pub(crate) const ARENA_DEMOTE_VOLUME_FRACTION: f64 = 0.10;
 
 // ---------------------------------------------------------------------------
@@ -751,7 +761,7 @@ mod tests {
             state.record_latency(100, backend, size_class_for(64), 10, 64);
         }
         assert!(!state.is_inference());
-        state.freeze(false);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
         assert!(state.is_inference());
     }
 
@@ -768,7 +778,7 @@ mod tests {
                 state.record_latency(100, Backend::Arena, size_class_for(64), 10, 64);
             }
         }
-        state.freeze(false);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
 
         // In Inference, routing for hash 100 should return the frozen backend.
         let backend = state.route(100, 64);
@@ -788,7 +798,7 @@ mod tests {
             let backend = state.route(50, 64);
             state.record_latency(50, backend, size_class_for(64), 10, 64);
         }
-        state.freeze(false);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
 
         // record_latency() in Inference mode should be a no-op (not panic).
         state.record_latency(50, Backend::Slab, size_class_for(64), 10, 64);
@@ -803,7 +813,7 @@ mod tests {
             let backend = state.route(100, 64);
             state.record_latency(100, backend, size_class_for(64), 10, 64);
         }
-        state.freeze(false);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
 
         // Hash 999 was never seen → should fall back to size-based default.
         let backend = state.route(999, 64);
@@ -814,7 +824,7 @@ mod tests {
     #[test]
     fn inference_falls_back_for_large_size() {
         let mut state = AllocatorState::new_training();
-        state.freeze(false);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
         // Size > BUDDY_MAX → System.
         let backend = state.route(999, 2 * 1024 * 1024);
         assert_eq!(backend, Backend::System);
@@ -835,7 +845,7 @@ mod tests {
             // `inference_mode_routes_via_perfect_hash`'s forced-Arena case.
             state.record_latency(200, Backend::System, sc, 10, size);
         }
-        state.freeze(false);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
 
         let backend = state.route(200, size);
         assert_ne!(
@@ -859,7 +869,7 @@ mod tests {
             let _ = state.route(201, size);
             state.record_latency(201, Backend::System, sc, 10, size);
         }
-        state.freeze(false);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
 
         assert_eq!(state.route(201, size), Backend::System);
     }
@@ -883,11 +893,11 @@ mod tests {
         // backend instead — Slab for slab-range, Buddy for buddy-range.
         // This is what kills the freeze-at-1000 arena/slab coin flip.
         let mut small = train_arena_locked(300, 64); // sc 0-11 → Slab
-        small.freeze(true);
+        small.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION);
         assert_eq!(small.route(300, 64), Backend::Slab);
 
         let mut mid = train_arena_locked(301, 20_000); // sc 12 → Buddy
-        mid.freeze(true);
+        mid.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION);
         assert_eq!(mid.route(301, 20_000), Backend::Buddy);
     }
 
@@ -896,8 +906,29 @@ mod tests {
         // A deployment that resets its arena (GUI/replay) keeps Arena
         // verdicts — demotion is strictly opt-in via the flag.
         let mut state = train_arena_locked(302, 64);
-        state.freeze(false);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
         assert_eq!(state.route(302, 64), Backend::Arena);
+    }
+
+    #[test]
+    fn demote_fraction_zero_is_blanket_demotion() {
+        // Bisect knob semantics: 0.0 demotes EVERY Arena verdict (the J4-C
+        // blanket behavior) — any signature with pulls > 0 satisfies
+        // `pulls/total >= 0.0`.
+        let mut state = train_arena_locked(303, 64);
+        state.freeze(true, 0.0);
+        assert_eq!(state.route(303, 64), Backend::Slab);
+    }
+
+    #[test]
+    fn demote_fraction_above_one_never_demotes() {
+        // Bisect knob semantics: > 1.0 keeps every Arena verdict even in a
+        // reset-free deployment — no signature can exceed 100% of volume.
+        // (train_arena_locked's single signature IS 100% of its table, the
+        // heaviest case possible.)
+        let mut state = train_arena_locked(304, 64);
+        state.freeze(true, 2.0);
+        assert_eq!(state.route(304, 64), Backend::Arena);
     }
 
     #[test]
@@ -914,7 +945,7 @@ mod tests {
             let _ = state.route_with_frame(400, 41, size);
             state.record_latency(400, Backend::Arena, sc, 10, size);
         }
-        state.freeze(true);
+        state.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION);
         let distilled = state.distilled_table().expect("inference mode");
         let key = combine_hash_size_class(41, sc);
         match distilled.lookup(key) {
@@ -1009,7 +1040,7 @@ mod tests {
             let _ = state.route(501, 256);
             state.record_latency(501, Backend::Slab, size_class_for(256), 10, 256);
         }
-        state.freeze(true);
+        state.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION);
         assert_eq!(
             state.route(500, size),
             Backend::Arena,
@@ -1034,7 +1065,7 @@ mod tests {
             let _ = state.route(511, size);
             state.record_latency(511, Backend::Arena, sc, 10, size);
         }
-        state.freeze(true);
+        state.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION);
         assert_eq!(
             state.route(510, size),
             Backend::Slab,
@@ -1066,7 +1097,7 @@ mod tests {
             let _ = state.route_with_frame(521, 62, 256);
             state.record_latency(521, Backend::Slab, size_class_for(256), 10, 256);
         }
-        state.freeze(true);
+        state.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION);
         let distilled = state.distilled_table().expect("inference mode");
         let key = combine_hash_size_class(61, sc);
         match distilled.lookup(key) {
@@ -1094,7 +1125,7 @@ mod tests {
             let backend = state.route(2, 256);
             state.record_latency(2, backend, size_class_for(256), 10, 256);
         }
-        state.freeze(false);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
 
         // Export.
         let bytes = state.export().expect("export should work in Inference");
@@ -1115,7 +1146,7 @@ mod tests {
             let backend = state.route(42, 64);
             state.record_latency(42, backend, size_class_for(64), 10, 64);
         }
-        state.freeze(false);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
         let bytes = state.export().unwrap();
 
         let loaded = AllocatorState::load(&bytes).unwrap();
@@ -1126,8 +1157,8 @@ mod tests {
     #[should_panic(expected = "freeze() called on an already-frozen")]
     fn freeze_twice_panics() {
         let mut state = AllocatorState::new_training();
-        state.freeze(false);
-        state.freeze(false); // Should panic.
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION); // Should panic.
     }
 
     #[test]
@@ -1179,7 +1210,7 @@ mod tests {
             let b = state.route(42, 64);
             state.record_latency(42, b, size_class_for(64), 10, 64);
         }
-        state.freeze(false);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
         assert!(state.routing_snapshot().is_empty());
         assert_eq!(state.signature_count(), 0);
     }
@@ -1194,7 +1225,7 @@ mod tests {
         assert!(!state.is_inference());
         assert_eq!(state.signature_count(), 1);
 
-        state.freeze(false);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
         assert!(state.is_inference());
         assert_eq!(state.signature_count(), 0);
 

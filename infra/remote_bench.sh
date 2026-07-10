@@ -50,7 +50,14 @@ echo "== Run directory: $RUN_DIR =="
 #   make bench-perf          real-PMU MT diagnostics (probe-gated; informational)
 #   make bench-report        aggregate -> report + graphs
 echo "== [1/5] Rust criterion + latency_profile suite (make bench) =="
-make bench RUN_DIR="$RUN_DIR"
+# Non-fatal: `make bench` is the *informational* criterion/latency suite — it
+# does NOT feed the certified gate (that's [2/5] bench-native-host + the
+# aggregate). It must never abort the run under `set -e`: a criterion bench
+# OOM (e.g. the buddy hypothesis bench SIGKILL'd on c9g, 2026-07-10) would
+# otherwise cost the whole 2-instance provisioning without ever producing a
+# gate verdict. Latency profiling runs first inside `make bench`, so its raw
+# output survives even if a later criterion bench dies.
+make bench RUN_DIR="$RUN_DIR" || echo "WARNING: make bench (informational criterion/latency) failed — continuing to the gated native suite"
 
 echo "== [2/5] Native (LD_PRELOAD) cross-allocator timing suite =="
 make bench-native-host RUN_DIR="$RUN_DIR"

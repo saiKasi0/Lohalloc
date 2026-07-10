@@ -431,6 +431,17 @@ run_lohalloc_triple() {
     local lang="$1" binary="$2" workload="$3" preload="$4"
     local tune_env=""
     [ -n "${TUNE_FILE:-}" ] && tune_env="LOHALLOC_TUNE=$TUNE_FILE"
+    # J5 bisect knobs: forwarded (when set) into the SAME command-string env
+    # as LOHALLOC_TUNE, so they reach all three legs — timed training, the
+    # untimed train+export, and timed inference. Deliberately including the
+    # train/export leg: stripes change training-time latencies → rewards →
+    # verdicts, so a bisect cell must train under the config it is benched
+    # under (the exported model itself stores only (hash, sc, backend)).
+    # Explicit named forwarding (not a generic passthrough) keeps the env
+    # injection surface auditable; the values are then self-documented in
+    # every raw JSON's stored hyperfine command.
+    [ -n "${LOHALLOC_STRIPES:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_STRIPES=$LOHALLOC_STRIPES"
+    [ -n "${LOHALLOC_DEMOTE_FRACTION:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_DEMOTE_FRACTION=$LOHALLOC_DEMOTE_FRACTION"
     run_one "$lang" "$binary" "$workload" "lohalloc" "$preload" "training" "$tune_env"
     local model="$MODEL_DIR/model-${lang}-${workload}.lohalloc"
     echo "==> [train+export] $lang/$workload -> $model (train ops=$TRAIN_OPS)"

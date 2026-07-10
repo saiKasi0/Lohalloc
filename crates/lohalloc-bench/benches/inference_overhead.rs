@@ -15,7 +15,7 @@ fn inference_overhead(c: &mut Criterion) {
         b.iter_batched(
             HarnessDriver::new,
             |h| workloads::workload_slab_churn(&h, hashes::W_SLAB, 2000),
-            BatchSize::SmallInput,
+            BatchSize::PerIteration,
         );
     });
 
@@ -28,7 +28,7 @@ fn inference_overhead(c: &mut Criterion) {
                 h
             },
             |h| workloads::workload_slab_churn(&h, hashes::W_SLAB, 2000),
-            BatchSize::SmallInput,
+            BatchSize::PerIteration,
         );
     });
 
@@ -40,7 +40,7 @@ fn inference_overhead(c: &mut Criterion) {
                 h
             },
             |h| workloads::workload_slab_churn(&h, hashes::W_SLAB, 2000),
-            BatchSize::SmallInput,
+            BatchSize::PerIteration,
         );
     });
 

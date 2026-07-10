@@ -36,6 +36,10 @@ fi
 export TF_VAR_aws_region="${TF_VAR_aws_region:-${AWS_DEFAULT_REGION:-us-east-1}}"
 
 INSTANCE_TYPE="${1:-c8g.4xlarge}"
+# Which script to run on the box. Default = the full certified suite; the J5
+# bisect harness is selected with REMOTE_SCRIPT=infra/remote_bisect.sh. Must
+# be a repo-relative path (it rides in via the rsync above).
+REMOTE_SCRIPT="${REMOTE_SCRIPT:-infra/remote_bench.sh}"
 STAMP="$(date +%Y%m%dT%H%M%S)"
 DEST="results/${STAMP}_${INSTANCE_TYPE}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
@@ -139,12 +143,12 @@ SSH_TRIES=3 ssh_try 'sudo systemctl disable --now \
 # finishes and holds the suite's exit code; `~/bench.log` streams progress.
 # This is the fix for both prior data losses: execution is decoupled from this
 # SSH session, and completion is a file on disk, not a live channel.
-echo "== Launching detached bench suite =="
+echo "== Launching detached bench suite ($REMOTE_SCRIPT) =="
 ssh "${SSH_OPTS[@]}" "ubuntu@$IP" \
-    'cd ~/lohalloc && chmod +x infra/remote_bench.sh && rm -f ~/bench.rc ~/bench.log && \
-     setsid bash -lc "./infra/remote_bench.sh > ~/bench.log 2>&1; echo \$? > ~/bench.rc" \
+    "cd ~/lohalloc && chmod +x '$REMOTE_SCRIPT' && rm -f ~/bench.rc ~/bench.log && \
+     setsid bash -lc \"./'$REMOTE_SCRIPT' > ~/bench.log 2>&1; echo \\\$? > ~/bench.rc\" \
         </dev/null >/dev/null 2>&1 & \
-     sleep 1; echo "detached launch ok"'
+     sleep 1; echo 'detached launch ok'"
 
 # Poll for the completion sentinel, tolerant of a box that briefly vanishes
 # (reboot / blip). Up to ~4h (720 * 20s) — the cachegrind pass alone is slow

@@ -98,6 +98,20 @@ pub fn global_lohalloc_fallthroughs() -> u64 {
     lohalloc_alloc::Lohalloc::fallthrough_count()
 }
 
+/// J5-bisect slab central-refill counters
+/// `(central_refills, sibling_steps, sibling_hits)` — the sibling-scan
+/// instrumentation (all 0 without `route-metrics`).
+#[cfg(feature = "alloc-lohalloc")]
+pub fn global_lohalloc_slab_refill_counts() -> (u64, u64, u64) {
+    lohalloc_alloc::Lohalloc::slab_refill_counts()
+}
+
+/// The latched active stripe count (reflects `LOHALLOC_STRIPES` when set).
+#[cfg(feature = "alloc-lohalloc")]
+pub fn global_lohalloc_active_stripes() -> usize {
+    lohalloc_alloc::Lohalloc::active_stripes()
+}
+
 /// Whether the global instance latched each backend's header-free fast path
 /// on `load()` `(slab, buddy, arena)`. Diagnostic for the touch-cost story:
 /// these only latch if the backend was untouched at model-load time.

@@ -49,6 +49,7 @@
 //! | `converge_stable_n` | 64      | consecutive same-arm selections per Signature required by `converged` |
 //! | `freeze_after`      | (none)  | op-count threshold; the env var `LOHALLOC_FREEZE_AFTER` (read by `lohalloc-cabi`) takes precedence over this key |
 //! | `reward_batch`      | 16      | latency samples averaged per bandit reward update; de-quantizes the ARM ~42ns `Instant` tick floor. `1` = pre-Ladder-4 per-op behavior |
+//! | `demote_fraction`   | 0.10    | freeze-time Arena-demotion volume threshold (J5-A bisect knob): `0.0` = demote every Arena verdict (J4-C blanket), `>1.0` = never demote |
 
 /// How the training→inference transition is triggered (consumed by
 /// `lohalloc-cabi`'s auto-freeze and `native_workload`'s driver — the
@@ -84,6 +85,13 @@ pub struct TrainingConfig {
     /// pre-Ladder-4 per-op reward behavior bit-for-bit. Clamped to ≥1 by
     /// the parser (0 would never flush a reward).
     pub reward_batch: u32,
+    /// Freeze-time Arena-demotion volume threshold (J5-A, bisect knob): a
+    /// signature's Arena verdict is demoted to the size-based default when
+    /// its training volume `pulls/total >= demote_fraction` (and the arena
+    /// never reset, see `Lohalloc::freeze`). `0.0` demotes EVERY Arena
+    /// verdict (the J4-C blanket behavior); `0.10` is the certified J5
+    /// volume-selective default; `> 1.0` never demotes.
+    pub demote_fraction: f64,
 }
 
 impl TrainingConfig {
@@ -101,6 +109,7 @@ impl TrainingConfig {
             converge_stable_n: 64,
             freeze_after: None,
             reward_batch: 16,
+            demote_fraction: crate::state::ARENA_DEMOTE_VOLUME_FRACTION,
         }
     }
 }
@@ -113,7 +122,7 @@ impl Default for TrainingConfig {
 
 /// The known keys, used both for file parsing and for deriving the
 /// `LOHALLOC_<KEY>` env-override names.
-const KEYS: [&str; 13] = [
+const KEYS: [&str; 14] = [
     "focus",
     "ucb_c",
     "hysteresis",
@@ -127,6 +136,7 @@ const KEYS: [&str; 13] = [
     "converge_stable_n",
     "freeze_after",
     "reward_batch",
+    "demote_fraction",
 ];
 
 /// Apply a `focus` preset. Only sets the reward-shape pair — everything
@@ -193,6 +203,12 @@ fn apply_key(cfg: &mut TrainingConfig, key: &str, value: &str) {
             Ok(v) if v > 0 => cfg.reward_batch = v,
             _ => eprintln!(
                 "lohalloc tune: bad value '{value}' for reward_batch (must be >= 1) ignored"
+            ),
+        },
+        "demote_fraction" => match value.parse::<f64>() {
+            Ok(v) if v.is_finite() && v >= 0.0 => cfg.demote_fraction = v,
+            _ => eprintln!(
+                "lohalloc tune: bad value '{value}' for demote_fraction (must be >= 0) ignored"
             ),
         },
         other => eprintln!("lohalloc tune: unknown key '{other}' ignored"),
@@ -362,6 +378,28 @@ mod tests {
         assert_eq!(cfg.frag_weight, 0.0);
         assert_eq!(cfg.freeze_mode, FreezeMode::Ops);
         assert_eq!(cfg.freeze_after, None);
+        // The bisect knob's default must stay the certified J5 constant.
+        assert_eq!(
+            cfg.demote_fraction,
+            crate::state::ARENA_DEMOTE_VOLUME_FRACTION
+        );
+        assert_eq!(cfg.demote_fraction, 0.10);
+    }
+
+    #[test]
+    fn demote_fraction_parses_and_rejects() {
+        let mut cfg = TrainingConfig::default();
+        apply_key(&mut cfg, "demote_fraction", "0.0");
+        assert_eq!(cfg.demote_fraction, 0.0);
+        apply_key(&mut cfg, "demote_fraction", "2.0");
+        assert_eq!(cfg.demote_fraction, 2.0);
+        // Rejected values keep the current setting.
+        apply_key(&mut cfg, "demote_fraction", "-1");
+        assert_eq!(cfg.demote_fraction, 2.0);
+        apply_key(&mut cfg, "demote_fraction", "nan");
+        assert_eq!(cfg.demote_fraction, 2.0);
+        apply_key(&mut cfg, "demote_fraction", "junk");
+        assert_eq!(cfg.demote_fraction, 2.0);
     }
 
     #[test]

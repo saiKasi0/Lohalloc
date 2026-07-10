@@ -255,6 +255,17 @@ fn run_lohalloc(workload: &str, ops: usize) -> bool {
         // as the global allocator, process startup may have touched it first.
         let (slab_hl, buddy_hl, arena_hl) = ga::global_lohalloc_headerless();
         eprintln!("native_workload: headerless slab={slab_hl} buddy={buddy_hl} arena={arena_hl}");
+        // J5-bisect: the stripe config this run actually executed under
+        // (LOHALLOC_STRIPES override visible here) + the sibling-scan
+        // mechanism counters (0 without route-metrics). steps/refill near
+        // stripe_count-1 with hits≈0 = pure scan waste.
+        let (refills, steps, hits) = ga::global_lohalloc_slab_refill_counts();
+        eprintln!(
+            "native_workload: stripes={} demote_fraction={} slab_central_refills={refills} \
+             sibling_steps={steps} sibling_hits={hits}",
+            ga::global_lohalloc_active_stripes(),
+            lohalloc_alloc::tune::config().demote_fraction,
+        );
     }
     ok
 }
