@@ -19,6 +19,22 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."   # repo root
 
+# Load AWS credentials (and optional SSH_KEY / region) from a gitignored .env
+# so a one-off run can use an EC2-capable IAM principal without touching the
+# shell profile. `set -a` auto-exports every assignment for the AWS SDK +
+# terraform. NOTE: .env OVERRIDES any matching var already in the shell — keep
+# the authoritative creds in .env, not split across both.
+if [ -f .env ]; then
+    echo "== Loading AWS credentials from .env =="
+    set -a
+    # shellcheck disable=SC1091
+    . ./.env
+    set +a
+fi
+# terraform's aws provider reads var.aws_region, not AWS_DEFAULT_REGION — bridge
+# them so one region setting in .env drives both the SDK and the provider.
+export TF_VAR_aws_region="${TF_VAR_aws_region:-${AWS_DEFAULT_REGION:-us-east-1}}"
+
 INSTANCE_TYPE="${1:-c8g.4xlarge}"
 STAMP="$(date +%Y%m%dT%H%M%S)"
 DEST="results/${STAMP}_${INSTANCE_TYPE}"

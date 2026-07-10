@@ -6,6 +6,7 @@
 use core::alloc::Layout;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use lohalloc_bench::forced::lohalloc_forced_single;
+use lohalloc_bench::workloads::HarnessDriver;
 use lohalloc_core::Backend;
 
 const HASH: u64 = 0xB4C4_0001;
@@ -21,7 +22,11 @@ fn backend_micro(c: &mut Criterion) {
         (Backend::System, 2 * 1024 * 1024 - 48), // large, system-only territory
     ];
     for &(backend, size) in cases {
-        let alloc = lohalloc_forced_single(HASH, size, backend);
+        // HarnessDriver (not a bare Lohalloc) so construction + drop of the
+        // 32+32-stripe struct stay outlined (O3 compile-explosion fix); the
+        // measured closure still calls the allocator directly via Deref.
+        let h = HarnessDriver::with_alloc(lohalloc_forced_single(HASH, size, backend));
+        let alloc: &lohalloc_alloc::Lohalloc = &h.alloc;
         let layout = Layout::from_size_align(size, 16).unwrap();
         group.bench_with_input(
             BenchmarkId::new(format!("{backend:?}"), size),

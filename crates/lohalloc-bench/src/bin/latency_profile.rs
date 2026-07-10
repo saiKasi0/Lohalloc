@@ -216,9 +216,11 @@ fn main() {
             "arena" => Backend::Arena,
             other => panic!("unknown forced backend {other}"),
         };
-        harness = HarnessDriver {
-            alloc: lohalloc_forced_single(hash, size_for_workload(&args.workload), backend),
-        };
+        harness = HarnessDriver::with_alloc(lohalloc_forced_single(
+            hash,
+            size_for_workload(&args.workload),
+            backend,
+        ));
         let timing = TimingDriver::new(&harness);
         let t0 = std::time::Instant::now();
         run_workload(&args.workload, &timing, hash, args.ops);

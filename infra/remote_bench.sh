@@ -9,6 +9,11 @@ echo "== Installing toolchain =="
 sudo apt-get update -y
 sudo apt-get install -y build-essential cmake git pkg-config valgrind \
     libjemalloc2 libjemalloc-dev
+# perf (bench-perf) is best-effort: linux-tools is kernel-version-specific and
+# the generic metapackage sometimes lags the running kernel on fresh AMIs.
+# Never fail the run if it can't install — the probe below gates bench-perf.
+sudo apt-get install -y "linux-tools-$(uname -r)" linux-tools-common 2>/dev/null \
+    || sudo apt-get install -y linux-tools-generic 2>/dev/null || true
 
 if [ ! -f /usr/local/lib/libmimalloc.so ]; then
     echo "== Building mimalloc from source =="
@@ -42,17 +47,38 @@ echo "== Run directory: $RUN_DIR =="
 #                       hypothesis, inference_overhead, comparison ×4 baselines)
 #   make bench-native-host   native C/C++/Rust hyperfine (the 41 vs-jemalloc rows)
 #   make bench-cache-host    cachegrind D1/LL miss-rate simulation
+#   make bench-perf          real-PMU MT diagnostics (probe-gated; informational)
 #   make bench-report        aggregate -> report + graphs
-echo "== [1/4] Rust criterion + latency_profile suite (make bench) =="
+echo "== [1/5] Rust criterion + latency_profile suite (make bench) =="
 make bench RUN_DIR="$RUN_DIR"
 
-echo "== [2/4] Native (LD_PRELOAD) cross-allocator timing suite =="
+echo "== [2/5] Native (LD_PRELOAD) cross-allocator timing suite =="
 make bench-native-host RUN_DIR="$RUN_DIR"
 
-echo "== [3/4] Native cachegrind cache-miss suite =="
+echo "== [3/5] Native cachegrind cache-miss suite =="
 make bench-cache-host RUN_DIR="$RUN_DIR"
 
-echo "== [4/4] Aggregating =="
+# [4/5] Real-PMU MT diagnostics (perf). Cachegrind is a single-thread sim and
+# cannot see cross-core coherence / false sharing; perf can. But PMU exposure
+# is instance-dependent (Nitro virtualizes it; Graviton non-metal often lacks
+# LLC events), so gate on the probe and NEVER fail the run — this is an
+# informational, ungated table. Opt out entirely with RUN_PERF=0.
+echo "== [4/5] Real-PMU MT diagnostics (perf) =="
+if [ "${RUN_PERF:-1}" = 1 ]; then
+    # LLC/kernel events need paranoid <= 1; best-effort, ignore if locked down.
+    sudo sysctl -w kernel.perf_event_paranoid=1 >/dev/null 2>&1 || true
+    if bash bench/probe_perf.sh; then
+        echo "== perf PMU sufficient — running bench-perf =="
+        make bench-perf RUN_DIR="$RUN_DIR" || echo "WARNING: bench-perf failed — continuing (informational only)"
+    else
+        echo "== perf PMU insufficient on this instance — skipping bench-perf =="
+        echo "   (use a .metal instance for real LLC/coherence events)"
+    fi
+else
+    echo "== RUN_PERF=0 — skipping perf pass =="
+fi
+
+echo "== [5/5] Aggregating =="
 make bench-report RUN_DIR="$RUN_DIR"
 
 echo "Done. $RUN_DIR is ready for retrieval (scp)."

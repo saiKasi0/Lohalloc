@@ -61,7 +61,7 @@ use serde::{Deserialize, Serialize};
 /// One normalized row, regardless of which source format it came from.
 #[derive(Debug, Clone, Serialize)]
 struct Row {
-    source: &'static str, // "native-timing" | "cachegrind" | "rust-latency"
+    source: &'static str, // "native-timing" | "cachegrind" | "perf" | "rust-latency"
     lang: String,
     allocator: String,
     workload: String,
@@ -208,6 +208,32 @@ struct CachegrindResult {
     ll_misses: u64,
 }
 
+/// Real-hardware PMU counters from `bench/run_native.sh --perf` (`perf-`
+/// prefixed raw files, `"source":"pmu"`). Unlike `CachegrindResult`'s
+/// deterministic simulation these are noisy real-silicon counts, MT rows
+/// only, and never gated — they exist to attribute an MT regression to actual
+/// L1/LLC misses (cross-core coherence traffic cachegrind's single-thread sim
+/// cannot see). Uses the L1-dcache-load / LLC-load counters as the L1/last-
+/// level miss view; `cache_references`/`cache_misses` are also in the raw file
+/// (aggregate all-levels) but not surfaced here.
+#[derive(Deserialize)]
+struct PerfResult {
+    lang: String,
+    allocator: String,
+    workload: String,
+    mode: String,
+    #[serde(default)]
+    ops: Option<u64>,
+    /// ops=1 startup-calibration companion (`-cal` files) — subtracted from
+    /// its main row for the `_net` per-op view, exactly like cachegrind.
+    #[serde(default)]
+    calibration: bool,
+    l1d_loads: u64,
+    l1d_load_misses: u64,
+    llc_loads: u64,
+    llc_load_misses: u64,
+}
+
 #[derive(Deserialize)]
 struct RustLatencyResult {
     workload: String,
@@ -289,6 +315,10 @@ fn load_rows(dir: &Path) -> (Vec<Row>, SampleMap) {
     // workload, mode) after the directory scan to fill the `_net` fields.
     let mut cg_main: Vec<CachegrindResult> = Vec::new();
     let mut cg_cal: BTreeMap<(String, String, String, String), (u64, u64)> = BTreeMap::new();
+    // perf (real-PMU) rows are two-phase exactly like cachegrind: main rows and
+    // their ops=1 `-cal` companions, paired after the scan for the `_net` view.
+    let mut perf_main: Vec<PerfResult> = Vec::new();
+    let mut perf_cal: BTreeMap<(String, String, String, String), (u64, u64)> = BTreeMap::new();
     let Ok(entries) = fs::read_dir(dir) else {
         eprintln!("results directory {dir:?} not found or unreadable");
         return (rows, samples);
@@ -346,6 +376,17 @@ fn load_rows(dir: &Path) -> (Vec<Row>, SampleMap) {
                 Ok(cg) => cg_main.push(cg),
                 Err(e) => eprintln!("failed to parse {path:?} as cachegrind result: {e}"),
             }
+        } else if stem.starts_with("perf-") {
+            match serde_json::from_str::<PerfResult>(&text) {
+                Ok(p) if p.calibration => {
+                    perf_cal.insert(
+                        (p.lang, p.allocator, p.workload, p.mode),
+                        (p.l1d_load_misses, p.llc_load_misses),
+                    );
+                }
+                Ok(p) => perf_main.push(p),
+                Err(e) => eprintln!("failed to parse {path:?} as perf result: {e}"),
+            }
         } else if stem.starts_with("rust_") || stem.starts_with("rust-") {
             match serde_json::from_str::<RustLatencyResult>(&text) {
                 Ok(r) => {
@@ -383,6 +424,17 @@ fn load_rows(dir: &Path) -> (Vec<Row>, SampleMap) {
             ))
             .copied();
         rows.push(cachegrind_row(cg, cal));
+    }
+    for p in perf_main {
+        let cal = perf_cal
+            .get(&(
+                p.lang.clone(),
+                p.allocator.clone(),
+                p.workload.clone(),
+                p.mode.clone(),
+            ))
+            .copied();
+        rows.push(perf_row(p, cal));
     }
     (rows, samples)
 }
@@ -496,6 +548,35 @@ fn cachegrind_row(cg: CachegrindResult, cal: Option<(u64, u64)>) -> Row {
                 Some(cg.d1_misses.saturating_sub(cal_d1) as f64 / ops as f64);
             row.ll_misses_per_op_net =
                 Some(cg.ll_misses.saturating_sub(cal_ll) as f64 / ops as f64);
+        }
+    }
+    row
+}
+
+/// Turn one main perf result (plus its optional ops=1 calibration L1d/LLC
+/// miss counts) into a report row. Reuses the shared `d1_*`/`ll_*` metric
+/// fields — L1-dcache maps to the D1 (L1 data) view and LLC to the last-level
+/// view — so the perf table renders the same shape as cachegrind's; the
+/// `source == "perf"` tag is what distinguishes them. Rates use each level's
+/// own load count as the denominator (L1d misses / L1d loads; LLC misses /
+/// LLC loads). Net per-op subtracts the mode's ops=1 startup cost, clamped at
+/// 0, identical to `cachegrind_row`.
+fn perf_row(p: PerfResult, cal: Option<(u64, u64)>) -> Row {
+    let mut row = empty_row("perf", p.lang, p.allocator, p.workload, p.mode);
+    if p.l1d_loads > 0 {
+        row.d1_miss_rate = Some(p.l1d_load_misses as f64 / p.l1d_loads as f64);
+    }
+    if p.llc_loads > 0 {
+        row.ll_miss_rate = Some(p.llc_load_misses as f64 / p.llc_loads as f64);
+    }
+    if let Some(ops) = p.ops.filter(|&o| o > 0) {
+        row.d1_misses_per_op = Some(p.l1d_load_misses as f64 / ops as f64);
+        row.ll_misses_per_op = Some(p.llc_load_misses as f64 / ops as f64);
+        if let Some((cal_l1d, cal_llc)) = cal {
+            row.d1_misses_per_op_net =
+                Some(p.l1d_load_misses.saturating_sub(cal_l1d) as f64 / ops as f64);
+            row.ll_misses_per_op_net =
+                Some(p.llc_load_misses.saturating_sub(cal_llc) as f64 / ops as f64);
         }
     }
     row
@@ -951,6 +1032,34 @@ fn write_markdown(
             fmt2(row.d1_misses_per_op_net),
             fmt2(row.ll_misses_per_op_net),
         ));
+    }
+
+    if rows.iter().any(|r| r.source == "perf") {
+        out.push_str("\n## MT PMU metrics (perf, real hardware)\n\n");
+        out.push_str(
+            "Real hardware PMU counters (vs cachegrind's single-thread \
+             simulation) — the only view that sees cross-core coherence / \
+             false sharing, the mechanism behind MT regressions. MT rows only. \
+             `net` subtracts an ops=1 startup-calibration run. INFORMATIONAL: \
+             perf counts are run-to-run noisy and never gate — the headline is \
+             `LLC/op net` (last-level misses per op, coherence-dominated).\n\n",
+        );
+        out.push_str("| lang | allocator | workload | mode | L1d miss rate | LLC miss rate | L1d miss/op | LLC miss/op | L1d/op net | LLC/op net |\n|---|---|---|---|---|---|---|---|---|---|\n");
+        for row in rows.iter().filter(|r| r.source == "perf") {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {:.4} | {:.4} | {} | {} | {} | {} |\n",
+                row.lang,
+                row.allocator,
+                row.workload,
+                row.mode,
+                row.d1_miss_rate.unwrap_or(0.0),
+                row.ll_miss_rate.unwrap_or(0.0),
+                fmt2(row.d1_misses_per_op),
+                fmt2(row.ll_misses_per_op),
+                fmt2(row.d1_misses_per_op_net),
+                fmt2(row.ll_misses_per_op_net),
+            ));
+        }
     }
 
     out.push_str("\n## Rust per-op latency (hdrhistogram)\n\n");
@@ -1576,5 +1685,61 @@ mod tests {
         // alloc_mean_ns = 40ns -> 25 M allocs/s.
         let mean_ns = 40.0f64;
         assert!((1e3 / mean_ns - 25.0).abs() < 1e-9);
+    }
+
+    fn perf(ops: u64, l1d_m: u64, llc_m: u64) -> PerfResult {
+        PerfResult {
+            lang: "rust".into(),
+            allocator: "lohalloc".into(),
+            workload: "mt-interfere-t8".into(),
+            mode: "inference".into(),
+            ops: Some(ops),
+            calibration: false,
+            l1d_loads: 1_000_000,
+            l1d_load_misses: l1d_m,
+            llc_loads: 100_000,
+            llc_load_misses: llc_m,
+        }
+    }
+
+    #[test]
+    fn perf_row_maps_l1d_llc_and_nets_startup() {
+        // 16_000 gross LLC misses over 2000 ops = 8.0/op, of which 6_000 are
+        // one-time startup (thread spawn + model load) -> net 5.0/op. Mirrors
+        // the cachegrind net test but on the real-PMU path, reusing the shared
+        // d1/ll Row fields (L1-dcache -> D1 view, LLC -> LL view).
+        let row = perf_row(perf(2000, 4_000, 16_000), Some((1_000, 6_000)));
+        assert_eq!(row.source, "perf");
+        assert_eq!(row.d1_miss_rate, Some(4_000.0 / 1_000_000.0));
+        assert_eq!(row.ll_miss_rate, Some(16_000.0 / 100_000.0));
+        assert_eq!(row.ll_misses_per_op, Some(8.0));
+        assert_eq!(row.ll_misses_per_op_net, Some(5.0));
+        assert_eq!(row.d1_misses_per_op_net, Some(1.5));
+    }
+
+    #[test]
+    fn perf_row_clamps_net_and_survives_missing_calibration() {
+        // main < cal (noisy real counters) clamps at 0, never negative.
+        let clamped = perf_row(perf(100, 50, 500), Some((80, 600)));
+        assert_eq!(clamped.ll_misses_per_op_net, Some(0.0));
+        // No calibration companion -> gross only, no net (informational rows
+        // from a pre-calibration or partial run still render).
+        let no_cal = perf_row(perf(2000, 4_000, 16_000), None);
+        assert_eq!(no_cal.ll_misses_per_op, Some(8.0));
+        assert_eq!(no_cal.ll_misses_per_op_net, None);
+    }
+
+    #[test]
+    fn perf_result_parses_source_pmu_shape() {
+        // The exact JSON perf_pass writes (extra fields like cache_references
+        // are ignored by serde), calibration defaults false.
+        let json = r#"{"lang":"rust","allocator":"lohalloc","workload":"mt-xfree-t4",
+            "mode":"inference","ops":50000,"calibration":false,
+            "cache_references":9,"cache_misses":3,
+            "l1d_loads":100,"l1d_load_misses":10,
+            "llc_loads":20,"llc_load_misses":2,"source":"pmu"}"#;
+        let p: PerfResult = serde_json::from_str(json).unwrap();
+        assert!(!p.calibration);
+        assert_eq!(p.llc_load_misses, 2);
     }
 }

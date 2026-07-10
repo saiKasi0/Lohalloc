@@ -46,7 +46,7 @@ fn layer1_forced_routing_matches_hypotheses() {
         let model = forced_model_bytes(&[(hyp.hash, hyp.size, hyp.forced_backend)]);
         let alloc = Lohalloc::new();
         assert!(alloc.load(&model), "{}: model load failed", hyp.id);
-        let harness = HarnessDriver { alloc };
+        let harness = HarnessDriver::with_alloc(alloc);
         let recording = RecordingDriver::new(&harness, &harness.alloc);
 
         run_generator_for_hash(&recording, hyp.hash);
@@ -76,7 +76,7 @@ fn combo_slab_arena_diverges_per_site() {
     ]);
     let alloc = Lohalloc::new();
     assert!(alloc.load(&model), "combo model load failed");
-    let harness = HarnessDriver { alloc };
+    let harness = HarnessDriver::with_alloc(alloc);
 
     let slab_rec = RecordingDriver::new(&harness, &harness.alloc);
     let arena_rec = RecordingDriver::new(&harness, &harness.alloc);
@@ -105,7 +105,7 @@ fn combo_buddy_small_diverges_per_site() {
     ]);
     let alloc = Lohalloc::new();
     assert!(alloc.load(&model), "combo model load failed");
-    let harness = HarnessDriver { alloc };
+    let harness = HarnessDriver::with_alloc(alloc);
 
     let buddy_rec = RecordingDriver::new(&harness, &harness.alloc);
     let small_rec = RecordingDriver::new(&harness, &harness.alloc);
@@ -131,7 +131,7 @@ fn adv_exhaust_forces_fallthrough_once_arena_full() {
     let model = forced_model_bytes(&[(hashes::W_ADV_EXHAUST, SMALL_FIXED_REQUEST, Backend::Arena)]);
     let alloc = Lohalloc::new();
     assert!(alloc.load(&model), "exhaust model load failed");
-    let harness = HarnessDriver { alloc };
+    let harness = HarnessDriver::with_alloc(alloc);
     let recording = RecordingDriver::new(&harness, &harness.alloc);
 
     // The arena CHAINS 1 MiB chunks up to a cap that J4-D scales to the host
@@ -167,7 +167,7 @@ fn adv_mixed_smoke_spans_multiple_backends() {
     let alloc = Lohalloc::new();
     alloc.freeze();
     assert!(alloc.is_inference());
-    let harness = HarnessDriver { alloc };
+    let harness = HarnessDriver::with_alloc(alloc);
     let recording = RecordingDriver::new(&harness, &harness.alloc);
 
     workloads::workload_adversarial_mixed(&recording, hashes::W_ADV_MIXED, 5_000);

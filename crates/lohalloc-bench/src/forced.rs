@@ -43,6 +43,12 @@ pub fn forced_model_bytes(triples: &[(u64, usize, Backend)]) -> Vec<u8> {
 /// Build a fresh `Lohalloc` instance pre-loaded with a forced-routing model.
 /// Panics if the model fails to load (a bug in this helper, not the system
 /// under test).
+///
+/// `#[inline(never)]`: `Lohalloc::new()` materializes the 32+32-element
+/// stripe arrays — outlined here so criterion bench closures that build a
+/// forced instance per batch get a `call`, not an inlined copy (part of the
+/// O3 bench-compile-explosion fix; see `workloads::harness_drop_outlined`).
+#[inline(never)]
 pub fn lohalloc_forced(triples: &[(u64, usize, Backend)]) -> Lohalloc {
     let alloc = Lohalloc::new();
     let bytes = forced_model_bytes(triples);

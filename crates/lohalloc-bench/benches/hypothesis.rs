@@ -21,8 +21,12 @@ fn bench_slab(c: &mut Criterion) {
     });
     group.bench_function("forced_best_slab", |b| {
         b.iter_batched(
-            || HarnessDriver {
-                alloc: lohalloc_forced_single(hashes::W_SLAB, SMALL_FIXED_REQUEST, Backend::Slab),
+            || {
+                HarnessDriver::with_alloc(lohalloc_forced_single(
+                    hashes::W_SLAB,
+                    SMALL_FIXED_REQUEST,
+                    Backend::Slab,
+                ))
             },
             |h| workloads::workload_slab_churn(&h, hashes::W_SLAB, 2000),
             BatchSize::SmallInput,
@@ -30,8 +34,12 @@ fn bench_slab(c: &mut Criterion) {
     });
     group.bench_function("forced_worst_system", |b| {
         b.iter_batched(
-            || HarnessDriver {
-                alloc: lohalloc_forced_single(hashes::W_SLAB, SMALL_FIXED_REQUEST, Backend::System),
+            || {
+                HarnessDriver::with_alloc(lohalloc_forced_single(
+                    hashes::W_SLAB,
+                    SMALL_FIXED_REQUEST,
+                    Backend::System,
+                ))
             },
             |h| workloads::workload_slab_churn(&h, hashes::W_SLAB, 2000),
             BatchSize::SmallInput,
@@ -51,8 +59,12 @@ fn bench_arena(c: &mut Criterion) {
     });
     group.bench_function("forced_best_arena", |b| {
         b.iter_batched(
-            || HarnessDriver {
-                alloc: lohalloc_forced_single(hashes::W_ARENA, SMALL_FIXED_REQUEST, Backend::Arena),
+            || {
+                HarnessDriver::with_alloc(lohalloc_forced_single(
+                    hashes::W_ARENA,
+                    SMALL_FIXED_REQUEST,
+                    Backend::Arena,
+                ))
             },
             |h| workloads::workload_arena_bursts(&h, hashes::W_ARENA, 5, 300),
             BatchSize::SmallInput,
@@ -60,12 +72,12 @@ fn bench_arena(c: &mut Criterion) {
     });
     group.bench_function("forced_worst_system", |b| {
         b.iter_batched(
-            || HarnessDriver {
-                alloc: lohalloc_forced_single(
+            || {
+                HarnessDriver::with_alloc(lohalloc_forced_single(
                     hashes::W_ARENA,
                     SMALL_FIXED_REQUEST,
                     Backend::System,
-                ),
+                ))
             },
             |h| workloads::workload_arena_bursts(&h, hashes::W_ARENA, 5, 300),
             BatchSize::SmallInput,
@@ -85,8 +97,12 @@ fn bench_buddy(c: &mut Criterion) {
     });
     group.bench_function("forced_best_buddy", |b| {
         b.iter_batched(
-            || HarnessDriver {
-                alloc: lohalloc_forced_single(hashes::W_BUDDY, BUDDY_SIZES[0], Backend::Buddy),
+            || {
+                HarnessDriver::with_alloc(lohalloc_forced_single(
+                    hashes::W_BUDDY,
+                    BUDDY_SIZES[0],
+                    Backend::Buddy,
+                ))
             },
             |h| workloads::workload_buddy_interleaved(&h, hashes::W_BUDDY, 200),
             BatchSize::SmallInput,
@@ -94,8 +110,12 @@ fn bench_buddy(c: &mut Criterion) {
     });
     group.bench_function("forced_worst_system", |b| {
         b.iter_batched(
-            || HarnessDriver {
-                alloc: lohalloc_forced_single(hashes::W_BUDDY, BUDDY_SIZES[0], Backend::System),
+            || {
+                HarnessDriver::with_alloc(lohalloc_forced_single(
+                    hashes::W_BUDDY,
+                    BUDDY_SIZES[0],
+                    Backend::System,
+                ))
             },
             |h| workloads::workload_buddy_interleaved(&h, hashes::W_BUDDY, 200),
             BatchSize::SmallInput,

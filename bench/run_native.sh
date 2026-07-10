@@ -11,10 +11,11 @@
 set -euo pipefail
 
 CACHEGRIND=0
-if [ "${1:-}" = "--cachegrind" ]; then
-    CACHEGRIND=1
-    shift
-fi
+PERFMODE=0
+case "${1:-}" in
+    --cachegrind) CACHEGRIND=1; shift ;;
+    --perf)       PERFMODE=1; shift ;;
+esac
 
 if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
     echo "requires bash 4+ (associative arrays) — macOS ships 3.2 by default;" >&2
@@ -48,6 +49,13 @@ if [ "$CACHEGRIND" = 1 ]; then
     if ! command -v valgrind >/dev/null 2>&1; then
         echo "valgrind not found — cachegrind mode is Linux-only (see docker/Dockerfile.bench)." >&2
         echo "valgrind does not support modern macOS at all, so this mode cannot run locally there." >&2
+        exit 1
+    fi
+elif [ "$PERFMODE" = 1 ]; then
+    if ! command -v perf >/dev/null 2>&1; then
+        echo "perf not found — --perf mode is Linux-only (needs linux-tools + PMU access)." >&2
+        echo "Run 'bash bench/probe_perf.sh' on the target host first to confirm the PMU" >&2
+        echo "exposes the cache/coherence events (else use a .metal instance)." >&2
         exit 1
     fi
 elif ! command -v hyperfine >/dev/null 2>&1; then
@@ -125,6 +133,14 @@ for n in $MT_THREADS; do
         MT_WORKLOADS+=("mt-${kind}-t${n}")
     done
 done
+
+# perf mode targets the MT rows only — real-hardware PMU beats cachegrind's
+# single-thread sim exactly where cross-core coherence / false sharing lives;
+# the single-thread rows stay on cachegrind. Default WORKLOADS to the MT set
+# (feeds the existing WORKLOADS override below) unless the caller narrowed it.
+if [ "$PERFMODE" = 1 ] && [ -z "${WORKLOADS:-}" ]; then
+    WORKLOADS="${MT_WORKLOADS[*]}"
+fi
 
 C_WORKLOADS=(slab arena buddy system adv-mixed "${MT_WORKLOADS[@]}")
 CPP_WORKLOADS=(slab arena buddy system adv-mixed cpp-vector cpp-string "${MT_WORKLOADS[@]}")
@@ -301,9 +317,82 @@ cachegrind_pass() {
 EOF
 }
 
+# Runs `binary` under `perf stat` reading REAL hardware PMU counters (vs
+# cachegrind's software simulation). Writes a `perf-`-prefixed JSON with
+# `"source":"pmu"` — the field run_cachegrind's `"source":"sim"` was always
+# paired against. Same ops=1 `-cal` calibration companion as cachegrind so the
+# aggregator can subtract each mode's fixed startup cost before dividing.
+run_perf() {
+    local lang="$1" binary="$2" workload="$3" allocator="$4" preload="$5" mode="$6" extra_env="$7"
+    perf_pass "$@" "$OPS" ""
+    perf_pass "$@" 1 "-cal"
+}
+
+perf_pass() {
+    local lang="$1" binary="$2" workload="$3" allocator="$4" preload="$5" mode="$6" extra_env="$7" ops="$8" suffix="$9"
+    local out="$RAW_DIR/perf-${lang}-${allocator}-${workload}-${mode}${suffix}.json"
+    echo "==> [perf] $lang/$allocator/$workload ($mode${suffix}, ops=$ops)"
+
+    local pin
+    pin="$(taskset_prefix_for "$workload")"
+
+    # perf stat counts the whole target process INCLUDING every worker thread
+    # it spawns — exactly the MT total we want. -x, => machine-readable CSV
+    # (value,unit,event,run-time,pct,...); an unsupported/unpermitted event
+    # prints "<not supported>"/"<not counted>" in the value field, normalized
+    # to 0 below. The event set is the arch-portable generic-name set that
+    # bench/probe_perf.sh validates.
+    local events="cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses"
+    local raw
+    raw="$(env $extra_env "$PRELOAD_VAR"="$preload" ${pin}perf stat -x, -e "$events" \
+        -- "$binary" "$workload" "$ops" 2>&1 >/dev/null || true)"
+
+    # Pull one event's integer count from the CSV (field 3 == event name;
+    # field 1 == value). Non-numeric ("<not supported>", "<not counted>",
+    # empty) -> 0 so the row still parses and the miss is visible as a zero.
+    pev() {
+        local v
+        v="$(printf '%s\n' "$raw" | awk -F, -v e="$1" '$3==e {print $1; exit}' | tr -d '[:space:]')"
+        case "$v" in
+        '' | *[!0-9]*) echo 0 ;;
+        *) echo "$v" ;;
+        esac
+    }
+
+    local cache_references cache_misses l1d_loads l1d_load_misses llc_loads llc_load_misses
+    cache_references="$(pev cache-references)"
+    cache_misses="$(pev cache-misses)"
+    l1d_loads="$(pev L1-dcache-loads)"
+    l1d_load_misses="$(pev L1-dcache-load-misses)"
+    llc_loads="$(pev LLC-loads)"
+    llc_load_misses="$(pev LLC-load-misses)"
+
+    local calibration=false
+    [ -n "$suffix" ] && calibration=true
+    cat >"$out" <<EOF
+{
+  "lang": "$lang",
+  "allocator": "$allocator",
+  "workload": "$workload",
+  "mode": "$mode",
+  "ops": $ops,
+  "calibration": $calibration,
+  "cache_references": $cache_references,
+  "cache_misses": $cache_misses,
+  "l1d_loads": $l1d_loads,
+  "l1d_load_misses": $l1d_load_misses,
+  "llc_loads": $llc_loads,
+  "llc_load_misses": $llc_load_misses,
+  "source": "pmu"
+}
+EOF
+}
+
 run_one() {
     if [ "$CACHEGRIND" = 1 ]; then
         run_cachegrind "$@"
+    elif [ "$PERFMODE" = 1 ]; then
+        run_perf "$@"
     else
         run_timing "$@"
     fi

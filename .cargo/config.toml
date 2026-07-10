@@ -8,7 +8,36 @@
 [build]
 rustflags = ["-C", "force-frame-pointers=yes"]
 
+# ---------------------------------------------------------------------------
+# [profile.bench] — the criterion micro-benches ONLY. These are INFORMATIONAL
+# (criterion HTML diffs); they do NOT feed the certified regression gate. The
+# gated native rows build under [profile.release] (untouched below) via
+# `bench-rust-bins --release`, so nothing here affects gate numbers or the
+# shipped allocator.
+#
+# History (2026-07-10): after commit 28e0c92 widened the stripe arrays to
+# [Mutex<{Slab,Buddy}>; MAX_STRIPES=32], compiling the benches at any
+# opt-level > 0 exploded (hypothesis: ~20 min + OOM on Graviton; >4 min at O2
+# locally). Root cause, pinned by sampling the stuck rustc: 100% in LLVM's
+# `InstCombinerImpl::visitAllocSite`, which is superlinear in an `alloca`'s
+# USE count. HarnessDriver held a `Lohalloc` BY VALUE, so the bench put a
+# tens-of-KB struct on the stack (32+32 Mutex arrays) with thousands of uses;
+# 8->32 quadrupled it past the tipping point. FIXED in lohalloc-bench by
+# Box-ing that field (`HarnessDriver { alloc: Box<Lohalloc> }`) — the optimizer
+# then only ever sees an 8-byte pointer, exactly like production where Lohalloc
+# lives in a `static`, never on the stack. hypothesis O3 compile: 20 min -> ~2s.
+# lohalloc-alloc itself is UNCHANGED. If bench compiles ever explode again,
+# sample the stuck rustc (`sample <pid>`) or `cargo llvm-lines`, and get big
+# by-value structs off the stack — do NOT lower opt-level here.
 [profile.bench]
 opt-level = 3
-debug = true   # Preserves debug symbols for accurate PC hashing
+# lto=false + codegen-units=16 (vs release's fat/1): bench-only build-time
+# trim. The measured workload loops live in one crate and inline fully
+# without LTO; #[inline(never)] outlining is honored by LTO anyway.
+lto = false
+codegen-units = 16
+# debug=1 (line tables) not 2: symbolizable backtraces at a fraction of the
+# DWARF cost. PC hashing needs frame pointers (force-frame-pointers, above) +
+# the runtime module table, never DWARF — production hashes fine at debug=false.
+debug = 1
 strip = "none"

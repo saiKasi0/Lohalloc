@@ -76,13 +76,32 @@ pub trait AllocDriver {
 /// (`crate::forced`) assertable: the hash for a given workload/site is
 /// always the same value regardless of inlining or call depth.
 pub struct HarnessDriver {
-    pub alloc: Lohalloc,
+    /// **Boxed on purpose** — this is the fix for the criterion-bench O3
+    /// compile explosion. `Lohalloc` is a large by-value struct (`MAX_STRIPES
+    /// = 32` × two `Mutex<{Slab,Buddy}>` arrays, tens of KB). Held inline it
+    /// becomes a giant stack `alloca` with thousands of uses, and LLVM's
+    /// `InstCombine` `visitAllocSite` pass is superlinear in an alloca's use
+    /// count — after 8→32 that made a single bench crate take 20+ min / OOM
+    /// to compile at opt-level>0 (confirmed by sampling rustc: 100% in
+    /// `InstCombinerImpl::visitAllocSite`). Behind a `Box` the optimizer only
+    /// ever sees an 8-byte pointer — exactly like production, where `Lohalloc`
+    /// lives in a `static`, never on the stack. `Box` derefs transparently, so
+    /// `driver.alloc.freeze()` etc. compile unchanged; the one-time heap alloc
+    /// happens in untimed setup.
+    pub alloc: Box<Lohalloc>,
 }
 
 impl HarnessDriver {
     pub fn new() -> Self {
+        Self::with_alloc(Lohalloc::new())
+    }
+
+    /// Wraps a pre-configured (e.g. forced-model) instance on the heap. Every
+    /// `HarnessDriver { alloc: ... }` struct literal became this call when the
+    /// field became boxed.
+    pub fn with_alloc(alloc: Lohalloc) -> Self {
         Self {
-            alloc: Lohalloc::new(),
+            alloc: Box::new(alloc),
         }
     }
 }

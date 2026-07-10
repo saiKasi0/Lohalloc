@@ -36,7 +36,7 @@ endif
 .PHONY: help all shim example-sink demo-sink binaries \
         server server-debug gui dev test e2e lint fmt clean \
         bench-all bench-all-host bench-mac bench-image bench-latency bench bench-tune bench-tune-native graphs \
-        bench-native bench-cache bench-native-host bench-cache-host bench-rust-bins bench-report
+        bench-native bench-cache bench-native-host bench-cache-host bench-perf bench-rust-bins bench-report
 
 help:
 	@echo "Lohalloc — available targets:"
@@ -61,6 +61,7 @@ help:
 	@echo "  make bench          — full Rust criterion suite + latency profiles + report (Phase 6)"
 	@echo "  make bench-native   — native C/C++/Rust cross-allocator timing (Docker, Linux LD_PRELOAD)"
 	@echo "  make bench-cache    — native cachegrind cache-miss pass (Docker)"
+	@echo "  make bench-perf     — real-PMU MT diagnostics via perf (host-only; probe first: bash bench/probe_perf.sh)"
 	@echo "  make bench-report   — aggregate results/<timestamp>/raw into report + graphs (use RUN_DIR=...)"
 	@echo "  make graphs RUN_DIR=results/<ts>  — re-render graphs for an existing run"
 	@echo "  make bench-tune     — Step 8 tune-config ablation sweep (GRID=, TUNE_WORKLOADS=, TUNE_OUT=)"
@@ -304,6 +305,18 @@ bench-cache-host: bench-rust-bins
 	make -C bench/native
 	@mkdir -p $(RUN_DIR)/raw
 	RAW_DIR="$(CURDIR)/$(RUN_DIR)/raw" bash bench/run_native.sh --cachegrind
+
+# Real-PMU MT diagnostics (perf) for the MT rows only — the only view that
+# sees cross-core coherence / false sharing (cachegrind is a single-thread
+# sim). Host-only: perf reads the host PMU, so Docker-on-Mac can't run it.
+# Probe the box first — `bash bench/probe_perf.sh` — needs perf_event_paranoid
+# <=1 and a PMU that exposes the LLC events (a .metal instance if virtualized).
+# Informational: perf counts are run-to-run noisy and never gate.
+bench-perf: bench-rust-bins
+	cargo build -p lohalloc-cabi --release
+	make -C bench/native
+	@mkdir -p $(RUN_DIR)/raw
+	RAW_DIR="$(CURDIR)/$(RUN_DIR)/raw" bash bench/run_native.sh --perf
 
 # Aggregate $(RUN_DIR)/raw into $(RUN_DIR)/bench-report.{json,md} and render
 # graphs into $(RUN_DIR)/graphs. No staging, no move — reads and writes the
