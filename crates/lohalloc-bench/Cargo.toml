@@ -52,6 +52,13 @@ harness = false
 name = "comparison"
 harness = false
 
+# Step-0 oracle-gap eval: measures the headroom a context-aware Decision
+# Engine could capture on workloads whose per-site optimum changes at
+# runtime. See the bench's module doc for the decision rule.
+[[bench]]
+name = "context_gap"
+harness = false
+
 [[bin]]
 name = "latency_profile"
 path = "src/bin/latency_profile.rs"

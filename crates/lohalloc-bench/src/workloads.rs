@@ -34,6 +34,16 @@ pub const BUDDY_SIZES: [usize; 4] = [32 * 1024, 64 * 1024, 128 * 1024, 256 * 102
 /// Sizes above `BUDDY_MAX`; only the System backend can serve these.
 pub const SYSTEM_SIZES: [usize; 2] = [2 * 1024 * 1024, 8 * 1024 * 1024];
 
+/// Request size landing exactly on the 8 KiB Slab class — used by the
+/// Step-0 context workloads. Deliberately mid-slab rather than 256 B: the
+/// bump arena's budget (32 MiB floor, CPU-scaled; see
+/// `arena::scaled_max_chunks`) must *bind within bench-scale op counts* for
+/// a reset-free regime to have a real arena-vs-slab tradeoff — at 8 KiB the
+/// arena exhausts after ~4-8k routed allocations, at 256 B only after
+/// ~250k (which made arena trivially dominate every regime in the first
+/// version of this eval).
+pub const MID_SLAB_REQUEST: usize = 8192 - HEADER_PAD; // 8144
+
 /// Deterministic synthetic hashes identifying each workload's call site.
 /// Used with [`HarnessDriver`] (via `alloc_with_hash`) so routing outcomes
 /// are assertable regardless of inlining or call depth — see
@@ -49,6 +59,19 @@ pub mod hashes {
     pub const W_COMBO_BA_SMALL: u64 = 0x5AA5_0008;
     pub const W_ADV_MIXED: u64 = 0x5AA5_0009;
     pub const W_ADV_EXHAUST: u64 = 0x5AA5_000A;
+    // Step-0 oracle-gap workloads (see `benches/context_gap.rs`): each has an
+    // `_A`/`_B` pair. The *real*/static variants pass the same hash for both
+    // params (one logical call site — what production topology hashing would
+    // see); the *oracle* variant passes both, giving each behavioral regime
+    // its own identity so a static frozen model can express the per-regime
+    // optimum. The timing delta between those two runs is exactly the
+    // headroom a context-aware Decision Engine could capture.
+    pub const W_PHASE_A: u64 = 0x5AA5_000B;
+    pub const W_PHASE_B: u64 = 0x5AA5_000C;
+    pub const W_FILL_A: u64 = 0x5AA5_000D;
+    pub const W_FILL_B: u64 = 0x5AA5_000E;
+    pub const W_DATA_A: u64 = 0x5AA5_000F;
+    pub const W_DATA_B: u64 = 0x5AA5_0010;
 }
 
 /// A minimal seam so the same workload generator can drive either a private
@@ -252,6 +275,131 @@ pub fn workload_adversarial_mixed<D: AllocDriver>(driver: &D, hash: u64, ops: us
     }
     for (p, l) in live {
         unsafe { driver.dealloc(p, l, hash) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Step-0 adversarial-context workloads (oracle-gap eval)
+//
+// Unlike every workload above, the per-site optimum in these CHANGES AT
+// RUNTIME — by phase, by allocator state, or by data — which a static
+// `(site, size_class)` frozen verdict cannot express. Each takes TWO hash
+// params; see the `hashes` module doc for the real-vs-oracle convention.
+// All three use ONE request size ([`MID_SLAB_REQUEST`], a single slab
+// class), so `size_class` cannot separate the regimes either — only context
+// could. Deliberately **reset-free** (no `phase_end`) except where noted:
+// the production LD_PRELOAD/global-allocator deployments the gate measures
+// never call `reset_arena`, so the bump arena is a finite budget and
+// spending it well IS the contextual decision (the J4/J5 story).
+// ---------------------------------------------------------------------------
+
+/// W-PHASE: alternating temporal regimes at one call site, reset-free.
+/// Even phases are tight alloc/free churn; odd phases allocate a burst,
+/// hold it, and drop it en masse. `ops/8` per phase. A static verdict
+/// either burns the whole arena budget on churn (exhausts mid-run → storm)
+/// or forfeits bump speed everywhere; a per-regime split can spend the
+/// budget on one regime only.
+#[inline(never)]
+pub fn workload_phase_lifetime<D: AllocDriver>(driver: &D, hash_a: u64, hash_b: u64, ops: usize) {
+    let layout = Layout::from_size_align(MID_SLAB_REQUEST, 16).unwrap();
+    let phase_len = (ops / 8).max(1);
+    let mut done = 0;
+    let mut phase = 0usize;
+    while done < ops {
+        let n = phase_len.min(ops - done);
+        if phase % 2 == 0 {
+            for _ in 0..n {
+                let p = unsafe { driver.alloc(layout, hash_a) };
+                unsafe { driver.dealloc(p, layout, hash_a) };
+            }
+        } else {
+            let mut held = Vec::with_capacity(n);
+            for _ in 0..n {
+                held.push(unsafe { driver.alloc(layout, hash_b) });
+            }
+            for p in held {
+                unsafe { driver.dealloc(p, layout, hash_b) };
+            }
+        }
+        done += n;
+        phase += 1;
+    }
+}
+
+/// W-FILL: one regime *shift* plus the arena-exhaustion state trap (the J4
+/// saga as a workload). First half: arena-friendly bursts WITH cluster
+/// resets (`phase_end` — the one place resets are modeled, an app that
+/// resets during a setup phase). Second half: reset-free steady churn — a
+/// bump arena's no-op dealloc means churn *fills it monotonically* until
+/// exhaustion, so a static Arena verdict pays a permanent fallthrough storm
+/// there while a static Slab verdict forfeits the burst-half bump speed.
+/// The optimum flips with allocator state, invisible to a stateless bandit.
+#[inline(never)]
+pub fn workload_arena_fill_churn<D: AllocDriver>(driver: &D, hash_a: u64, hash_b: u64, ops: usize) {
+    let layout = Layout::from_size_align(MID_SLAB_REQUEST, 16).unwrap();
+    let half = ops / 2;
+    let bursts = 8;
+    let burst = (half / bursts).max(1);
+    for _ in 0..bursts {
+        let mut ptrs = Vec::with_capacity(burst);
+        for _ in 0..burst {
+            ptrs.push(unsafe { driver.alloc(layout, hash_a) });
+        }
+        for p in ptrs {
+            unsafe { driver.dealloc(p, layout, hash_a) };
+        }
+        driver.phase_end();
+    }
+    let mut window: VecDeque<*mut u8> = VecDeque::with_capacity(64);
+    for _ in 0..(ops - half) {
+        let p = unsafe { driver.alloc(layout, hash_b) };
+        window.push_back(p);
+        if window.len() > 64 {
+            let old = window.pop_front().unwrap();
+            unsafe { driver.dealloc(old, layout, hash_b) };
+        }
+    }
+    for p in window {
+        unsafe { driver.dealloc(p, layout, hash_b) };
+    }
+}
+
+/// W-DATA: per-op data-dependent lifetime at one call site, reset-free —
+/// the finest context granularity (the allocation-history-register case).
+/// A deterministic xorshift "data stream" decides each op: ~70% short-lived
+/// (alloc+free immediately), ~30% held and released en masse every 4096
+/// ops. Static routing sees one blended optimum; a per-stream split routes
+/// each *individual op* by the same data bit the workload itself branches
+/// on.
+#[inline(never)]
+pub fn workload_data_dependent_lifetime<D: AllocDriver>(
+    driver: &D,
+    hash_a: u64,
+    hash_b: u64,
+    ops: usize,
+) {
+    let layout = Layout::from_size_align(MID_SLAB_REQUEST, 16).unwrap();
+    let mut state: u64 = 0xA5A5_5A5A_DEAD_BEEF;
+    let mut held: Vec<*mut u8> = Vec::with_capacity(4096);
+    for i in 0..ops {
+        // xorshift64
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        if state % 10 < 7 {
+            let p = unsafe { driver.alloc(layout, hash_a) };
+            unsafe { driver.dealloc(p, layout, hash_a) };
+        } else {
+            held.push(unsafe { driver.alloc(layout, hash_b) });
+        }
+        if i % 4096 == 4095 {
+            for p in held.drain(..) {
+                unsafe { driver.dealloc(p, layout, hash_b) };
+            }
+        }
+    }
+    for p in held {
+        unsafe { driver.dealloc(p, layout, hash_b) };
     }
 }
 
@@ -555,5 +703,47 @@ impl<'a, D: AllocDriver> AllocDriver for TimingDriver<'a, D> {
 
     fn phase_end(&self) {
         self.inner.phase_end();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::forced::lohalloc_forced;
+
+    /// Completion smoke: every Step-0 workload runs to completion against a
+    /// fresh training-mode instance without crashing or leaking (all pointers
+    /// are freed by construction; a buddy/slab invariant violation would
+    /// abort or hang here).
+    #[test]
+    fn context_workloads_complete() {
+        let h = HarnessDriver::new();
+        workload_phase_lifetime(&h, hashes::W_PHASE_A, hashes::W_PHASE_A, 2000);
+        workload_arena_fill_churn(&h, hashes::W_FILL_A, hashes::W_FILL_A, 2000);
+        workload_data_dependent_lifetime(&h, hashes::W_DATA_A, hashes::W_DATA_A, 2000);
+    }
+
+    /// The oracle convention works end-to-end: a forced model with distinct
+    /// per-regime hashes routes each regime to its own backend — this is
+    /// what `benches/context_gap.rs`'s `oracle_per_phase` rows rely on.
+    /// (Everything goes through the Box'd `HarnessDriver` — a bare by-value
+    /// `Lohalloc` overflows the 2 MB test-thread stack; see the field doc.)
+    #[test]
+    fn oracle_per_phase_hashes_route_independently() {
+        let h = HarnessDriver::with_alloc(lohalloc_forced(&[
+            (hashes::W_PHASE_A, MID_SLAB_REQUEST, Backend::Slab),
+            (hashes::W_PHASE_B, MID_SLAB_REQUEST, Backend::Arena),
+        ]));
+        let layout = Layout::from_size_align(MID_SLAB_REQUEST, 16).unwrap();
+        let pa = unsafe { h.alloc.alloc_with_hash(layout, hashes::W_PHASE_A) };
+        let pb = unsafe { h.alloc.alloc_with_hash(layout, hashes::W_PHASE_B) };
+        assert_eq!(unsafe { h.alloc.backend_for_ptr(pa) }, Some(Backend::Slab));
+        assert_eq!(unsafe { h.alloc.backend_for_ptr(pb) }, Some(Backend::Arena));
+        unsafe {
+            h.alloc.dealloc_with_hash(pa, layout);
+            h.alloc.dealloc_with_hash(pb, layout);
+        }
+        // And the full oracle workload completes on that model.
+        workload_phase_lifetime(&h, hashes::W_PHASE_A, hashes::W_PHASE_B, 2000);
     }
 }
