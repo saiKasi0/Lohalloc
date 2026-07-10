@@ -55,6 +55,7 @@ pub mod tune;
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use crossbeam_utils::CachePadded;
 use lohalloc_core::{align_up, BUDDY_MAX, MIN_ALIGN, SLAB_MAX};
 use std::sync::Mutex;
 
@@ -237,8 +238,9 @@ pub struct Lohalloc {
     /// blocks migrate between stripes' lists harmlessly. No registry
     /// widening or header stripe field is needed (deviation from the
     /// original C4 sketch, justified there).
-    slab: [Mutex<slab::Slab>; BACKEND_STRIPES],
-    /// Central Buddy backend, sharded into `BACKEND_STRIPES` independent
+    slab: [Mutex<slab::Slab>; MAX_STRIPES],
+    /// Central Buddy backend, sharded into `MAX_STRIPES` independent (of which
+    /// `stripe_mask() + 1` are active)
     /// stripes (Ladder 4 C3). Allocations pick a stripe by the calling
     /// thread (`thread_stripe()` — magazine misses from different threads
     /// land on different stripes); frees resolve the *exact* owning stripe
@@ -246,7 +248,7 @@ pub struct Lohalloc {
     /// `Buddy` whose bitmap tracks its region — see `buddy.rs`'s "Stripe
     /// safety" module-doc section for why coalescing can never cross
     /// stripes).
-    buddy: [Mutex<buddy::Buddy>; BACKEND_STRIPES],
+    buddy: [Mutex<buddy::Buddy>; MAX_STRIPES],
     /// Region base → owning buddy stripe (exact free-side routing). Fixed
     /// atomics; inserted from inside `Buddy::refill`'s `register` callback
     /// *while the stripe lock is held* — safe only because insertion can
@@ -263,7 +265,17 @@ pub struct Lohalloc {
     /// training, fallthrough=200k/350k allocs — training self-corrects via
     /// the bandit; frozen routing cannot). One relaxed load, paid only on
     /// arena-recommended allocations.
-    arena_exhausted: AtomicBool,
+    ///
+    /// `CachePadded` (here and on every other hot atomic below — J5-B1):
+    /// J4-D certified that ONE shared RMW atomic on the hot path costs 3.2×
+    /// at t8 via cache-line ping-pong, and the field survey found zero
+    /// padding anywhere — read-hot atomics (loaded on every alloc/free by
+    /// every thread) were sharing 64-byte lines with RMW'd neighbors, so a
+    /// single writer invalidated the line for all readers. Each padded field
+    /// gets its own 128-byte line (aarch64 prefetch pair); read-hot fields
+    /// stay in Shared state across cores regardless of what any RMW field
+    /// does. Cost: ~128 B per field on a single static — irrelevant.
+    arena_exhausted: CachePadded<AtomicBool>,
     /// The Decision Engine (Phase 3). Routes allocations via MAB in Training
     /// mode and via a frozen `PerfectHashTable` in Inference mode.
     state: Mutex<state::AllocatorState>,
@@ -272,7 +284,7 @@ pub struct Lohalloc {
     /// state lock on the Inference hot path. Flipped exactly once inside
     /// `freeze()`/`load()` (which already touch the state lock) — a single
     /// relaxed atomic load costs far less than a `Mutex` lock/unlock pair.
-    frozen: AtomicBool,
+    frozen: CachePadded<AtomicBool>,
     /// Retention cache for large System-backend mappings (see
     /// `system::SystemCache`): freed 1 MiB+ mappings are kept populated and
     /// reused instead of munmap'd, matching (and beating) glibc's
@@ -291,17 +303,22 @@ pub struct Lohalloc {
     system_cache: core::cell::UnsafeCell<system::SystemCache>,
     /// CAS guard for `system_cache`: allocation-free, non-blocking. On
     /// contention or re-entry the caller simply skips the cache (correct:
-    /// it's a best-effort retention layer over plain mmap/munmap).
-    system_cache_lock: AtomicBool,
+    /// it's a best-effort retention layer over plain mmap/munmap). Padded:
+    /// this is a genuine RMW (CAS) — cold (System path only), but it must
+    /// never share a line with a read-hot field.
+    system_cache_lock: CachePadded<AtomicBool>,
     /// Count of System allocations served from the retention cache
-    /// (testability/introspection).
-    system_cache_hits: AtomicU64,
+    /// (testability/introspection). RMW on System cache hits — padded off
+    /// the read-hot fields for the same reason as `system_cache_lock`.
+    system_cache_hits: CachePadded<AtomicU64>,
     /// Unique id for the per-thread magazine layer (see `magazine.rs`'s
     /// ownership doc): 0 = unassigned, lazily claimed from a process-wide
     /// monotonic counter on first slab use. Ids are never reused, so a
     /// thread's magazine can always tell "my instance's blocks" from a
     /// previous instance's (whose regions may already be unmapped).
-    magazine_id: AtomicU64,
+    /// Read on every magazine alloc/free (`magazine_owner`), written once —
+    /// padded so no RMW neighbor ever invalidates it.
+    magazine_id: CachePadded<AtomicU64>,
     /// Lock-free copy of the frozen decision plane (`FrozenRouting`: main
     /// 3-frame table + Ladder-6 distilled 1-frame table, published together
     /// as ONE pointer so the pair can never tear), published by
@@ -314,8 +331,12 @@ pub struct Lohalloc {
     /// reader may still hold `&*table`; a full RCU scheme is overkill for
     /// a GUI dev button, and leakage is bounded by freeze/reset cycles).
     /// The pointer value doubles as the pin cache's validity tag — see
-    /// `PIN_CACHE`.
-    frozen_table: AtomicPtr<perfect_hash::FrozenRouting>,
+    /// `PIN_CACHE`. The single hottest read atomic in the allocator (loaded
+    /// on every inference alloc by every thread) — the field survey found it
+    /// sharing a line with the `system_cache_lock`/`system_cache_hits`/
+    /// `magazine_id` RMWs, so one System-path alloc invalidated the line for
+    /// every concurrent inference reader. Padded onto its own line.
+    frozen_table: CachePadded<AtomicPtr<perfect_hash::FrozenRouting>>,
     /// One-way latch: `true` only for an instance that was booted straight
     /// into Inference via `load()` (never for one that trained live and
     /// later called `freeze()`). Gates the header-free Slab fast path —
@@ -327,7 +348,7 @@ pub struct Lohalloc {
     /// writing headers unconditionally (unchanged, zero risk to the
     /// existing GUI/training reward-attribution path, which needs the
     /// header's `hash`/`size_class_hint` on dealloc).
-    slab_headerless: AtomicBool,
+    slab_headerless: CachePadded<AtomicBool>,
     /// Maps a header-free Slab segment's base address to its class, so
     /// `dealloc`/cabi entry points can recover a headerless block's class
     /// from its address alone. See `registry::SegmentRegistry`.
@@ -340,7 +361,7 @@ pub struct Lohalloc {
     /// `(stripe, order)` from `buddy_region_stripes` + the per-region
     /// order map. Training instances never set this (reward attribution
     /// needs the header's `hash`/`size_class_hint`).
-    buddy_headerless: AtomicBool,
+    buddy_headerless: CachePadded<AtomicBool>,
     /// Ladder 5: one-way latch mirroring `slab_headerless`/
     /// `buddy_headerless`, for the Arena backend. Set only by `load()` on
     /// an instance whose arena was never touched. Phase 4's cachegrind
@@ -354,18 +375,21 @@ pub struct Lohalloc {
     /// they have no recoverable size, so `try_usable_size` conservatively
     /// reports 0 and the realloc path forbids in-place reuse (see
     /// `usable_size_for_realloc`).
-    arena_headerless: AtomicBool,
+    arena_headerless: CachePadded<AtomicBool>,
     /// Chunk-membership set for headerless arena frees. See
     /// `registry::ArenaChunkRegistry`.
     arena_chunks: registry::ArenaChunkRegistry,
     /// Ladder 5 span carve: bumped by `reset_arena()` so every thread's
     /// TLS `ARENA_SPAN` (a window into a chunk the reset just rewound) is
-    /// discarded on its next use instead of served.
-    arena_epoch: AtomicU64,
+    /// discarded on its next use instead of served. Read on every arena
+    /// span check; padded so nothing RMW-hot can ever share its line (J4-D
+    /// briefly put a per-op-RMW counter adjacent to it — the exact
+    /// false-sharing shape that cost 3.2× at t8 before J5-A stripped it).
+    arena_epoch: CachePadded<AtomicU64>,
     /// Published descriptor of the arena chunk currently being bumped, for
     /// `arena_alloc_fast`'s lock-free path — null until the arena is first
     /// initialized. See `ArenaChunkDescriptor`'s doc.
-    arena_chunk: AtomicPtr<ArenaChunkDescriptor>,
+    arena_chunk: CachePadded<AtomicPtr<ArenaChunkDescriptor>>,
 }
 
 /// Published snapshot of the arena chunk currently being bumped — see
@@ -481,37 +505,75 @@ impl Default for Lohalloc {
     }
 }
 
-/// Number of central-`Buddy` stripes (Ladder 4 C3). Power of two so the
-/// stripe pick is a mask. 4 matches the approved plan: enough to take the
-/// mt-mixed t4/t8 rows off one lock, small enough that per-stripe region
-/// pools stay warm.
-pub(crate) const BACKEND_STRIPES: usize = 4;
+/// Ceiling on central-`Slab`/`Buddy` stripes (J5-B2). The stripe arrays are
+/// sized to this **compile-time constant** so `Lohalloc::new()` stays a
+/// `const fn` (the property that lets the allocator be installed as a plain
+/// `static` / `#[global_allocator]` with zero runtime init); how many of
+/// them are *active* is the runtime [`stripe_mask`], scaled once to the host
+/// core count. Stripes are metadata-only (no eager block memory), so the
+/// inactive tail costs a few hundred KB of `.bss` and nothing else.
+pub(crate) const MAX_STRIPES: usize = 32;
+
+/// Floor on the *active* stripe count. 8 matches the J4-B certified state
+/// (at 8 stripes the 8 threads of a t8 run land on stripes 0..7 exactly, so
+/// the striped Mutexes are 1:1 — J4-B measured 4 stripes at t8 as 2:1
+/// contention, rust/mt-mixed-t8 1.88×). Hosts with ≤8 cores therefore
+/// behave byte-identically to the certified J4-C configuration; only wider
+/// hosts (e.g. the 16-vCPU c9g gate box) grow past it.
+pub(crate) const MIN_STRIPES: usize = 8;
+
+/// The active-stripe mask (`active_count - 1`), latched on first use.
+/// 0 = unlatched (a mask can never legitimately be 0: the floor is 8).
+static STRIPE_MASK: AtomicUsize = AtomicUsize::new(0);
+
+/// Active stripe count as a mask, scaled to the host: `next_pow2(ncpus)`
+/// clamped to `[MIN_STRIPES, MAX_STRIPES]`, minus 1. Latched once — a racy
+/// double-init computes the identical value, so a plain relaxed
+/// load/store is enough (same pattern as `magazine_id`). Reads after the
+/// latch are a single shared (never-again-written) atomic load; the J4-B
+/// lesson that stripes must track the *actual* concurrency is what this
+/// generalizes: the old `BACKEND_STRIPES = 8` const was hardwired to the
+/// benched t8 and left a 16-vCPU host 2:1-contended at t16.
+#[inline]
+pub(crate) fn stripe_mask() -> usize {
+    let m = STRIPE_MASK.load(Ordering::Relaxed);
+    if m != 0 {
+        return m;
+    }
+    let ncpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(MIN_STRIPES);
+    let count = ncpus.next_power_of_two().clamp(MIN_STRIPES, MAX_STRIPES);
+    let mask = count - 1;
+    STRIPE_MASK.store(mask, Ordering::Relaxed);
+    mask
+}
 
 impl Lohalloc {
     pub const fn new() -> Self {
         Self {
-            slab: [const { Mutex::new(slab::Slab::new()) }; BACKEND_STRIPES],
-            buddy: [const { Mutex::new(buddy::Buddy::new()) }; BACKEND_STRIPES],
+            slab: [const { Mutex::new(slab::Slab::new()) }; MAX_STRIPES],
+            buddy: [const { Mutex::new(buddy::Buddy::new()) }; MAX_STRIPES],
             buddy_region_stripes: registry::RegionRegistry::new(),
             // Arena is lazily initialized on first use (requires mmap, which
             // is not const-evaluable).
             arena: Mutex::new(None),
-            arena_exhausted: AtomicBool::new(false),
+            arena_exhausted: CachePadded::new(AtomicBool::new(false)),
             // Decision Engine starts in Training mode.
             state: Mutex::new(state::AllocatorState::new_training_const()),
-            frozen: AtomicBool::new(false),
+            frozen: CachePadded::new(AtomicBool::new(false)),
             system_cache: core::cell::UnsafeCell::new(system::SystemCache::new()),
-            system_cache_lock: AtomicBool::new(false),
-            system_cache_hits: AtomicU64::new(0),
-            magazine_id: AtomicU64::new(0),
-            frozen_table: AtomicPtr::new(core::ptr::null_mut()),
-            slab_headerless: AtomicBool::new(false),
+            system_cache_lock: CachePadded::new(AtomicBool::new(false)),
+            system_cache_hits: CachePadded::new(AtomicU64::new(0)),
+            magazine_id: CachePadded::new(AtomicU64::new(0)),
+            frozen_table: CachePadded::new(AtomicPtr::new(core::ptr::null_mut())),
+            slab_headerless: CachePadded::new(AtomicBool::new(false)),
             segment_registry: registry::SegmentRegistry::new(),
-            buddy_headerless: AtomicBool::new(false),
-            arena_headerless: AtomicBool::new(false),
+            buddy_headerless: CachePadded::new(AtomicBool::new(false)),
+            arena_headerless: CachePadded::new(AtomicBool::new(false)),
             arena_chunks: registry::ArenaChunkRegistry::new(),
-            arena_epoch: AtomicU64::new(0),
-            arena_chunk: AtomicPtr::new(core::ptr::null_mut()),
+            arena_epoch: CachePadded::new(AtomicU64::new(0)),
+            arena_chunk: CachePadded::new(AtomicPtr::new(core::ptr::null_mut())),
         }
     }
 
@@ -606,7 +668,8 @@ thread_local! {
     static ALLOC_START_NS: Cell<u64> = const { Cell::new(0) };
     /// This thread's central-backend stripe (Ladder 4 C3/C4), assigned
     /// round-robin on first use so concurrent threads spread evenly across
-    /// the `BACKEND_STRIPES` stripes regardless of thread-id numbering.
+    /// the active stripes (`stripe_mask() + 1`, CPU-scaled — J5-B2)
+    /// regardless of thread-id numbering.
     /// `usize::MAX` = unassigned. Plain dtor-free `Cell`, same TLS
     /// discipline as the magazines. Process-wide (not per-instance):
     /// a stripe index is just a load-spreading hint on the alloc side —
@@ -786,7 +849,7 @@ const ARENA_SPAN_BYTES: usize = 4096;
 /// Round-robin source for `THREAD_STRIPE` assignments.
 static NEXT_STRIPE: AtomicU64 = AtomicU64::new(0);
 
-/// The calling thread's stripe index in `[0, BACKEND_STRIPES)`.
+/// The calling thread's stripe index in `[0, stripe_mask()]`.
 #[inline]
 fn thread_stripe() -> usize {
     THREAD_STRIPE.with(|c| {
@@ -794,7 +857,7 @@ fn thread_stripe() -> usize {
         if v != usize::MAX {
             return v;
         }
-        let v = (NEXT_STRIPE.fetch_add(1, Ordering::Relaxed) as usize) & (BACKEND_STRIPES - 1);
+        let v = (NEXT_STRIPE.fetch_add(1, Ordering::Relaxed) as usize) & stripe_mask();
         c.set(v);
         v
     })
@@ -1351,8 +1414,9 @@ impl Lohalloc {
                 return n;
             }
         }
-        for k in 1..BACKEND_STRIPES {
-            let s = (stripe + k) & (BACKEND_STRIPES - 1);
+        let mask = stripe_mask();
+        for k in 1..=mask {
+            let s = (stripe + k) & mask;
             if let Ok(mut slab) = self.slab[s].try_lock() {
                 let n = slab.alloc_batch_recycled(class, buf, headerless);
                 if n > 0 {
@@ -1471,6 +1535,13 @@ impl Lohalloc {
     /// (`reset_arena()` bumps the epoch so stale spans — windows into
     /// rewound chunks — are discarded, not served). Span tails stranded by
     /// a refill are ≤ the request size; a dead thread strands ≤ one span.
+    ///
+    /// (J5-A note: J4-D briefly added a per-alloc `arena_live` pin + Dekker
+    /// epoch-lock here so a drain-triggered reset could run concurrently.
+    /// It was TSAN-correct but certified throughput-negative — the shared
+    /// RMW cache line cost 3.2× at t8 — and was stripped; see COPILOT.md
+    /// "J4-D". Resets are once again GUI/replay-only, serialized behind the
+    /// arena Mutex, and the epoch check below handles them.)
     fn arena_alloc_fast(&self, size: usize, align: usize) -> Option<*mut u8> {
         let align = align.max(MIN_ALIGN);
         let owner = self.magazine_owner();
@@ -1581,7 +1652,7 @@ impl Lohalloc {
         let base = block as usize & !(buddy::REGION_BYTES - 1);
         self.buddy_region_stripes
             .lookup(base)
-            .map(|s| s as usize & (BACKEND_STRIPES - 1))
+            .map(|s| s as usize & (MAX_STRIPES - 1))
     }
 
     /// J1: raw, header-free Buddy block for `size` bytes (caller must have
@@ -1742,7 +1813,7 @@ impl Lohalloc {
             }
         }
         let mut grouped = [core::ptr::null_mut::<u8>(); 33];
-        for stripe in 0..BACKEND_STRIPES {
+        for stripe in 0..=stripe_mask() {
             let mut g = 0;
             for i in 0..total {
                 if stripes[i] == stripe {
@@ -2126,8 +2197,8 @@ impl Lohalloc {
     /// Reset the Bump Arena, reclaiming all arena allocations.
     ///
     /// This is the "reset-based reclaim" mechanism: all Arena-tagged pointers
-    /// are invalidated. The Decision Engine (Phase 3) will call this when a
-    /// topological cluster's lifetime ends.
+    /// are invalidated. The Decision Engine (Phase 3) and the GUI/replay
+    /// controls call this when a topological cluster's lifetime ends.
     pub fn reset_arena(&self) {
         if let Ok(mut arena_guard) = self.arena.lock() {
             if let Some(ref mut arena) = *arena_guard {
@@ -2207,9 +2278,19 @@ impl Lohalloc {
     ///
     /// Panics if already in Inference mode (double-freeze is a logic error).
     pub fn freeze(&self) {
+        // J4-C/J5-A: `arena_epoch` is bumped only by `reset_arena()`, so 0
+        // here means this instance never observed a reset during training —
+        // a reset-free deployment (LD_PRELOAD / global allocator) where a
+        // frozen Arena verdict on a *heavy* signature becomes a permanent
+        // fallthrough storm once the arena fills. `AllocatorState::freeze`
+        // applies the demotion volume-selectively (heavy demoted, light
+        // kept — J4-C demoted all and flattened the light-arena rows; J4-D
+        // kept all and the storm cost 3.98×; the volume split is the good
+        // half of both). See its doc.
+        let demote_arena = self.arena_epoch.load(Ordering::Relaxed) == 0;
         Self::with_realloc_guard(|| {
             if let Ok(mut state) = self.state.lock() {
-                state.freeze();
+                state.freeze(demote_arena);
                 self.publish_frozen_table(&state);
             }
         });
@@ -3581,14 +3662,27 @@ mod integration_tests {
         assert!(alloc.load(&table.serialize()));
         let layout = Layout::from_size_align(size, 16).unwrap();
 
-        // ~66 MiB of requests: ~32 MiB lands in the chained arena (cap),
-        // the rest must fall through to Slab — every single one succeeds.
+        // Alloc (holding every block, so nothing drains and the arena keeps
+        // growing) until the arena caps and a request falls through to Slab.
+        // J4-D scales the chunk cap to the host core count, so the exact cap
+        // is machine-dependent — but it never exceeds the 128 MiB ceiling
+        // (`MAX_CHUNKS_CAP`), which 4 KiB blocks reach within ~33k allocs on
+        // any host. Detect the fallthrough rather than assuming 32 MiB.
         let mut ptrs = Vec::new();
-        for i in 0..16_000 {
+        let mut fell_through = false;
+        for i in 0..40_000 {
             let p = unsafe { alloc.alloc_with_hash(layout, hash) };
             assert!(!p.is_null(), "alloc {i} must succeed");
             ptrs.push(p);
+            if unsafe { alloc.backend_for_ptr(p) } == Some(lohalloc_core::Backend::Slab) {
+                fell_through = true;
+                break;
+            }
         }
+        assert!(
+            fell_through,
+            "arena must chain to its cap and then fall through to Slab"
+        );
         assert_eq!(
             unsafe { alloc.backend_for_ptr(ptrs[0]) },
             Some(lohalloc_core::Backend::Arena),
@@ -3633,13 +3727,17 @@ mod integration_tests {
         assert!(alloc.load(&table.serialize()));
         let layout = Layout::from_size_align(size, 16).unwrap();
 
-        // ~64 MiB of requests against a 32 MiB cap: every alloc must still
-        // succeed (post-cap ones via the size-chain fallthrough).
+        // Alloc 64 KiB blocks (holding every one, so nothing drains) until the
+        // cap latches. J4-D scales the cap to the host core count, but it never
+        // exceeds the 128 MiB ceiling — reached within ~2k of these on any
+        // host; 5000 is a generous safety bound.
         let mut ptrs = Vec::new();
-        for i in 0..1000 {
+        let mut i = 0;
+        while !alloc.arena_exhausted.load(Ordering::Relaxed) && i < 5000 {
             let p = unsafe { alloc.alloc_with_hash(layout, hash) };
             assert!(!p.is_null(), "alloc {i} must succeed even after the cap");
             ptrs.push(p);
+            i += 1;
         }
         assert!(
             alloc.arena_exhausted.load(Ordering::Relaxed),
@@ -4116,6 +4214,25 @@ mod integration_tests {
     }
 
     #[test]
+    fn stripe_mask_is_pow2_count_within_bounds() {
+        // J5-B2: the active stripe count is a power of two (the stripe pick
+        // is a mask) scaled to the host core count, floored at MIN_STRIPES
+        // (preserves the certified ≤8-thread behavior byte-identically) and
+        // ceilinged at MAX_STRIPES (the const array size).
+        let mask = stripe_mask();
+        let count = mask + 1;
+        assert!(
+            count.is_power_of_two(),
+            "stripe count must be pow2: {count}"
+        );
+        assert!((MIN_STRIPES..=MAX_STRIPES).contains(&count));
+        // Latched: a second read returns the identical mask.
+        assert_eq!(stripe_mask(), mask);
+        // Thread stripes always land inside the active set.
+        assert!(thread_stripe() <= mask);
+    }
+
+    #[test]
     fn buddy_blocks_resolve_to_a_registered_stripe() {
         // C3: every buddy allocation's region must be registered in the
         // region → stripe registry before the block reaches the caller —
@@ -4132,7 +4249,7 @@ mod integration_tests {
                 .expect("buddy path must serve");
             let stripe = alloc.buddy_stripe_of(block);
             assert!(
-                matches!(stripe, Some(s) if s < BACKEND_STRIPES),
+                matches!(stripe, Some(s) if s <= stripe_mask()),
                 "buddy block ({size} B) must resolve to a registered stripe, got {stripe:?}"
             );
             // All allocations from one thread land on that thread's stripe.

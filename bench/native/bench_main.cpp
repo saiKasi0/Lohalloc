@@ -48,7 +48,7 @@ void cpp_string_build(size_t ops) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
-                "usage: %s <slab|arena|buddy|system|adv-mixed|mt-slab-tN|mt-mixed-tN|mt-xfree-tN"
+                "usage: %s <slab|arena|buddy|system|adv-mixed|mt-slab-tN|mt-mixed-tN|mt-xfree-tN|mt-interfere-tN"
                 "|cpp-vector|cpp-string> [ops]\n",
                 argv[0]);
         return 2;

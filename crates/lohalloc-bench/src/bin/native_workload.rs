@@ -55,6 +55,7 @@ fn run<D: AllocDriver + Sync>(driver: &D, workload: &str, ops: usize) -> bool {
             "slab" => workloads::workload_mt_slab_churn(driver, threads, ops),
             "mixed" => workloads::workload_mt_adversarial_mixed(driver, threads, ops),
             "xfree" => workloads::workload_mt_xfree(driver, threads, ops),
+            "interfere" => workloads::workload_mt_interfere(driver, threads, ops),
             _ => return false,
         }
         return true;
@@ -262,7 +263,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let Some(workload) = args.get(1) else {
         eprintln!(
-            "usage: {} <slab|arena|buddy|system|adv-mixed|mt-slab-tN|mt-mixed-tN|mt-xfree-tN> [ops]",
+            "usage: {} <slab|arena|buddy|system|adv-mixed|mt-slab-tN|mt-mixed-tN|mt-xfree-tN|mt-interfere-tN> [ops]",
             args.first()
                 .map(String::as_str)
                 .unwrap_or("native_workload")

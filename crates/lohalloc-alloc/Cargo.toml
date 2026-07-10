@@ -9,6 +9,11 @@ description = "Lohalloc Execution Plane: GlobalAlloc shim with Slab, Buddy, and 
 [dependencies]
 lohalloc-core.workspace = true
 libc = "0.2"
+# CachePadded only (J5-B1): pads hot atomics to their own cache line (128 B
+# on aarch64 — covers the prefetched line pair). default-features off keeps
+# this no_std-compatible and pulls in nothing else; the crate is already in
+# the workspace lockfile transitively, so this adds no new external code.
+crossbeam-utils = { version = "0.8", default-features = false }
 
 [features]
 # When enabled, every alloc/free emits a `TelemetryCRecord` to a C-ABI sink

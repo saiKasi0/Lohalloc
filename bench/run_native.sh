@@ -114,7 +114,11 @@ fi
 # the still-serialized Buddy/Arena paths (see crates/lohalloc-alloc's
 # module docs) should show up first. Override with MT_THREADS="1 2 4 8" etc.
 MT_THREADS="${MT_THREADS:-1 4 8}"
-MT_WORKLOAD_KINDS=(slab mixed xfree)
+# "interfere" (J5-B2) is the allocator-interference row: fixed application
+# compute + occasional alloc, so its lohalloc/jemalloc ratio measures how
+# much the allocator slows down a real MT app (expect ~1.0; a big loss =
+# false-sharing / cache-pollution finding, the thing cachegrind cannot see).
+MT_WORKLOAD_KINDS=(slab mixed xfree interfere)
 MT_WORKLOADS=()
 for n in $MT_THREADS; do
     for kind in "${MT_WORKLOAD_KINDS[@]}"; do

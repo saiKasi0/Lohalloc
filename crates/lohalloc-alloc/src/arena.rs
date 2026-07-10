@@ -4,7 +4,8 @@
 //! Allocations advance a cursor forward within the current chunk, aligned to
 //! `max(align, MIN_ALIGN)`; when the chunk fills, the arena advances to the
 //! next chunk in the chain (recycling one rewound by `reset`, or mapping a
-//! fresh one) up to [`MAX_CHUNKS`]. There is no per-allocation `free`; memory
+//! fresh one) up to the per-arena `max_chunks` cap (see
+//! [`scaled_max_chunks`]). There is no per-allocation `free`; memory
 //! is reclaimed via [`BumpArena::reset`], which rewinds every chunk's cursor.
 //! This is the "reset-based reclaim" model from the v3 spec: the Decision
 //! Engine (Phase 3) routes entire topological clusters (temporary, bulk
@@ -19,9 +20,10 @@
 //! site paid lock + failed-attempt + full size-chain re-route — a permanent
 //! per-op penalty measured as a prime contributor to the adversarial-mixed
 //! benchmark's 6-10× gap. Chaining keeps the bump fast path intact while
-//! letting the arena grow; the [`MAX_CHUNKS`] cap (32 MiB total) bounds
-//! memory for workloads that never reset, after which allocation falls back
-//! to the size-based chain exactly as before.
+//! letting the arena grow; the per-arena `max_chunks` cap (32 MiB floor,
+//! CPU-scaled higher, see [`scaled_max_chunks`]) bounds memory for workloads
+//! that never reset, after which allocation falls back to the size-based
+//! chain exactly as before.
 //!
 //! Chunks are mapped aligned to their (power-of-two-rounded) size, so the
 //! default 1 MiB chunks are 1 MiB-aligned — `ptr & !(CHUNK - 1)` recovers a
@@ -53,10 +55,34 @@ const DEFAULT_CHUNK_SIZE: usize = 1 << 20; // 1 MiB
 /// headerless serving; `with_capacity` arenas (tests) keep headers.
 pub(crate) const CHUNK_BYTES: usize = DEFAULT_CHUNK_SIZE;
 
-/// Maximum number of chained chunks (32 × 1 MiB = 32 MiB by default). At the
-/// cap, `alloc` returns `None` and the caller falls through to size-based
-/// routing — the pre-chaining behavior, just 32× later.
-const MAX_CHUNKS: usize = 32;
+/// Chunk-cap floor (and the fixed cap for `with_capacity` test arenas):
+/// 32 × 1 MiB = 32 MiB. At the cap, `alloc` returns `None` and the caller
+/// falls through to size-based routing — the pre-chaining behavior.
+const BASE_MAX_CHUNKS: usize = 32;
+
+/// Extra chained chunks permitted **per available CPU**. Each concurrent
+/// thread bumps its own 4 KiB TLS span (see `lib.rs`'s `arena_alloc_fast`),
+/// so more cores means more live spans in flight before J4-D's drain-reset
+/// can reclaim; a bigger arena avoids premature exhaustion on many-core
+/// hosts (the 16-vCPU c9g gate) without penalizing small machines. 4 MiB of
+/// headroom per core.
+const PER_CPU_CHUNKS: usize = 4;
+
+/// Absolute ceiling regardless of core count (128 × 1 MiB = 128 MiB), so a
+/// very wide host can't balloon a never-resetting accumulator unbounded.
+const MAX_CHUNKS_CAP: usize = 128;
+
+/// The CPU-scaled chunk cap for a production arena (`BumpArena::new`).
+/// `clamp(BASE + PER_CPU * ncpus, BASE..=CAP)`; a failed
+/// `available_parallelism` (returns `Err`) degrades to `ncpus == 0`, i.e.
+/// exactly the old fixed `BASE_MAX_CHUNKS` (32). Called once per arena at
+/// construction (a cheap syscall, allocation-free) — never on the hot path.
+fn scaled_max_chunks() -> usize {
+    let ncpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    (BASE_MAX_CHUNKS + PER_CPU_CHUNKS * ncpus).clamp(BASE_MAX_CHUNKS, MAX_CHUNKS_CAP)
+}
 
 /// One mmap-backed bump chunk.
 ///
@@ -149,7 +175,7 @@ impl Chunk {
 pub struct BumpArena {
     /// All mapped chunks. `chunks[current]` is the one being bumped; chunks
     /// before it are full (until `reset` rewinds everything). The Vec only
-    /// grows (≤ `MAX_CHUNKS` entries); its own heap growth is served through
+    /// grows (≤ `max_chunks` entries); its own heap growth is served through
     /// the caller's re-entrancy bypass when this arena lives inside the
     /// process's global allocator.
     chunks: Vec<Chunk>,
@@ -158,33 +184,47 @@ pub struct BumpArena {
     /// Size for newly mapped chunks (`DEFAULT_CHUNK_SIZE` unless constructed
     /// via `with_capacity`, which tests use to exercise the cap cheaply).
     chunk_size: usize,
+    /// Chunk cap for this arena. Production arenas (`new`) scale it to the
+    /// host core count (see [`scaled_max_chunks`]); `with_capacity` test
+    /// arenas pin it to [`BASE_MAX_CHUNKS`] so cap-exhaustion tests stay
+    /// deterministic regardless of the machine they run on.
+    max_chunks: usize,
 }
 
 unsafe impl Send for BumpArena {}
 
 impl BumpArena {
-    /// Create a new arena with the default chunk size (1 MiB).
+    /// Create a new arena with the default chunk size (1 MiB) and a
+    /// CPU-scaled chunk cap (see [`scaled_max_chunks`]).
     pub fn new() -> Option<Self> {
-        Self::with_capacity(DEFAULT_CHUNK_SIZE)
+        Self::with_cap(DEFAULT_CHUNK_SIZE, scaled_max_chunks())
     }
 
     /// Create a new arena whose chunks are `chunk_size` bytes (rounded up to
-    /// whole pages). The first chunk is mapped eagerly.
+    /// whole pages), pinned to the fixed [`BASE_MAX_CHUNKS`] cap. Tests use
+    /// this to exercise cap exhaustion cheaply and deterministically.
     pub fn with_capacity(chunk_size: usize) -> Option<Self> {
+        Self::with_cap(chunk_size, BASE_MAX_CHUNKS)
+    }
+
+    /// Shared constructor: `chunk_size` bytes per chunk, capped at
+    /// `max_chunks` chained chunks. The first chunk is mapped eagerly.
+    fn with_cap(chunk_size: usize, max_chunks: usize) -> Option<Self> {
         let first = Chunk::new(chunk_size)?;
-        let mut chunks = Vec::with_capacity(MAX_CHUNKS);
+        let mut chunks = Vec::with_capacity(max_chunks);
         chunks.push(first);
         Some(Self {
             chunks,
             current: 0,
             chunk_size,
+            max_chunks,
         })
     }
 
     /// Allocate `size` bytes aligned to at least `max(align, MIN_ALIGN)`.
     ///
     /// Returns `None` only when `size` can never fit in a chunk or the
-    /// [`MAX_CHUNKS`] cap is exhausted.
+    /// `max_chunks` cap is exhausted.
     ///
     /// # Safety contract for the caller
     /// The returned pointer is valid until `reset` is called. Reading/writing
@@ -211,7 +251,7 @@ impl BumpArena {
         loop {
             if self.current + 1 < self.chunks.len() {
                 self.current += 1;
-            } else if self.chunks.len() < MAX_CHUNKS {
+            } else if self.chunks.len() < self.max_chunks {
                 let chunk = Chunk::new(self.chunk_size)?;
                 self.chunks.push(chunk);
                 self.current += 1;
@@ -227,9 +267,19 @@ impl BumpArena {
     /// Reset the arena: rewind every chunk's cursor and start bumping from
     /// the first chunk again. All prior allocations are invalidated. Chunks
     /// stay mapped (recycled on the next fill cycle).
+    ///
+    /// The rewind stores are **atomic** (`store`, not `get_mut`): J4-D fires
+    /// this from `lib.rs`'s drain-triggered auto-reset, which can run
+    /// concurrently with the lock-free fast path reading these same cursors
+    /// via the published `ArenaChunkDescriptor`. `lib.rs`'s epoch-lock
+    /// protocol proves no fast-path *carve* CAS overlaps a rewind, but a
+    /// non-atomic `get_mut` write racing the descriptor's atomic loads would
+    /// still be UB (and a ThreadSanitizer report); an atomic store is
+    /// well-defined and just as cheap under `&mut self`.
     pub fn reset(&mut self) {
         for chunk in &mut self.chunks {
-            *chunk.cursor.get_mut() = chunk.base as usize;
+            let base = chunk.base as usize;
+            chunk.cursor.store(base, Ordering::Relaxed);
         }
         self.current = 0;
     }
@@ -243,7 +293,7 @@ impl BumpArena {
 
     /// After a failed [`alloc`](Self::alloc): `true` when the failure means
     /// the arena is *permanently* out of memory for chunk-fitting requests
-    /// (the [`MAX_CHUNKS`] cap is reached and this request would have fit an
+    /// (the `max_chunks` cap is reached and this request would have fit an
     /// empty chunk), as opposed to a one-off oversized request that could
     /// never fit any chunk. `lib.rs` uses this to set its `arena_exhausted`
     /// fast-fail flag — a bump arena never recovers from cap exhaustion
@@ -252,13 +302,20 @@ impl BumpArena {
     /// chunk's remaining bytes, but that transient (< one chunk) is not
     /// worth re-attempting the Mutex slow path on every allocation forever.
     pub(crate) fn exhausted_after_failed(&self, size: usize, align: usize) -> bool {
-        self.chunks.len() == MAX_CHUNKS
+        self.chunks.len() == self.max_chunks
             && size.saturating_add(align.max(MIN_ALIGN)) <= self.chunk_size
+    }
+
+    /// This arena's chunk cap (CPU-scaled for `new`, fixed for
+    /// `with_capacity`). Exposed for tests asserting the scaling.
+    #[cfg(test)]
+    pub(crate) fn max_chunks(&self) -> usize {
+        self.max_chunks
     }
 
     /// Base address of every currently mapped chunk, for the headerless
     /// chunk registry (`lib.rs` registers them — idempotently, ≤
-    /// [`MAX_CHUNKS`] entries — on the chunk-creating slow path, before
+    /// `max_chunks` entries — on the chunk-creating slow path, before
     /// the current chunk is (re)published to the lock-free fast path).
     pub(crate) fn chunk_bases(&self) -> impl Iterator<Item = usize> + '_ {
         self.chunks.iter().map(|c| c.base as usize)
@@ -340,9 +397,11 @@ mod tests {
 
     #[test]
     fn arena_full_returns_none_at_cap() {
-        // Small chunks so the MAX_CHUNKS cap is reachable quickly:
-        // 32 chunks × 4 KiB = 128 KiB total.
+        // Small chunks so the BASE_MAX_CHUNKS cap is reachable quickly:
+        // 32 chunks × 4 KiB = 128 KiB total. `with_capacity` pins the cap to
+        // BASE_MAX_CHUNKS so this is deterministic on any host.
         let mut arena = BumpArena::with_capacity(4096).expect("arena");
+        assert_eq!(arena.max_chunks(), BASE_MAX_CHUNKS);
         let mut total = 0;
         while arena.alloc(256, 16).is_some() {
             total += 1;
@@ -352,7 +411,7 @@ mod tests {
         }
         assert_eq!(
             arena.chunks.len(),
-            MAX_CHUNKS,
+            BASE_MAX_CHUNKS,
             "should have chained to the cap"
         );
         assert!(
@@ -412,6 +471,37 @@ mod tests {
         // Pointers should be monotonically increasing.
         assert!(p2 as usize > p1 as usize);
         assert!(p3 as usize > p2 as usize);
+    }
+
+    #[test]
+    fn cpu_scaled_cap_is_at_least_base_and_within_ceiling() {
+        // A production arena's cap floors at BASE_MAX_CHUNKS and never
+        // exceeds MAX_CHUNKS_CAP, regardless of the host core count. It must
+        // also match the standalone scaler exactly (single source of truth).
+        let arena = BumpArena::new().expect("arena");
+        let cap = arena.max_chunks();
+        assert!(cap >= BASE_MAX_CHUNKS, "cap {cap} below floor");
+        assert!(cap <= MAX_CHUNKS_CAP, "cap {cap} above ceiling");
+        assert_eq!(cap, scaled_max_chunks(), "arena cap must match scaler");
+    }
+
+    #[test]
+    fn scaled_max_chunks_is_monotone_and_clamped() {
+        // The scaling formula, exercised directly (available_parallelism is
+        // fixed on a given host, so drive the math via the same clamp). More
+        // cores never shrinks the cap; the ceiling always holds.
+        let f = |n: usize| {
+            (BASE_MAX_CHUNKS + PER_CPU_CHUNKS * n).clamp(BASE_MAX_CHUNKS, MAX_CHUNKS_CAP)
+        };
+        assert_eq!(f(0), BASE_MAX_CHUNKS, "Err/zero-cpu degrades to the floor");
+        assert!(f(1) >= f(0));
+        assert!(f(16) >= f(8));
+        assert!(f(8) >= f(1));
+        assert_eq!(
+            f(1_000_000),
+            MAX_CHUNKS_CAP,
+            "huge core count clamps to ceiling"
+        );
     }
 
     #[test]

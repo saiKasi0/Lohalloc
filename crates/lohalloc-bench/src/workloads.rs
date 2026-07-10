@@ -298,6 +298,82 @@ pub fn workload_mt_xfree<D: AllocDriver + Sync>(driver: &D, threads: usize, ops:
     });
 }
 
+/// W-MT-INTERFERE (J5-B2): `threads` threads doing a FIXED amount of
+/// cache-resident application compute with only *occasional* allocation —
+/// the allocator-interference benchmark. Every prior workload is a pure
+/// alloc/free loop, which measures allocator throughput but not what the
+/// allocator does to a real MT application (shared-cache-line traffic,
+/// lock stalls, cache pollution bleeding into application work). Here the
+/// compute dominates (an FNV-1a pass over a 4 KiB thread-local buffer per
+/// iteration) and one 208-byte alloc/free happens every
+/// `INTERFERE_ALLOC_EVERY` iterations, so hyperfine's wall-time delta
+/// between allocators IS the interference signal — an ideal allocator
+/// scores ~1.0 vs any other. Deterministic: fixed iteration count, no
+/// wall-clock dependence, buffer contents fold into a volatile sink so the
+/// kernel can't be optimized away. Mirrors
+/// `bench/native/workloads.c::workload_mt_interfere`.
+pub fn workload_mt_interfere<D: AllocDriver + Sync>(driver: &D, threads: usize, ops: usize) {
+    let threads = threads.max(1);
+    let per_thread = (ops / threads).max(1);
+    let layout = Layout::from_size_align(SMALL_FIXED_REQUEST, 16).unwrap();
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            scope.spawn(move || {
+                // 4 KiB thread-local working set: L1-resident, so the only
+                // cross-core cache traffic is whatever the ALLOCATOR causes.
+                let mut buf = [0u8; INTERFERE_BUF_BYTES];
+                let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ (t as u64);
+                let mut held: *mut u8 = core::ptr::null_mut();
+                for i in 0..per_thread {
+                    // xorshift-fed refresh of a few buffer slots, then a
+                    // full FNV-1a pass — the "application work".
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    buf[(seed as usize) & (INTERFERE_BUF_BYTES - 1)] = seed as u8;
+                    // FNV a rotating 512-byte window (whole buffer covered
+                    // every 8 iterations) — ~0.5 µs of compute per iteration,
+                    // enough to dominate the occasional alloc without making
+                    // hyperfine rows minutes long.
+                    let start = (i * INTERFERE_WINDOW_BYTES) & (INTERFERE_BUF_BYTES - 1);
+                    let mut h = 0xcbf2_9ce4_8422_2325u64;
+                    for &b in &buf[start..start + INTERFERE_WINDOW_BYTES] {
+                        h = (h ^ b as u64).wrapping_mul(0x1_0000_01b3);
+                    }
+                    // Volatile sink: the compute must not be elided.
+                    unsafe { core::ptr::write_volatile(&mut seed, seed ^ h) };
+                    // Occasional allocation: hold one block across the gap
+                    // (so the allocator's memory placement matters), free it
+                    // and take a fresh one every INTERFERE_ALLOC_EVERY iters.
+                    if i % INTERFERE_ALLOC_EVERY == 0 {
+                        if !held.is_null() {
+                            unsafe { driver.dealloc(held, layout, 0) };
+                        }
+                        held = unsafe { driver.alloc(layout, 0) };
+                        // Touch the block so its cache line is genuinely used.
+                        unsafe { held.write(seed as u8) };
+                    }
+                }
+                if !held.is_null() {
+                    unsafe { driver.dealloc(held, layout, 0) };
+                }
+            });
+        }
+    });
+}
+
+/// Thread-local working-set size for [`workload_mt_interfere`]: 4 KiB is
+/// comfortably L1-resident so the compute kernel itself never causes
+/// cross-core traffic.
+pub const INTERFERE_BUF_BYTES: usize = 4096;
+/// One alloc/free per this many compute iterations in
+/// [`workload_mt_interfere`] — allocation is *occasional*, the compute
+/// dominates (mirrors `bench/native/workloads.c`).
+pub const INTERFERE_ALLOC_EVERY: usize = 8;
+/// Bytes FNV-hashed per iteration (a rotating window over the buffer; must
+/// divide [`INTERFERE_BUF_BYTES`] so windows never wrap).
+pub const INTERFERE_WINDOW_BYTES: usize = 512;
+
 /// W-ADV-EXHAUST: long-lived small allocations, never freed by the
 /// generator — returned to the caller so it can free them after asserting
 /// on routing/exhaustion behavior. Used with a forced-Arena model to

@@ -262,6 +262,77 @@ NOINLINE void workload_mt_xfree(size_t ops, int threads) {
     free(consumers);
 }
 
+// W-MT-INTERFERE (J5-B2): fixed cache-resident application compute with only
+// occasional allocation -- the allocator-interference benchmark. The compute
+// (an FNV-1a pass over a rotating 512-byte window of a 4 KiB thread-local
+// buffer) dominates; one SMALL_FIXED_REQUEST malloc/free happens every 8
+// iterations. hyperfine's wall-time delta between allocators IS the
+// interference signal (an ideal allocator scores ~1.0 vs any other).
+// Deterministic: fixed iteration count, volatile sink so the kernel can't be
+// elided. Mirrors crates/lohalloc-bench/src/workloads.rs::workload_mt_interfere.
+#define INTERFERE_BUF_BYTES 4096
+#define INTERFERE_WINDOW_BYTES 512
+#define INTERFERE_ALLOC_EVERY 8
+
+struct mt_interfere_arg {
+    size_t ops;
+    int thread_index;
+};
+
+static void *mt_interfere_worker(void *arg) {
+    struct mt_interfere_arg *a = arg;
+    unsigned char buf[INTERFERE_BUF_BYTES];
+    memset(buf, 0, sizeof(buf));
+    uint64_t seed = 0x9E3779B97F4A7C15ull ^ (uint64_t)a->thread_index;
+    volatile uint64_t sink = 0;
+    void *held = NULL;
+    for (size_t i = 0; i < a->ops; i++) {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        buf[(size_t)seed & (INTERFERE_BUF_BYTES - 1)] = (unsigned char)seed;
+        size_t start = (i * INTERFERE_WINDOW_BYTES) & (INTERFERE_BUF_BYTES - 1);
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (size_t j = 0; j < INTERFERE_WINDOW_BYTES; j++) {
+            h = (h ^ buf[start + j]) * 0x1000001b3ull;
+        }
+        sink = sink ^ h;
+        if (i % INTERFERE_ALLOC_EVERY == 0) {
+            if (held != NULL) {
+                free(held);
+            }
+            held = malloc(SMALL_FIXED_REQUEST);
+            if (held != NULL) {
+                *(volatile unsigned char *)held = (unsigned char)seed;
+            }
+        }
+    }
+    if (held != NULL) {
+        free(held);
+    }
+    (void)sink;
+    return NULL;
+}
+
+NOINLINE void workload_mt_interfere(size_t ops, int threads) {
+    if (threads < 1) threads = 1;
+    size_t per_thread = ops / (size_t)threads;
+    if (per_thread == 0) per_thread = 1;
+
+    pthread_t *tids = malloc(sizeof(pthread_t) * (size_t)threads);
+    struct mt_interfere_arg *args = malloc(sizeof(struct mt_interfere_arg) * (size_t)threads);
+    for (int i = 0; i < threads; i++) {
+        args[i].ops = per_thread;
+        args[i].thread_index = i;
+        pthread_create(&tids[i], NULL, mt_interfere_worker, &args[i]);
+    }
+    for (int i = 0; i < threads; i++) {
+        pthread_join(tids[i], NULL);
+    }
+    free(tids);
+    free(args);
+}
+
 // Parses "mt-<kind>-t<N>" into `kind_out` (nul-terminated) and `*threads_out`.
 // Splits on the *last* '-' in the string so a kind name could itself contain
 // hyphens (not currently needed, but costs nothing). Returns 1 on a
@@ -295,6 +366,8 @@ int dispatch_workload(const char *workload, size_t ops) {
             workload_mt_adversarial_mixed(ops, threads);
         } else if (strcmp(kind, "xfree") == 0) {
             workload_mt_xfree(ops, threads);
+        } else if (strcmp(kind, "interfere") == 0) {
+            workload_mt_interfere(ops, threads);
         } else {
             fprintf(stderr, "unknown mt workload kind '%s'\n", kind);
             return 0;

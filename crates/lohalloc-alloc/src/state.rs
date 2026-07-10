@@ -287,25 +287,56 @@ impl AllocatorState {
     /// `PerfectHashTable` (one entry per observed signature, mapping hash →
     /// best backend).
     ///
+    /// `demote_arena` is the J4-C bistability fix, made **volume-selective**
+    /// by J5-A: when the caller observed **zero arena resets during
+    /// training** (`Lohalloc` passes `arena_epoch == 0`), an Arena verdict is
+    /// demoted to the size-appropriate Slab/Buddy backend in *both* frozen
+    /// tables — but only for a **heavy** signature, one whose training volume
+    /// (`total_pulls`) is ≥ [`ARENA_DEMOTE_VOLUME_FRACTION`] of that table's
+    /// total. Rationale: a bump arena only reclaims via `reset()`; in a
+    /// deployment that never resets (LD_PRELOAD / global-allocator, the whole
+    /// native bench matrix), a *dominant* burst site fills the arena once and
+    /// then falls through on every allocation *forever* (measured: 68,940
+    /// fallthroughs / 200k ops) — and whether it froze to Arena or Slab was
+    /// cold-start UCB noise swinging gate rows 1.3×↔3.5× (J4-C). But J4-C's
+    /// *blanket* demotion also flattened sites that used Arena lightly and
+    /// beneficially (adv-mixed routes only ~117 allocs there — it can never
+    /// fill a chunk, so its bump-speed win is free), and J4-D proved keeping
+    /// heavy sites is even worse (worst 3.98×). The volume split takes the
+    /// good half of both: light Arena kept, heavy Arena demoted,
+    /// deterministically. Workloads that genuinely reset (GUI/replay) keep
+    /// everything.
+    ///
     /// # Panics
     ///
     /// Panics if called when already in Inference mode. `freeze()` is a
     /// one-way transition.
-    pub fn freeze(&mut self) {
+    pub fn freeze(&mut self, demote_arena: bool) {
         match self {
             Self::Training { bandit, .. } => {
                 // Same per-size-class clamp for both tables: a distilled
                 // entry must never license a backend the main table would
                 // have clamped away (the pin cache serves straight from
-                // distilled with no further checks).
-                let clamp = |triples: Vec<(u64, u8, lohalloc_core::Backend)>| {
-                    triples
+                // distilled with no further checks). `total_all` is computed
+                // per table — main counts every signature, distilled only
+                // the unambiguous groups — so each table's fractions are
+                // self-consistent.
+                let clamp = |entries: Vec<(u64, u8, lohalloc_core::Backend, u32)>| {
+                    let total_all: u64 = entries.iter().map(|&(_, _, _, p)| p as u64).sum();
+                    entries
                         .into_iter()
-                        .map(|(key, size_class, backend)| {
+                        .map(|(key, size_class, backend, pulls)| {
+                            let heavy = total_all > 0
+                                && (pulls as f64 / total_all as f64)
+                                    >= ARENA_DEMOTE_VOLUME_FRACTION;
                             (
                                 key,
                                 size_class,
-                                clamp_backend_for_size_class(size_class, backend),
+                                clamp_backend_for_size_class(
+                                    size_class,
+                                    backend,
+                                    demote_arena && heavy,
+                                ),
                             )
                         })
                         .collect::<Vec<_>>()
@@ -432,8 +463,45 @@ pub(crate) fn default_backend_for_size_class(size_class: u8) -> Backend {
 /// fallthrough chain would already do for an out-of-range recommendation;
 /// it never changes behavior for a Signature that legitimately belongs on
 /// System (size_class 14).
-fn clamp_backend_for_size_class(size_class: u8, backend: Backend) -> Backend {
+///
+/// `demote_arena` (J4-C) extends the same idea to Arena for reset-free
+/// deployments: an Arena verdict frozen from pre-exhaustion samples becomes a
+/// permanent fallthrough storm once the un-reset arena fills (see
+/// [`AllocatorState::freeze`]'s doc for the measured bistability). Demotion
+/// targets what the fallthrough chain would pick anyway — Slab for slab-range
+/// classes, Buddy for buddy-range — just without paying the doomed Arena
+/// attempt per allocation.
+///
+/// J5 generalizes the same lesson to **unservable** verdicts: a backend that
+/// cannot serve the size class in the deployment that will load this model
+/// is a *per-allocation* doomed attempt + fallthrough forever once frozen:
+/// - Slab above `SLAB_MAX` (sc > 11);
+/// - Buddy above `BUDDY_MAX` (sc > 13), and — the subtle one — **below the
+///   headerless order-map floor** (sc ≤ 10, requests ≤ 8 KiB, which round
+///   below `buddy::MIN_HEADERLESS_ORDER`'s 16 KiB and are refused by
+///   `buddy_block_headerless_via_magazine`). Training runs header-based
+///   where Buddy CAN serve those sizes, so the bandit legitimately learns
+///   the verdict — and every `load()`-booted (headerless) inference process
+///   then fails it per-op. Measured on adv-mixed as ONE flipped sc-10 entry
+///   swinging fallthrough 1.6k↔15.4k/200k across identically-built models.
+/// - Arena above its 1 MiB chunk (sc > 13).
+///
+/// Like the System clamp, each is a strict narrowing to what the fallthrough
+/// chain would do anyway, minus the doomed attempt per op.
+fn clamp_backend_for_size_class(size_class: u8, backend: Backend, demote_arena: bool) -> Backend {
     if backend == Backend::System && size_class <= 13 {
+        return default_backend_for_size_class(size_class);
+    }
+    let unservable = match backend {
+        Backend::Slab => size_class > 11,
+        Backend::Buddy => size_class > 13 || size_class <= 10,
+        Backend::Arena => size_class > 13,
+        Backend::System => false, // serves any size (clamped above when dominated)
+    };
+    if unservable {
+        return default_backend_for_size_class(size_class);
+    }
+    if demote_arena && backend == Backend::Arena {
         return default_backend_for_size_class(size_class);
     }
     backend
@@ -467,6 +535,19 @@ pub(crate) fn shaped_reward(
     cfg.t_ref_ns / (cfg.t_ref_ns + latency_ns as f64)
         - cfg.frag_weight * f64::from(frag_pct) / 100.0
 }
+
+/// J5-A: the volume threshold for freeze-time Arena demotion. A signature
+/// whose `total_pulls` is at least this fraction of the table's total is
+/// "heavy": in a reset-free deployment it will dominate arena traffic,
+/// exhaust the cap, and storm — demote it. Below the threshold it is
+/// "light": it can never meaningfully fill the arena, so its bump-speed
+/// win is kept. Calibration from the certified A/Bs: the storm rows'
+/// burst signatures carry the majority of training pulls (rust/arena's
+/// site is ~all 1000 pre-freeze pulls), while adv-mixed's kept arena
+/// signatures sit far below 10% each (~117 arena allocs / 200k mixed ops).
+/// The gap between the two cases is orders of magnitude, so the exact
+/// value is not delicate — 0.10 sits comfortably between them.
+pub(crate) const ARENA_DEMOTE_VOLUME_FRACTION: f64 = 0.10;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -670,7 +751,7 @@ mod tests {
             state.record_latency(100, backend, size_class_for(64), 10, 64);
         }
         assert!(!state.is_inference());
-        state.freeze();
+        state.freeze(false);
         assert!(state.is_inference());
     }
 
@@ -687,7 +768,7 @@ mod tests {
                 state.record_latency(100, Backend::Arena, size_class_for(64), 10, 64);
             }
         }
-        state.freeze();
+        state.freeze(false);
 
         // In Inference, routing for hash 100 should return the frozen backend.
         let backend = state.route(100, 64);
@@ -707,7 +788,7 @@ mod tests {
             let backend = state.route(50, 64);
             state.record_latency(50, backend, size_class_for(64), 10, 64);
         }
-        state.freeze();
+        state.freeze(false);
 
         // record_latency() in Inference mode should be a no-op (not panic).
         state.record_latency(50, Backend::Slab, size_class_for(64), 10, 64);
@@ -722,7 +803,7 @@ mod tests {
             let backend = state.route(100, 64);
             state.record_latency(100, backend, size_class_for(64), 10, 64);
         }
-        state.freeze();
+        state.freeze(false);
 
         // Hash 999 was never seen → should fall back to size-based default.
         let backend = state.route(999, 64);
@@ -733,7 +814,7 @@ mod tests {
     #[test]
     fn inference_falls_back_for_large_size() {
         let mut state = AllocatorState::new_training();
-        state.freeze();
+        state.freeze(false);
         // Size > BUDDY_MAX → System.
         let backend = state.route(999, 2 * 1024 * 1024);
         assert_eq!(backend, Backend::System);
@@ -754,7 +835,7 @@ mod tests {
             // `inference_mode_routes_via_perfect_hash`'s forced-Arena case.
             state.record_latency(200, Backend::System, sc, 10, size);
         }
-        state.freeze();
+        state.freeze(false);
 
         let backend = state.route(200, size);
         assert_ne!(
@@ -778,9 +859,227 @@ mod tests {
             let _ = state.route(201, size);
             state.record_latency(201, Backend::System, sc, 10, size);
         }
-        state.freeze();
+        state.freeze(false);
 
         assert_eq!(state.route(201, size), Backend::System);
+    }
+
+    /// Train a state whose winning arm for `(hash, size)` is Arena — the
+    /// forced-reward pattern from `freeze_clamps_system_lock_for_buddy_range_size`.
+    fn train_arena_locked(hash: u64, size: usize) -> AllocatorState {
+        let sc = size_class_for(size);
+        let mut state = AllocatorState::new_training();
+        for _ in 0..20 {
+            let _ = state.route(hash, size);
+            state.record_latency(hash, Backend::Arena, sc, 10, size);
+        }
+        state
+    }
+
+    #[test]
+    fn freeze_demotes_arena_when_no_reset_observed() {
+        // J4-C: in a reset-free deployment (`demote_arena = true`), an
+        // Arena-locked Signature must freeze to the size-appropriate
+        // backend instead — Slab for slab-range, Buddy for buddy-range.
+        // This is what kills the freeze-at-1000 arena/slab coin flip.
+        let mut small = train_arena_locked(300, 64); // sc 0-11 → Slab
+        small.freeze(true);
+        assert_eq!(small.route(300, 64), Backend::Slab);
+
+        let mut mid = train_arena_locked(301, 20_000); // sc 12 → Buddy
+        mid.freeze(true);
+        assert_eq!(mid.route(301, 20_000), Backend::Buddy);
+    }
+
+    #[test]
+    fn freeze_keeps_arena_when_resets_observed() {
+        // A deployment that resets its arena (GUI/replay) keeps Arena
+        // verdicts — demotion is strictly opt-in via the flag.
+        let mut state = train_arena_locked(302, 64);
+        state.freeze(false);
+        assert_eq!(state.route(302, 64), Backend::Arena);
+    }
+
+    #[test]
+    fn arena_demotion_applies_to_distilled_table_too() {
+        // The pin cache serves straight from the distilled table with no
+        // further checks, so a demoted main entry with an un-demoted
+        // distilled sibling would re-open the fallthrough storm through
+        // the pin path. Train with a consistent one_frame so distill()
+        // emits the site, then check the distilled section.
+        let size = 64usize;
+        let sc = size_class_for(size);
+        let mut state = AllocatorState::new_training();
+        for _ in 0..20 {
+            let _ = state.route_with_frame(400, 41, size);
+            state.record_latency(400, Backend::Arena, sc, 10, size);
+        }
+        state.freeze(true);
+        let distilled = state.distilled_table().expect("inference mode");
+        let key = combine_hash_size_class(41, sc);
+        match distilled.lookup(key) {
+            Some(backend) => assert_eq!(
+                backend,
+                Backend::Slab,
+                "distilled entry must be demoted identically to main"
+            ),
+            None => {
+                // Site not distilled (ambiguity rules) — acceptable: no
+                // pin-path entry means no un-demoted verdict can leak.
+            }
+        }
+    }
+
+    #[test]
+    fn clamp_fixes_unservable_verdicts() {
+        // J5: a frozen verdict whose backend cannot serve the size class is
+        // a per-op doomed attempt + fallthrough — clamp to the
+        // size-appropriate backend. (Slab caps at sc 11; Buddy and Arena at
+        // sc 13.) A servable verdict passes through untouched.
+        // Slab above SLAB_MAX → Buddy (sc 12/13), System (sc 14).
+        assert_eq!(
+            clamp_backend_for_size_class(12, Backend::Slab, false),
+            Backend::Buddy
+        );
+        assert_eq!(
+            clamp_backend_for_size_class(13, Backend::Slab, false),
+            Backend::Buddy
+        );
+        assert_eq!(
+            clamp_backend_for_size_class(14, Backend::Slab, false),
+            Backend::System
+        );
+        // Buddy / Arena above BUDDY_MAX / chunk size → System.
+        assert_eq!(
+            clamp_backend_for_size_class(14, Backend::Buddy, false),
+            Backend::System
+        );
+        assert_eq!(
+            clamp_backend_for_size_class(14, Backend::Arena, false),
+            Backend::System
+        );
+        // Buddy below the headerless order-map floor (sc <= 10: requests
+        // <= 8 KiB round below MIN_HEADERLESS_ORDER's 16 KiB and are refused
+        // per-op in every load()-booted deployment) → Slab.
+        assert_eq!(
+            clamp_backend_for_size_class(0, Backend::Buddy, false),
+            Backend::Slab
+        );
+        assert_eq!(
+            clamp_backend_for_size_class(10, Backend::Buddy, false),
+            Backend::Slab
+        );
+        // Servable verdicts are untouched (no demote flag).
+        assert_eq!(
+            clamp_backend_for_size_class(11, Backend::Slab, false),
+            Backend::Slab
+        );
+        assert_eq!(
+            clamp_backend_for_size_class(11, Backend::Buddy, false),
+            Backend::Buddy,
+            "sc 11 requests (8-16 KiB) round UP to the 16 KiB order — servable"
+        );
+        assert_eq!(
+            clamp_backend_for_size_class(13, Backend::Buddy, false),
+            Backend::Buddy
+        );
+        assert_eq!(
+            clamp_backend_for_size_class(5, Backend::Arena, false),
+            Backend::Arena
+        );
+    }
+
+    #[test]
+    fn volume_selective_demotion_keeps_light_arena() {
+        // J5-A: only a HEAVY arena signature (>= ARENA_DEMOTE_VOLUME_FRACTION
+        // of the table's training volume) is demoted; a light one keeps its
+        // bump-speed win — the adv-mixed case J4-C's blanket demotion
+        // flattened (c/adv-mixed 1.10→1.43).
+        let size = 64usize;
+        let sc = size_class_for(size);
+        let mut state = AllocatorState::new_training();
+        // Light arena signature: the standard 20-iteration lock-in...
+        for _ in 0..20 {
+            let _ = state.route(500, size);
+            state.record_latency(500, Backend::Arena, sc, 10, size);
+        }
+        // ...dwarfed by a heavy slab signature (50× the volume), pushing the
+        // arena signature's fraction well below the 10% threshold.
+        for _ in 0..1000 {
+            let _ = state.route(501, 256);
+            state.record_latency(501, Backend::Slab, size_class_for(256), 10, 256);
+        }
+        state.freeze(true);
+        assert_eq!(
+            state.route(500, size),
+            Backend::Arena,
+            "light arena signature must be KEPT below the volume threshold"
+        );
+    }
+
+    #[test]
+    fn volume_selective_demotion_demotes_heavy_arena_among_light() {
+        // The split is per-signature: the heavy burst site is demoted even
+        // while a light arena site in the same table is kept.
+        let size = 64usize;
+        let sc = size_class_for(size);
+        let mut state = AllocatorState::new_training();
+        // Heavy arena burst site (dominates training volume).
+        for _ in 0..1000 {
+            let _ = state.route(510, size);
+            state.record_latency(510, Backend::Arena, sc, 10, size);
+        }
+        // Light arena site.
+        for _ in 0..20 {
+            let _ = state.route(511, size);
+            state.record_latency(511, Backend::Arena, sc, 10, size);
+        }
+        state.freeze(true);
+        assert_eq!(
+            state.route(510, size),
+            Backend::Slab,
+            "heavy arena signature must be demoted to the size-appropriate backend"
+        );
+        assert_eq!(
+            state.route(511, size),
+            Backend::Arena,
+            "light arena signature in the same table must be kept"
+        );
+    }
+
+    #[test]
+    fn volume_selective_demotion_distilled_parity_for_light_arena() {
+        // A light KEPT arena verdict must be kept in the distilled table too
+        // — the pin cache serves distilled with no further checks, so a
+        // distilled entry demoted differently from main would change routing
+        // through the pin path.
+        let size = 64usize;
+        let sc = size_class_for(size);
+        let mut state = AllocatorState::new_training();
+        // Light arena site with a stable one-frame (so distill() emits it).
+        for _ in 0..20 {
+            let _ = state.route_with_frame(520, 61, size);
+            state.record_latency(520, Backend::Arena, sc, 10, size);
+        }
+        // Heavy slab site on a different one-frame, dominating volume.
+        for _ in 0..1000 {
+            let _ = state.route_with_frame(521, 62, 256);
+            state.record_latency(521, Backend::Slab, size_class_for(256), 10, 256);
+        }
+        state.freeze(true);
+        let distilled = state.distilled_table().expect("inference mode");
+        let key = combine_hash_size_class(61, sc);
+        match distilled.lookup(key) {
+            Some(backend) => assert_eq!(
+                backend,
+                Backend::Arena,
+                "light arena distilled entry must be kept, matching main"
+            ),
+            None => {
+                // Site not distilled (ambiguity rules) — acceptable: no
+                // pin-path entry means no divergent verdict can leak.
+            }
+        }
     }
 
     #[test]
@@ -795,7 +1094,7 @@ mod tests {
             let backend = state.route(2, 256);
             state.record_latency(2, backend, size_class_for(256), 10, 256);
         }
-        state.freeze();
+        state.freeze(false);
 
         // Export.
         let bytes = state.export().expect("export should work in Inference");
@@ -816,7 +1115,7 @@ mod tests {
             let backend = state.route(42, 64);
             state.record_latency(42, backend, size_class_for(64), 10, 64);
         }
-        state.freeze();
+        state.freeze(false);
         let bytes = state.export().unwrap();
 
         let loaded = AllocatorState::load(&bytes).unwrap();
@@ -827,8 +1126,8 @@ mod tests {
     #[should_panic(expected = "freeze() called on an already-frozen")]
     fn freeze_twice_panics() {
         let mut state = AllocatorState::new_training();
-        state.freeze();
-        state.freeze(); // Should panic.
+        state.freeze(false);
+        state.freeze(false); // Should panic.
     }
 
     #[test]
@@ -880,7 +1179,7 @@ mod tests {
             let b = state.route(42, 64);
             state.record_latency(42, b, size_class_for(64), 10, 64);
         }
-        state.freeze();
+        state.freeze(false);
         assert!(state.routing_snapshot().is_empty());
         assert_eq!(state.signature_count(), 0);
     }
@@ -895,7 +1194,7 @@ mod tests {
         assert!(!state.is_inference());
         assert_eq!(state.signature_count(), 1);
 
-        state.freeze();
+        state.freeze(false);
         assert!(state.is_inference());
         assert_eq!(state.signature_count(), 0);
 

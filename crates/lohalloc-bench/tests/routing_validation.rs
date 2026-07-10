@@ -134,12 +134,14 @@ fn adv_exhaust_forces_fallthrough_once_arena_full() {
     let harness = HarnessDriver { alloc };
     let recording = RecordingDriver::new(&harness, &harness.alloc);
 
-    // The arena now CHAINS 1 MiB chunks up to a 32 MiB cap (it used to be a
-    // single 1 MiB region), so exhausting it takes > 32 MiB of live,
-    // never-freed traffic. Since Ladder 5's headerless Arena, a
-    // load()-booted instance's arena blocks carry NO 48-byte header, so
-    // each allocation consumes exactly 208 B: 170_000 × 208 B ≈ 35 MiB.
-    let ptrs = workloads::workload_exhaust_no_free(&recording, hashes::W_ADV_EXHAUST, 170_000);
+    // The arena CHAINS 1 MiB chunks up to a cap that J4-D scales to the host
+    // core count (32 MiB floor, 128 MiB ceiling = `MAX_CHUNKS_CAP`). To force
+    // exhaustion on ANY host, allocate > 128 MiB of live, never-freed traffic
+    // (nothing frees here, so drain-reset never fires). Since Ladder 5's
+    // headerless Arena a load()-booted instance's arena blocks carry NO
+    // 48-byte header, so each consumes exactly 208 B: 700_000 × 208 B ≈ 139 MiB
+    // exceeds even the 128 MiB ceiling.
+    let ptrs = workloads::workload_exhaust_no_free(&recording, hashes::W_ADV_EXHAUST, 700_000);
 
     let arena_frac = recording.fraction_served_by(Backend::Arena);
     assert!(

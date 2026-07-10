@@ -63,11 +63,20 @@ void workload_mt_adversarial_mixed(size_t ops, int threads);
 // the allocator uses on the alloc side.
 void workload_mt_xfree(size_t ops, int threads);
 
+// W-MT-INTERFERE (J5-B2): `threads` threads doing fixed cache-resident
+// application compute (FNV over a rotating window of a 4 KiB thread-local
+// buffer) with only occasional allocation (1 malloc/free per 8 iterations).
+// Measures how much the allocator slows down a real MT application (shared
+// cache-line traffic, lock stalls, cache pollution) rather than raw
+// alloc/free throughput -- an ideal allocator's wall time here matches any
+// other's.
+void workload_mt_interfere(size_t ops, int threads);
+
 // Dispatches any workload name this file knows about, including the
-// "mt-<kind>-t<N>" multithreaded names (kind is "slab", "mixed", or
-// "xfree"; N is the thread count) -- shared by the C and C++ drivers so the
-// name-parsing logic lives in exactly one place. Returns 1 on a recognized
-// name, 0 (with nothing run) otherwise.
+// "mt-<kind>-t<N>" multithreaded names (kind is "slab", "mixed", "xfree",
+// or "interfere"; N is the thread count) -- shared by the C and C++ drivers
+// so the name-parsing logic lives in exactly one place. Returns 1 on a
+// recognized name, 0 (with nothing run) otherwise.
 int dispatch_workload(const char *workload, size_t ops);
 
 #ifdef __cplusplus

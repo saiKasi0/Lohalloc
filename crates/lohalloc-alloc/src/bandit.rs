@@ -331,13 +331,18 @@ impl BanditPolicy {
     ///
     /// The "best" backend for a Signature is the one with the highest mean
     /// reward (most reliable, not just most-pulled).
-    pub fn freeze(&self) -> Vec<(u64, u8, Backend)> {
+    pub fn freeze(&self) -> Vec<(u64, u8, Backend, u32)> {
+        // The 4th element is the Signature's training volume (`total_pulls`)
+        // — J5-A's volume-selective Arena demotion needs it at freeze time
+        // to tell a heavy burst site (demote: it would exhaust the arena and
+        // storm) from a light one (keep: bump-speed win, never fills). See
+        // `AllocatorState::freeze`.
         self.stats
             .iter()
             .map(|(sig, stats)| {
                 let best = backend_from_index(Self::best_arm_index(stats));
                 let key = crate::state::combine_hash_size_class(sig.caller_pc, sig.size_class);
-                (key, sig.size_class, best)
+                (key, sig.size_class, best, stats.total_pulls)
             })
             .collect()
     }
@@ -357,30 +362,34 @@ impl BanditPolicy {
     /// table, so distillation never changes a routing decision, it only makes
     /// the unambiguous ones cheaper to reach. Returned as the same
     /// `(combined_key, size_class, backend)` triples `freeze` uses.
-    pub fn distill(&self) -> Vec<(u64, u8, Backend)> {
-        // (one_frame, size_class) -> agreed backend so far, or None once a
-        // conflicting backend proves the group ambiguous.
-        let mut groups: BTreeMap<(u64, u8), Option<Backend>> = BTreeMap::new();
+    pub fn distill(&self) -> Vec<(u64, u8, Backend, u32)> {
+        // (one_frame, size_class) -> (agreed backend so far — None once a
+        // conflicting backend proves the group ambiguous — and the group's
+        // summed training volume). Summing `total_pulls` across the group
+        // means a hot 3-frame site distilled together with cold siblings
+        // still reads as heavy to J5-A's volume-selective Arena demotion —
+        // the pin cache serves this table with no further checks, so its
+        // demotion decision must be at least as conservative as main's.
+        let mut groups: BTreeMap<(u64, u8), (Option<Backend>, u64)> = BTreeMap::new();
         for (sig, stats) in self.stats.iter() {
             if stats.one_frame == 0 {
                 continue; // unknown leaf hash → cannot distill
             }
             let best = backend_from_index(Self::best_arm_index(stats));
-            groups
+            let entry = groups
                 .entry((stats.one_frame, sig.size_class))
-                .and_modify(|agreed| {
-                    if *agreed != Some(best) {
-                        *agreed = None; // conflicting context → ambiguous
-                    }
-                })
-                .or_insert(Some(best));
+                .or_insert((Some(best), 0));
+            if entry.0 != Some(best) {
+                entry.0 = None; // conflicting context → ambiguous
+            }
+            entry.1 += stats.total_pulls as u64;
         }
         groups
             .into_iter()
-            .filter_map(|((one_frame, size_class), agreed)| {
+            .filter_map(|((one_frame, size_class), (agreed, pulls))| {
                 agreed.map(|backend| {
                     let key = crate::state::combine_hash_size_class(one_frame, size_class);
-                    (key, size_class, backend)
+                    (key, size_class, backend, pulls.min(u32::MAX as u64) as u32)
                 })
             })
             .collect()
@@ -504,10 +513,14 @@ mod tests {
 
         let distilled = bandit.distill();
         assert_eq!(distilled.len(), 1, "only the unambiguous group distills");
-        let (key, size_class, backend) = distilled[0];
+        let (key, size_class, backend, pulls) = distilled[0];
         assert_eq!(key, crate::state::combine_hash_size_class(LEAF_A, 0));
         assert_eq!(size_class, 0);
         assert_eq!(backend, Backend::Buddy);
+        assert!(
+            pulls > 0,
+            "distilled entry must carry the group's summed training volume"
+        );
     }
 
     #[test]
@@ -669,8 +682,10 @@ mod tests {
         let large_key = crate::state::combine_hash_size_class(777, 12);
         assert_ne!(small_key, large_key, "combined keys must differ");
 
-        let map: std::collections::HashMap<u64, Backend> =
-            frozen.into_iter().map(|(k, _sc, b)| (k, b)).collect();
+        let map: std::collections::HashMap<u64, Backend> = frozen
+            .into_iter()
+            .map(|(k, _sc, b, _pulls)| (k, b))
+            .collect();
         assert_eq!(map.get(&small_key), Some(&Backend::Slab));
         assert_eq!(map.get(&large_key), Some(&Backend::Buddy));
 
