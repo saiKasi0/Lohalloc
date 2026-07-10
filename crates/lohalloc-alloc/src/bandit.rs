@@ -51,11 +51,26 @@
 //! `PerfectHashTable`, the hot path touches only the read-only table (an
 //! O(1) minimal perfect hash lookup), which is zero-allocation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use lohalloc_core::{Backend, Signature};
 
 use crate::tune::TrainingConfig;
+
+/// One diagnostic row of the shadow fine map:
+/// `(caller_pc, size_class, ctx, pulls[4], means[4])`.
+pub type FineSnapshotRow = (u64, u8, u8, [u32; 4], [f64; 4]);
+
+/// Minimum observations of a fine `(Signature, ctx)` arm before its verdict
+/// may override the coarse entry at freeze time. Below this, a divergent
+/// mean is more likely cold-start noise than a real contextual effect.
+pub(crate) const FINE_MIN_PULLS: u32 = 32;
+
+/// Minimum mean-reward margin (fine best arm vs. the coarse verdict's arm,
+/// both measured *within the same ctx*) required to emit a fine entry.
+/// Guards table bloat: a fine entry that ties the coarse verdict buys
+/// nothing but an extra inference probe.
+pub(crate) const FINE_MARGIN: f64 = 0.05;
 
 // The former hard-coded constants (`EXPLORATION_C = 2.0`,
 // `HYSTERESIS_PENALTY = 0.15`, `BASELINE_REWARDS = [1.0, 0.8, 0.3, 0.9]`)
@@ -130,6 +145,45 @@ impl SignatureStats {
     }
 }
 
+/// Passive per-arm shadow statistics for one `(Signature, ctx)` — no
+/// hysteresis, no `last_choice`: the fine map never routes during training
+/// (routing stays purely coarse, byte-identical to the pre-context policy);
+/// it only *observes* which backend the coarse policy used under which
+/// history context and what it cost. `pulls` here counts weighted reward
+/// observations, not selections.
+#[derive(Clone, Debug, Default)]
+struct FineStats {
+    sum_reward: [f64; 4],
+    pulls: [u32; 4],
+}
+
+impl FineStats {
+    fn mean(&self, arm: usize) -> f64 {
+        if self.pulls[arm] == 0 {
+            return 0.0;
+        }
+        self.sum_reward[arm] / self.pulls[arm] as f64
+    }
+}
+
+/// The freeze-time output of the shadow fine map (see
+/// [`BanditPolicy::freeze_fine`]).
+pub struct FineFreeze {
+    /// `(fine_key, coarse_key, size_class, backend)` — `fine_key` is
+    /// `combine_key_ctx(coarse_key, ctx)`; `coarse_key` rides along so the
+    /// caller can apply the parent's Arena-demotion (heavy) verdict to the
+    /// fine entry.
+    pub entries: Vec<(u64, u64, u8, Backend)>,
+    /// Coarse combined keys that received at least one fine entry — their
+    /// main-table entries get `FLAG_HAS_CONTEXT`.
+    pub flagged: BTreeSet<u64>,
+    /// `(one_frame, size_class)` groups containing a flagged Signature —
+    /// must be EXCLUDED from the distilled table: the pin cache serves
+    /// distilled verdicts with no further checks, so a pinned
+    /// context-routed site would silently bypass the ctx probe.
+    pub flagged_frames: BTreeSet<(u64, u8)>,
+}
+
 /// The Multi-Armed Bandit policy. Owns per-Signature statistics and selects
 /// the best backend for each allocation during Training mode.
 ///
@@ -137,6 +191,14 @@ impl SignatureStats {
 /// a flat `(hash, backend)` mapping for the `PerfectHashTable`.
 pub struct BanditPolicy {
     stats: BTreeMap<Signature, SignatureStats>,
+    /// Phase-1 shadow fine map: per-`(Signature, ctx)` observation
+    /// statistics (see [`FineStats`]). Fed alloc-side only — the dealloc
+    /// reward path has no context (the history register at *alloc* time is
+    /// what routing would see; it is gone by dealloc time). On-policy
+    /// caveat: fine arms only observe backends the coarse policy actually
+    /// chose under that ctx, so coverage of non-chosen arms comes from
+    /// UCB1's residual exploration.
+    fine: BTreeMap<(Signature, u8), FineStats>,
 }
 
 impl Default for BanditPolicy {
@@ -150,6 +212,7 @@ impl BanditPolicy {
     pub fn new() -> Self {
         Self {
             stats: BTreeMap::new(),
+            fine: BTreeMap::new(),
         }
     }
 
@@ -158,6 +221,7 @@ impl BanditPolicy {
     pub const fn new_const() -> Self {
         Self {
             stats: BTreeMap::new(),
+            fine: BTreeMap::new(),
         }
     }
 
@@ -271,6 +335,26 @@ impl BanditPolicy {
         // `weight` of them since the last flush). We don't double-count.
     }
 
+    /// Phase-1 shadow fine update: record a weighted reward observation for
+    /// `(sig, ctx, backend)`. Purely passive — never consulted by
+    /// `select()`, so training routing stays byte-identical; the fine map
+    /// only matters at [`freeze_fine`](Self::freeze_fine) time. Unlike
+    /// `update_weighted`, `pulls` is counted here (there is no `select()`
+    /// counting fine pulls).
+    pub fn update_fine(
+        &mut self,
+        sig: Signature,
+        ctx: u8,
+        backend: Backend,
+        reward: f64,
+        weight: u32,
+    ) {
+        let entry = self.fine.entry((sig, ctx)).or_default();
+        let i = backend as usize;
+        entry.sum_reward[i] += reward * weight as f64;
+        entry.pulls[i] += weight;
+    }
+
     /// True once every observed Signature's routing has stabilized — the
     /// trigger for `freeze_mode=converged` (checked by the embedding layer
     /// every few ops; the bandit never freezes itself).
@@ -345,6 +429,70 @@ impl BanditPolicy {
                 (key, sig.size_class, best, stats.total_pulls)
             })
             .collect()
+    }
+
+    /// Phase-1 hierarchical freeze, fine layer: for every observed
+    /// `(Signature, ctx)`, decide whether the context's evidence justifies a
+    /// fine entry that OVERRIDES the coarse verdict at inference time.
+    ///
+    /// `coarse_final` maps each coarse combined key to its FINAL (clamped,
+    /// possibly Arena-demoted) verdict — the comparison must run against
+    /// what inference will actually serve, not the raw bandit argmax, or a
+    /// fine entry could be emitted that merely re-states a pre-clamp
+    /// verdict.
+    ///
+    /// Emission criteria (all must hold — see [`FINE_MIN_PULLS`] /
+    /// [`FINE_MARGIN`]):
+    /// 1. the fine best arm has ≥ `FINE_MIN_PULLS` weighted observations,
+    /// 2. the coarse verdict's arm was ALSO observed within this ctx
+    ///    (otherwise the means aren't comparable),
+    /// 3. the fine best differs from the coarse verdict,
+    /// 4. its mean beats the coarse verdict's *within-ctx* mean by
+    ///    ≥ `FINE_MARGIN`.
+    ///
+    /// A coarse key gaining any fine entry is flagged (`FLAG_HAS_CONTEXT`),
+    /// and its `(one_frame, size_class)` group is reported for exclusion
+    /// from the distilled table (the pin cache must never serve a
+    /// context-routed site).
+    pub fn freeze_fine(&self, coarse_final: &BTreeMap<u64, Backend>) -> FineFreeze {
+        let mut out = FineFreeze {
+            entries: Vec::new(),
+            flagged: BTreeSet::new(),
+            flagged_frames: BTreeSet::new(),
+        };
+        for ((sig, ctx), fine) in self.fine.iter() {
+            let coarse_key = crate::state::combine_hash_size_class(sig.caller_pc, sig.size_class);
+            let Some(&coarse_backend) = coarse_final.get(&coarse_key) else {
+                continue; // parent didn't freeze (shouldn't happen) — skip
+            };
+            // Best observed arm within this ctx.
+            let best = (0..4)
+                .max_by(|&a, &b| {
+                    fine.mean(a)
+                        .partial_cmp(&fine.mean(b))
+                        .unwrap_or(core::cmp::Ordering::Equal)
+                })
+                .unwrap_or(0);
+            let best_backend = backend_from_index(best);
+            let coarse_arm = coarse_backend as usize;
+            if fine.pulls[best] < FINE_MIN_PULLS
+                || fine.pulls[coarse_arm] == 0
+                || best_backend == coarse_backend
+                || fine.mean(best) - fine.mean(coarse_arm) < FINE_MARGIN
+            {
+                continue;
+            }
+            let fine_key = crate::state::combine_key_ctx(coarse_key, *ctx);
+            out.entries
+                .push((fine_key, coarse_key, sig.size_class, best_backend));
+            out.flagged.insert(coarse_key);
+            if let Some(stats) = self.stats.get(sig) {
+                if stats.one_frame != 0 {
+                    out.flagged_frames.insert((stats.one_frame, sig.size_class));
+                }
+            }
+        }
+        out
     }
 
     /// J2 distillation: the subset of call sites that route *unambiguously*
@@ -431,6 +579,25 @@ impl BanditPolicy {
             })
             .map(|(i, _)| i)
             .unwrap_or(0)
+    }
+
+    /// Diagnostic snapshot of the shadow fine map:
+    /// `(caller_pc, size_class, ctx, pulls[4], means[4])` per observed
+    /// `(Signature, ctx)`. Test/route-metrics introspection only.
+    #[cfg(any(feature = "route-metrics", test))]
+    pub fn fine_snapshot(&self) -> Vec<FineSnapshotRow> {
+        self.fine
+            .iter()
+            .map(|((sig, ctx), f)| {
+                (
+                    sig.caller_pc,
+                    sig.size_class,
+                    *ctx,
+                    f.pulls,
+                    [f.mean(0), f.mean(1), f.mean(2), f.mean(3)],
+                )
+            })
+            .collect()
     }
 
     /// Number of distinct signatures observed.
@@ -735,6 +902,41 @@ mod tests {
         let bandit = BanditPolicy::new();
         assert!(bandit.is_empty());
         assert_eq!(bandit.len(), 0);
+    }
+
+    #[test]
+    fn freeze_fine_emits_only_significant_divergent_contexts() {
+        let mut bandit = BanditPolicy::new();
+        let s = sig(900);
+
+        // Coarse: Slab wins overall.
+        for _ in 0..100 {
+            let b = bandit.select(s);
+            bandit.update(s, b, if b == Backend::Slab { 1.0 } else { 0.1 });
+        }
+        // ctx 7: Arena decisively better, BOTH arms observed, enough pulls.
+        bandit.update_fine(s, 7, Backend::Arena, 0.9, FINE_MIN_PULLS);
+        bandit.update_fine(s, 7, Backend::Slab, 0.2, FINE_MIN_PULLS);
+        // ctx 3: Arena better but UNDER the pull threshold → not emitted.
+        bandit.update_fine(s, 3, Backend::Arena, 0.9, FINE_MIN_PULLS - 1);
+        bandit.update_fine(s, 3, Backend::Slab, 0.2, FINE_MIN_PULLS);
+        // ctx 5: Arena "better" but within the margin → not emitted.
+        bandit.update_fine(s, 5, Backend::Arena, 0.50, FINE_MIN_PULLS);
+        bandit.update_fine(s, 5, Backend::Slab, 0.49, FINE_MIN_PULLS);
+        // ctx 9: coarse arm never observed in-ctx → not comparable → skip.
+        bandit.update_fine(s, 9, Backend::Arena, 0.9, FINE_MIN_PULLS);
+
+        let coarse_key = crate::state::combine_hash_size_class(900, 0);
+        let final_map: BTreeMap<u64, Backend> = [(coarse_key, Backend::Slab)].into_iter().collect();
+        let fine = bandit.freeze_fine(&final_map);
+
+        assert_eq!(fine.entries.len(), 1, "only ctx 7 qualifies");
+        let (fine_key, parent, sc, backend) = fine.entries[0];
+        assert_eq!(parent, coarse_key);
+        assert_eq!(sc, 0);
+        assert_eq!(backend, Backend::Arena);
+        assert_eq!(fine_key, crate::state::combine_key_ctx(coarse_key, 7));
+        assert!(fine.flagged.contains(&coarse_key));
     }
 
     #[test]

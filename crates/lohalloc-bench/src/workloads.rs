@@ -747,3 +747,48 @@ mod tests {
         workload_phase_lifetime(&h, hashes::W_PHASE_A, hashes::W_PHASE_B, 2000);
     }
 }
+
+#[cfg(all(test, feature = "route-metrics"))]
+mod ctx_diag {
+    use super::*;
+    use lohalloc_core::Backend;
+
+    /// Diagnostic (run explicitly with --ignored --nocapture): what does the
+    /// hierarchical freeze actually emit after a phase_lifetime training
+    /// pass, and where does the frozen run route?
+    #[test]
+    #[ignore]
+    fn dump_trained_frozen_phase_model() {
+        let h = HarnessDriver::new();
+        workload_phase_lifetime(&h, hashes::W_PHASE_A, hashes::W_PHASE_A, 10_000);
+        eprintln!("== fine map before freeze (hash, sc, ctx, pulls[S,B,Sy,A], means):");
+        let mut snap = h.alloc.fine_snapshot();
+        snap.sort_by_key(|&(_, _, ctx, _, _)| ctx);
+        for (hash, sc, ctx, pulls, means) in snap {
+            eprintln!(
+                "  {hash:#x} sc={sc} ctx={ctx:2} ({ctx:04b}) pulls={pulls:?} means=[{:.3},{:.3},{:.3},{:.3}]",
+                means[0], means[1], means[2], means[3]
+            );
+        }
+        h.alloc.reset_arena();
+        h.alloc.freeze();
+        let bytes = h.alloc.export().expect("frozen");
+        let main = lohalloc_alloc::perfect_hash::PerfectHashTable::deserialize(&bytes)
+            .expect("valid model");
+        eprintln!("== main entries (hash, sc, backend, flags):");
+        for (hash, sc, backend, flags) in main.entries_flagged() {
+            eprintln!("  {hash:#018x} sc={sc} {backend:?} flags={flags}");
+        }
+        // Frozen re-run: where do ops actually land?
+        workload_phase_lifetime(&h, hashes::W_PHASE_A, hashes::W_PHASE_A, 10_000);
+        eprintln!(
+            "== frozen re-run served: slab={} buddy={} system={} arena={} fallthrough={} pht_misses={}",
+            lohalloc_alloc::Lohalloc::route_count(Backend::Slab),
+            lohalloc_alloc::Lohalloc::route_count(Backend::Buddy),
+            lohalloc_alloc::Lohalloc::route_count(Backend::System),
+            lohalloc_alloc::Lohalloc::route_count(Backend::Arena),
+            lohalloc_alloc::Lohalloc::fallthrough_count(),
+            lohalloc_alloc::Lohalloc::pht_miss_count(),
+        );
+    }
+}

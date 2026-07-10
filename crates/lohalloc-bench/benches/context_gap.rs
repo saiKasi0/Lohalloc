@@ -110,6 +110,27 @@ where
             BatchSize::PerIteration,
         );
     });
+    // Phase-1 accountability row: train (one hash — the real single-site
+    // view), freeze, then measure the FROZEN run. With the shadow fine
+    // bandit + hierarchical freeze, this is where a learned contextual
+    // policy shows up (or doesn't). The pre-freeze `reset_arena` marks the
+    // training/measurement cluster boundary: without it, a reset-free
+    // training pass makes freeze() demote heavy Arena verdicts — including
+    // the fine overrides the contextual learner just discovered
+    // (occupancy-aware demotion is the Phase-2 answer; see COPILOT.md).
+    group.bench_function("trained_frozen", |bch| {
+        bch.iter_batched(
+            || {
+                let h = HarnessDriver::new();
+                run(&h, hash_a, hash_a);
+                h.alloc.reset_arena();
+                h.alloc.freeze();
+                h
+            },
+            |h| run(&h, hash_a, hash_a),
+            BatchSize::PerIteration,
+        );
+    });
     group.finish();
 }
 

@@ -285,6 +285,15 @@ pub struct Lohalloc {
     /// `freeze()`/`load()` (which already touch the state lock) — a single
     /// relaxed atomic load costs far less than a `Mutex` lock/unlock pair.
     frozen: CachePadded<AtomicBool>,
+    /// Phase-1 context routing: whether the per-thread allocation-history
+    /// register ([`AHR`]) is maintained on the hot paths. `true` in Training
+    /// (the shadow fine bandit needs history); after `freeze()`/`load()` it
+    /// stays `true` only if the frozen main table carries any
+    /// `FLAG_HAS_CONTEXT` entry — an inference run with no context-routed
+    /// site pays exactly one relaxed bool load per alloc/dealloc and zero
+    /// TLS traffic. Read-hot, written once per mode transition — padded
+    /// like the other read gates (J5-B1).
+    ahr_on: CachePadded<AtomicBool>,
     /// Retention cache for large System-backend mappings (see
     /// `system::SystemCache`): freed 1 MiB+ mappings are kept populated and
     /// reused instead of munmap'd, matching (and beating) glibc's
@@ -532,6 +541,69 @@ fn record_slab_central_refill(_steps: u64, _sibling_hit: bool) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase-1 context routing: the per-thread Allocation-History Register (AHR).
+//
+// A gshare-style global history register (branch-predictor import): one bit
+// per allocator event — `1` per alloc, `0` per dealloc, LSB = most recent.
+// The low [`CTX_BITS`] bits are the routing context: a churn regime reads as
+// alternating `…1010`, a burst regime as a run of `…1111` — separable even
+// when every allocation has the *same* size class (which is exactly where
+// `(site, size_class)` routing is structurally blind; size-class history
+// would carry zero signal there). The context feeds two places:
+//
+// - Training: the shadow fine bandit (`BanditPolicy::update_fine`) learns
+//   per-`(Signature, ctx)` reward statistics from alloc-side rewards.
+// - Inference: a coarse main-table hit whose entry carries
+//   `FLAG_HAS_CONTEXT` probes `combine_key_ctx(key, ctx)` for a fine
+//   verdict (see `FrozenRouting::route_main`).
+//
+// Zero-allocation: a dtor-free `Cell<u64>` TLS (magazine pattern), shift+or
+// per event (~1-2ns), gated behind `Lohalloc::ahr_on` so an inference run
+// with no context-routed sites pays one relaxed bool load and no TLS
+// traffic. NOTE: the register is process-wide per *thread*, shared across
+// `Lohalloc` instances — history is a property of the thread's allocation
+// stream, and training/inference consistency only requires that reads and
+// pushes happen at the same points in both modes (they do: ctx is read
+// before the current alloc's push; deallocs push but never read).
+// ---------------------------------------------------------------------------
+
+/// Number of history bits in the routing context (16 context values).
+pub(crate) const CTX_BITS: u32 = 4;
+/// Low-bits mask selecting the context from the register.
+pub(crate) const CTX_MASK: u64 = (1 << CTX_BITS) - 1;
+
+thread_local! {
+    /// The allocation-history register: event bits, LSB = most recent.
+    static AHR: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Read this thread's routing context, then push the current alloc's event
+/// bit. Read-before-push is load-bearing: the context describes the history
+/// *before* this allocation, identically in training and inference.
+#[inline(always)]
+fn ahr_ctx_and_push_alloc() -> u8 {
+    AHR.with(|a| {
+        let v = a.get();
+        a.set((v << 1) | 1);
+        (v & CTX_MASK) as u8
+    })
+}
+
+/// Push an alloc event without reading the context (paths that never
+/// context-probe, e.g. the pin-cache-served fast path — their events are
+/// still part of every other site's history).
+#[inline(always)]
+fn ahr_push_alloc() {
+    AHR.with(|a| a.set((a.get() << 1) | 1));
+}
+
+/// Push a dealloc event (`0` bit).
+#[inline(always)]
+fn ahr_push_dealloc() {
+    AHR.with(|a| a.set(a.get() << 1));
+}
+
 impl Default for Lohalloc {
     fn default() -> Self {
         Self::new()
@@ -654,6 +726,8 @@ impl Lohalloc {
             // Decision Engine starts in Training mode.
             state: Mutex::new(state::AllocatorState::new_training_const()),
             frozen: CachePadded::new(AtomicBool::new(false)),
+            // Training maintains the history register from the first alloc.
+            ahr_on: CachePadded::new(AtomicBool::new(true)),
             system_cache: core::cell::UnsafeCell::new(system::SystemCache::new()),
             system_cache_lock: CachePadded::new(AtomicBool::new(false)),
             system_cache_hits: CachePadded::new(AtomicU64::new(0)),
@@ -1068,6 +1142,14 @@ unsafe impl GlobalAlloc for Lohalloc {
         if ptr.is_null() {
             return;
         }
+        // Phase-1 context: every dealloc is a `0` event in this thread's
+        // allocation-history register (churn vs. burst regimes differ
+        // precisely in their dealloc interleaving). Before any early
+        // return so headerless frees count too; gated to one relaxed load
+        // when no context routing is active.
+        if self.ahr_on.load(Ordering::Relaxed) {
+            ahr_push_dealloc();
+        }
         // Header-free fast path: must run BEFORE any header read — a
         // headerless block's `ptr - HEADER_SIZE` is not valid header
         // memory (see `headerless_class_for`'s doc).
@@ -1290,6 +1372,13 @@ impl Lohalloc {
                     match pin_probe(table, ret0, size_class) {
                         PinProbe::Pinned(backend) => {
                             record_pin_hit();
+                            // Pinned sites are never context-routed (freeze
+                            // excludes flagged sites from the distilled
+                            // table), but their alloc is still part of every
+                            // other site's history — push, don't read.
+                            if self.ahr_on.load(Ordering::Relaxed) {
+                                ahr_push_alloc();
+                            }
                             // Header hash = sentinel (0): in Inference the
                             // header's hash is telemetry-only (no reward
                             // bookkeeping), same degradation as a failed
@@ -1355,6 +1444,19 @@ impl Lohalloc {
     ) -> *mut u8 {
         let size_class = state::size_class_for(size);
 
+        // Phase-1 context: read this thread's history context and push the
+        // current alloc's event bit — gated so an inference run with no
+        // context-routed sites pays one relaxed bool load and zero TLS
+        // traffic. Read-before-push (the context is the history *before*
+        // this allocation) and unconditional-per-alloc-when-gated (every
+        // alloc is part of every later alloc's history) are both
+        // load-bearing for training/inference hash-identity — C6 class.
+        let ctx = if self.ahr_on.load(Ordering::Relaxed) {
+            Some(ahr_ctx_and_push_alloc())
+        } else {
+            None
+        };
+
         // Inference fast path: the frozen table is immutable and published
         // via an atomic pointer, so a frozen allocator routes with zero
         // locks on the decision plane (the serving backend's own Mutex is
@@ -1366,7 +1468,7 @@ impl Lohalloc {
             // and never freed while non-null (see `frozen_table`'s doc —
             // `reset_to_training` nulls the pointer and leaks the table).
             let key = state::combine_hash_size_class(hash, size_class);
-            let backend = match unsafe { (*table).main.lookup(key) } {
+            let backend = match unsafe { (*table).route_main(key, ctx) } {
                 Some(b) => b,
                 None => {
                     // Miss-only counter: the hit path pays nothing extra.
@@ -1438,6 +1540,12 @@ impl Lohalloc {
             Self::with_realloc_guard(|| {
                 if let Ok(mut st) = self.state.lock() {
                     st.record_latency(hash, backend, size_class, latency_ns, total);
+                    // Phase-1 shadow fine observation (alloc-side only —
+                    // dealloc has no ctx). Same lock section, one extra
+                    // BTreeMap upsert per training op.
+                    if let Some(c) = ctx {
+                        st.record_fine_latency(hash, backend, size_class, c, latency_ns, total);
+                    }
                 }
             });
         }
@@ -2426,9 +2534,31 @@ impl Lohalloc {
     /// instance is the process's global allocator.
     fn publish_frozen_table(&self, state: &state::AllocatorState) {
         if let Some(routing) = state.routing() {
+            // Phase-1: keep maintaining the history register only if the
+            // frozen model actually context-routes something; otherwise an
+            // inference run pays one relaxed load per alloc/dealloc and no
+            // TLS traffic. Decided BEFORE publishing the table so no alloc
+            // can observe a flagged table with the register disabled.
+            self.ahr_on
+                .store(routing.has_context_entries(), Ordering::Relaxed);
             let leaked: *mut perfect_hash::FrozenRouting = Box::leak(Box::new(routing.clone()));
             self.frozen_table.store(leaked, Ordering::Release);
         }
+    }
+
+    /// Diagnostic snapshot of the Phase-1 shadow fine map (see
+    /// `BanditPolicy::fine_snapshot`): `(caller_pc, size_class, ctx,
+    /// pulls[4], means[4])`. Test/route-metrics introspection only; empty
+    /// in Inference mode.
+    #[cfg(any(feature = "route-metrics", test))]
+    pub fn fine_snapshot(&self) -> Vec<bandit::FineSnapshotRow> {
+        Self::with_realloc_guard(|| {
+            if let Ok(state) = self.state.lock() {
+                state.fine_snapshot()
+            } else {
+                Vec::new()
+            }
+        })
     }
 
     /// Snapshot the current "best backend per Signature" without
@@ -2473,6 +2603,9 @@ impl Lohalloc {
             }
         });
         self.frozen.store(false, Ordering::Release);
+        // Training always maintains the history register (the shadow fine
+        // bandit needs it).
+        self.ahr_on.store(true, Ordering::Relaxed);
     }
 
     /// Export the frozen routing table to `.lohalloc` binary bytes.
@@ -4371,6 +4504,67 @@ mod integration_tests {
         for (ncpus, want) in [(1, 8), (4, 8), (8, 8), (10, 16), (16, 16), (64, 32)] {
             assert_eq!(stripe_count(None, ncpus), want, "ncpus={ncpus}");
         }
+    }
+
+    #[test]
+    fn loaded_ctx_model_routes_by_real_history_register() {
+        // Phase-1 end-to-end, deterministic: a hand-built v4 model with a
+        // FLAG_HAS_CONTEXT coarse entry (Slab) and one fine sibling at
+        // ctx 15 (Arena) is load()ed, then the REAL per-thread history
+        // register decides routing. Each test runs on its own thread, so
+        // the register starts at 0, and only this instance's ops push
+        // events (the test harness's own Vec allocations go through the
+        // process global allocator, never this instance).
+        const H: u64 = 0x77AA_0001; // the context-routed site
+        const F: u64 = 0x77AA_0002; // filler site (not in the model)
+        let size = 64usize;
+        let sc = state::size_class_for(size);
+        let key = state::combine_hash_size_class(H, sc);
+        let table = perfect_hash::PerfectHashTable::from_entries_flagged(vec![
+            (
+                key,
+                sc,
+                lohalloc_core::Backend::Slab,
+                perfect_hash::FLAG_HAS_CONTEXT,
+            ),
+            (
+                state::combine_key_ctx(key, 15),
+                sc,
+                lohalloc_core::Backend::Arena,
+                0,
+            ),
+        ]);
+        let h = Box::new(Lohalloc::new());
+        assert!(h.load(&table.serialize()), "v4 model must load");
+
+        let layout = Layout::from_size_align(size, 16).unwrap();
+        // Burst history: 4 held allocs -> register 0b1111 -> ctx 15.
+        let held: Vec<*mut u8> = (0..4)
+            .map(|_| unsafe { h.alloc_with_hash(layout, F) })
+            .collect();
+        let p_burst = unsafe { h.alloc_with_hash(layout, H) };
+        assert_eq!(
+            unsafe { h.backend_for_ptr(p_burst) },
+            Some(lohalloc_core::Backend::Arena),
+            "ctx 15 (burst history) must take the fine Arena override"
+        );
+        unsafe { h.dealloc_with_hash(p_burst, layout) };
+        for p in held {
+            unsafe { h.dealloc_with_hash(p, layout) };
+        }
+        // Churn history: alloc/free alternation -> register ...1010 ->
+        // ctx 10 -> fine miss -> coarse Slab.
+        for _ in 0..2 {
+            let p = unsafe { h.alloc_with_hash(layout, F) };
+            unsafe { h.dealloc_with_hash(p, layout) };
+        }
+        let p_churn = unsafe { h.alloc_with_hash(layout, H) };
+        assert_eq!(
+            unsafe { h.backend_for_ptr(p_churn) },
+            Some(lohalloc_core::Backend::Slab),
+            "ctx 10 (churn history) must fall back to the coarse verdict"
+        );
+        unsafe { h.dealloc_with_hash(p_churn, layout) };
     }
 
     #[test]

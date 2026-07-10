@@ -32,7 +32,7 @@
 //! a `.lohalloc` file and starts in Inference mode. See `perfect_hash.rs` for
 //! the binary format.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use lohalloc_core::{slab_class_for, Backend, Signature};
 
@@ -82,6 +82,20 @@ pub fn combine_hash_size_class(hash: u64, size_class: u8) -> u64 {
         .rotate_left(17)
 }
 
+/// Phase-1 context routing: derive the FINE routing key from a coarse
+/// combined key and the allocation-history context (see `lib.rs`'s `AHR`).
+/// Same shape as [`combine_hash_size_class`] with a different odd multiplier
+/// and rotation so ctx-mixing and size-class-mixing never produce structured
+/// collisions; `ctx + 1` so ctx `0` still lands away from the coarse key.
+/// Both frozen sections (coarse + fine) live in ONE perfect hash table —
+/// this key derivation is what keeps them distinct.
+#[inline]
+pub fn combine_key_ctx(key: u64, ctx: u8) -> u64 {
+    key ^ (ctx as u64 + 1)
+        .wrapping_mul(0xD6E8_FEB8_6659_FD93)
+        .rotate_left(23)
+}
+
 /// One in-flight reward batch for a (Signature, Backend) arm — raw latency
 /// and fragmentation sums awaiting enough samples to convert to a reward.
 #[derive(Clone, Copy, Default)]
@@ -117,12 +131,19 @@ struct PendingBatch {
 #[derive(Default)]
 pub struct PendingRewards {
     batches: BTreeMap<(Signature, u8), PendingBatch>,
+    /// Phase-1 shadow fine batches, keyed `(Signature, backend, ctx)`.
+    /// DELIBERATELY separate from `batches`: folding ctx into the coarse
+    /// key would split coarse batches 16 ways and change their flush
+    /// cadence — coarse training must stay byte-identical to the
+    /// pre-context policy. Fed alloc-side only (dealloc has no ctx).
+    fine_batches: BTreeMap<(Signature, u8, u8), PendingBatch>,
 }
 
 impl PendingRewards {
     pub const fn new() -> Self {
         Self {
             batches: BTreeMap::new(),
+            fine_batches: BTreeMap::new(),
         }
     }
 }
@@ -267,6 +288,47 @@ impl AllocatorState {
         }
     }
 
+    /// Phase-1 shadow fine reward: the alloc-side counterpart of
+    /// [`record_latency`](Self::record_latency), additionally keyed on the
+    /// allocation-history context. Called ONLY from the alloc path (the
+    /// dealloc path has no ctx — the history at alloc time is what routing
+    /// would have seen). Batching mirrors `record_latency` exactly; flushes
+    /// land in the bandit's passive fine map (`update_fine`), never
+    /// touching coarse routing.
+    pub fn record_fine_latency(
+        &mut self,
+        hash: u64,
+        backend: Backend,
+        size_class: u8,
+        ctx: u8,
+        latency_ns: u64,
+        total_bytes: usize,
+    ) {
+        if let Self::Training { bandit, pending } = self {
+            let sig = Signature::new(hash, size_class);
+            let cfg = crate::tune::config();
+            let frag_pct = if cfg.frag_weight > 0.0 {
+                crate::frag_pct_for(backend, total_bytes)
+            } else {
+                0.0
+            };
+            let batch = pending
+                .fine_batches
+                .entry((sig, backend as u8, ctx))
+                .or_default();
+            batch.latency_sum += latency_ns;
+            batch.frag_sum += frag_pct;
+            batch.count += 1;
+            if batch.count >= cfg.reward_batch {
+                let mean_latency = batch.latency_sum / batch.count as u64;
+                let mean_frag = batch.frag_sum / batch.count as f32;
+                let reward = shaped_reward(mean_latency, mean_frag, cfg);
+                bandit.update_fine(sig, ctx, backend, reward, batch.count);
+                pending.fine_batches.remove(&(sig, backend as u8, ctx));
+            }
+        }
+    }
+
     /// True when this state's routing has stabilized enough to freeze —
     /// the `freeze_mode=converged` trigger, forwarded to
     /// [`BanditPolicy::is_converged`] with the configured thresholds.
@@ -326,7 +388,9 @@ impl AllocatorState {
                 // distilled with no further checks). `total_all` is computed
                 // per table — main counts every signature, distilled only
                 // the unambiguous groups — so each table's fractions are
-                // self-consistent.
+                // self-consistent. Returns the per-entry `heavy` verdict
+                // alongside so the fine layer can inherit its parent's
+                // Arena-demotion decision.
                 let clamp = |entries: Vec<(u64, u8, lohalloc_core::Backend, u32)>| {
                     let total_all: u64 = entries.iter().map(|&(_, _, _, p)| p as u64).sum();
                     entries
@@ -342,12 +406,77 @@ impl AllocatorState {
                                     backend,
                                     demote_arena && heavy,
                                 ),
+                                heavy,
                             )
                         })
                         .collect::<Vec<_>>()
                 };
-                let main = PerfectHashTable::from_entries(clamp(bandit.freeze()));
-                let distilled = PerfectHashTable::from_entries(clamp(bandit.distill()));
+                let main_clamped = clamp(bandit.freeze());
+
+                // Phase-1 hierarchical freeze: the shadow fine map emits
+                // context-keyed overrides, compared against the FINAL
+                // (clamped) coarse verdicts; a fine Arena verdict inherits
+                // its parent's heavy/demotion decision; every fine entry
+                // passes the same unservable-verdict clamp.
+                let final_map: BTreeMap<u64, lohalloc_core::Backend> = main_clamped
+                    .iter()
+                    .map(|&(key, _, backend, _)| (key, backend))
+                    .collect();
+                let heavy_map: BTreeMap<u64, bool> = main_clamped
+                    .iter()
+                    .map(|&(key, _, _, heavy)| (key, heavy))
+                    .collect();
+                let fine = bandit.freeze_fine(&final_map);
+                // One pass: clamp each fine entry with its parent's heavy
+                // verdict; drop any whose clamped verdict collapses back to
+                // the parent's final backend (it would only buy an extra
+                // probe). A coarse key is flagged only if at least one of
+                // its fine entries SURVIVES — a flag with no fine siblings
+                // is one wasted probe per alloc at that site, forever.
+                let mut fine_entries: Vec<(u64, u8, lohalloc_core::Backend, u8)> = Vec::new();
+                let mut surviving_parents: BTreeSet<u64> = BTreeSet::new();
+                for &(fine_key, coarse_key, size_class, backend) in &fine.entries {
+                    let parent_heavy = heavy_map.get(&coarse_key).copied().unwrap_or(true);
+                    let clamped = clamp_backend_for_size_class(
+                        size_class,
+                        backend,
+                        demote_arena && parent_heavy,
+                    );
+                    if final_map.get(&coarse_key) == Some(&clamped) {
+                        continue;
+                    }
+                    fine_entries.push((fine_key, size_class, clamped, 0u8));
+                    surviving_parents.insert(coarse_key);
+                }
+
+                let mut main_quads: Vec<(u64, u8, lohalloc_core::Backend, u8)> = main_clamped
+                    .into_iter()
+                    .map(|(key, size_class, backend, _)| {
+                        let flags = if surviving_parents.contains(&key) {
+                            crate::perfect_hash::FLAG_HAS_CONTEXT
+                        } else {
+                            0
+                        };
+                        (key, size_class, backend, flags)
+                    })
+                    .collect();
+                main_quads.extend(fine_entries);
+                let main = PerfectHashTable::from_entries_flagged(main_quads);
+
+                // Distilled: exclude context-routed sites — the pin cache
+                // would serve them without the ctx probe.
+                let excluded: BTreeSet<u64> = fine
+                    .flagged_frames
+                    .iter()
+                    .map(|&(one_frame, sc)| combine_hash_size_class(one_frame, sc))
+                    .collect();
+                let distilled_entries: Vec<(u64, u8, lohalloc_core::Backend)> =
+                    clamp(bandit.distill())
+                        .into_iter()
+                        .filter(|(key, _, _, _)| !excluded.contains(key))
+                        .map(|(key, size_class, backend, _)| (key, size_class, backend))
+                        .collect();
+                let distilled = PerfectHashTable::from_entries(distilled_entries);
                 *self = Self::Inference {
                     routing: FrozenRouting { main, distilled },
                 };
@@ -368,6 +497,16 @@ impl AllocatorState {
     pub fn routing_snapshot(&self) -> Vec<(u64, Backend)> {
         match self {
             Self::Training { bandit, .. } => bandit.snapshot(),
+            Self::Inference { .. } => Vec::new(),
+        }
+    }
+
+    /// Diagnostic passthrough to [`BanditPolicy::fine_snapshot`] (empty in
+    /// Inference mode). Test/route-metrics introspection only.
+    #[cfg(any(feature = "route-metrics", test))]
+    pub fn fine_snapshot(&self) -> Vec<crate::bandit::FineSnapshotRow> {
+        match self {
+            Self::Training { bandit, .. } => bandit.fine_snapshot(),
             Self::Inference { .. } => Vec::new(),
         }
     }
@@ -929,6 +1068,79 @@ mod tests {
         let mut state = train_arena_locked(304, 64);
         state.freeze(true, 2.0);
         assert_eq!(state.route(304, 64), Backend::Arena);
+    }
+
+    #[test]
+    fn hierarchical_freeze_emits_flagged_coarse_plus_fine_and_probes_by_ctx() {
+        // Phase-1 end-to-end at the state level: coarse training settles on
+        // Slab; the shadow fine map observes Arena decisively winning under
+        // ctx 7 (fed through the real record_fine_latency batching). After
+        // freeze, the frozen routing must serve Slab everywhere EXCEPT
+        // ctx 7, where the fine entry overrides to Arena.
+        let hash = 4242u64;
+        let size = 64usize;
+        let sc = size_class_for(size);
+        let mut state = AllocatorState::new_training();
+        // Coarse: Slab fast (high reward), everything else slow.
+        for _ in 0..200 {
+            let b = state.route(hash, size);
+            let lat = if b == Backend::Slab { 1 } else { 20_000 };
+            state.record_latency(hash, b, sc, lat, size);
+        }
+        // Fine, ctx 7: Arena decisively faster than Slab. Enough samples to
+        // clear both the reward_batch flush (16) and FINE_MIN_PULLS (32).
+        for _ in 0..64 {
+            state.record_fine_latency(hash, Backend::Arena, sc, 7, 1, size);
+            state.record_fine_latency(hash, Backend::Slab, sc, 7, 20_000, size);
+        }
+        // demote_arena=false (resets observed): fine Arena verdicts survive.
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
+
+        let routing = state.routing().expect("inference");
+        let key = combine_hash_size_class(hash, sc);
+        // Unrelated ctx → coarse verdict.
+        assert_eq!(routing.route_main(key, Some(3)), Some(Backend::Slab));
+        // No register maintained → coarse verdict (degraded, correct).
+        assert_eq!(routing.route_main(key, None), Some(Backend::Slab));
+        // ctx 7 → the fine override.
+        assert_eq!(routing.route_main(key, Some(7)), Some(Backend::Arena));
+        // The coarse entry itself is flagged.
+        assert_eq!(
+            routing.main.lookup_with_flags(key).map(|(_, f)| f),
+            Some(crate::perfect_hash::FLAG_HAS_CONTEXT)
+        );
+        assert!(routing.has_context_entries());
+    }
+
+    #[test]
+    fn hierarchical_freeze_demotes_fine_arena_with_heavy_parent() {
+        // A fine Arena override on a HEAVY signature in a reset-free
+        // deployment must be demoted exactly like its parent would be —
+        // otherwise the ctx probe would re-open the J4 fallthrough storm
+        // through the fine path.
+        let hash = 4343u64;
+        let size = 64usize;
+        let sc = size_class_for(size);
+        let mut state = AllocatorState::new_training();
+        for _ in 0..200 {
+            let b = state.route(hash, size);
+            let lat = if b == Backend::Slab { 1 } else { 20_000 };
+            state.record_latency(hash, b, sc, lat, size);
+        }
+        for _ in 0..64 {
+            state.record_fine_latency(hash, Backend::Arena, sc, 7, 1, size);
+            state.record_fine_latency(hash, Backend::Slab, sc, 7, 20_000, size);
+        }
+        // demote_arena=true + fraction 0.0 → every signature is heavy →
+        // the fine Arena verdict clamps to Slab == parent → dropped, and
+        // with no surviving fine sibling the coarse entry must NOT be
+        // flagged (a flag with no siblings is a wasted probe forever).
+        state.freeze(true, 0.0);
+        let routing = state.routing().expect("inference");
+        let key = combine_hash_size_class(hash, sc);
+        assert_eq!(routing.route_main(key, Some(7)), Some(Backend::Slab));
+        assert_eq!(routing.main.lookup_with_flags(key).map(|(_, f)| f), Some(0));
+        assert!(!routing.has_context_entries());
     }
 
     #[test]

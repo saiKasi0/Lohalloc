@@ -1435,7 +1435,11 @@ fn decode_routing_entries(bytes: &[u8]) -> Vec<(u64, String)> {
     }
 
     let version = read_u32_le(bytes, &mut pos);
-    if version != 3 {
+    // v4 (Phase-1 context routing) only repurposed the first padding byte
+    // as per-entry flags — layout-identical for this decoder's purposes, so
+    // both v3 and v4 files decode here (the allocator itself accepts only
+    // the current version; this GUI-side decoder is best-effort).
+    if version != 3 && version != 4 {
         return Vec::new();
     }
 

@@ -45,12 +45,13 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let entries = table.entries();
+    let entries = table.entries_flagged();
     println!("# {} entries (main, 3-frame keys)", entries.len());
-    println!("# hash size_class backend");
+    println!("# hash size_class backend  ([ctx] = FLAG_HAS_CONTEXT: fine ctx siblings exist)");
     let mut by_backend: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for (hash, size_class, backend) in &entries {
-        println!("{hash:#018x} {size_class} {}", backend.as_str());
+    for (hash, size_class, backend, flags) in &entries {
+        let tag = if *flags != 0 { " [ctx]" } else { "" };
+        println!("{hash:#018x} {size_class} {}{tag}", backend.as_str());
         *by_backend.entry(backend.as_str()).or_insert(0) += 1;
     }
 
@@ -87,7 +88,7 @@ fn main() -> ExitCode {
     // caught immediately by inspection.
     let suspicious: Vec<_> = entries
         .iter()
-        .filter(|(_, size_class, backend)| *backend == Backend::System && *size_class <= 13)
+        .filter(|(_, size_class, backend, _)| *backend == Backend::System && *size_class <= 13)
         .collect();
     if !suspicious.is_empty() {
         println!(

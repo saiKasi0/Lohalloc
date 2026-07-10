@@ -105,22 +105,35 @@ use lohalloc_core::Backend;
 /// "LOHALLOC".
 const MAGIC: u64 = 0x434f4c4c41484f4c;
 
-/// Current serialization format version. Bumped to 3 in Ladder 6: the file
-/// now carries a second (distilled 1-frame) table — see the module doc's
-/// "Serialization" section. v2 keyed `hash` on
+/// Current serialization format version. Bumped to 4 for Phase-1 context
+/// routing: each entry now carries a `flags` byte (in the previously-zero
+/// first padding byte; see [`FLAG_HAS_CONTEXT`]). v3 added the distilled
+/// 1-frame table; v2 keyed `hash` on
 /// `combine_hash_size_class(caller_pc, size_class)` (unchanged for the main
-/// table); v1 keyed on the raw call-site hash.
-const VERSION: u32 = 3;
+/// table); v1 keyed on the raw call-site hash. Older versions are rejected
+/// outright — models are per-binary and regenerated per run.
+const VERSION: u32 = 4;
+
+/// Entry flag bit: this coarse `(site, size_class)` entry has fine
+/// context-keyed sibling entries — Inference should compute the
+/// allocation-history context and probe `combine_key_ctx(key, ctx)` before
+/// settling for this entry's backend (see `state::combine_key_ctx` and the
+/// Phase-1 context-routing design). Fine entries themselves carry no flags.
+pub const FLAG_HAS_CONTEXT: u8 = 1;
 
 /// One routing entry: a combined `(hash, size_class)` key
 /// (`state::combine_hash_size_class`) mapped to the backend that won the
 /// bandit's training for that signature. `size_class` is carried alongside
 /// the key for introspection/display only — lookups compare `hash` alone.
+/// `flags` (see [`FLAG_HAS_CONTEXT`]) shares the stored backend byte
+/// in-memory (`backend | flags << 2` — `Backend` needs only 2 bits), so
+/// carrying it costs zero bytes and zero extra loads on the hot path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Entry {
     hash: u64,
     backend: Backend,
     size_class: u8,
+    flags: u8,
 }
 
 /// Average keys per bucket in the primary CHD construction attempt.
@@ -152,10 +165,11 @@ fn fastrange(x: u64, n: usize) -> usize {
 /// Decode a stored backend discriminant byte. Kept as a free function so the
 /// hot `lookup` fast path and the cold `entry_backend_at` accessor share one
 /// definition (and so the `_` arm's `Arena` default lives in exactly one
-/// place).
+/// place). Masks to the low 2 bits: the stored byte's high bits carry the
+/// entry `flags` (see [`Entry`]).
 #[inline]
 fn backend_from_u8(b: u8) -> Backend {
-    match b {
+    match b & 0x3 {
         0 => Backend::Slab,
         1 => Backend::Buddy,
         2 => Backend::System,
@@ -178,7 +192,9 @@ fn pack(seeds: &[u32], slots: &[Entry]) -> Box<[u8]> {
     }
     for e in slots {
         buf.extend_from_slice(&e.hash.to_le_bytes());
-        buf.push(e.backend as u8);
+        // Backend in the low 2 bits, flags above — one byte, one load on
+        // the hot path for both (see `Entry`'s doc).
+        buf.push((e.backend as u8) | (e.flags << 2));
         buf.push(e.size_class);
     }
     buf.into_boxed_slice()
@@ -240,12 +256,24 @@ impl PerfectHashTable {
     /// Deduplicates first (last entry for a duplicate hash wins), then
     /// constructs the minimal perfect hash over the distinct keys.
     pub fn from_entries(triples: Vec<(u64, u8, Backend)>) -> Self {
-        let mut entries: Vec<Entry> = triples
+        Self::from_entries_flagged(
+            triples
+                .into_iter()
+                .map(|(hash, size_class, backend)| (hash, size_class, backend, 0))
+                .collect(),
+        )
+    }
+
+    /// [`from_entries`](Self::from_entries) plus a per-entry `flags` byte
+    /// (see [`FLAG_HAS_CONTEXT`]) — the Phase-1 context-routing freeze path.
+    pub fn from_entries_flagged(quads: Vec<(u64, u8, Backend, u8)>) -> Self {
+        let mut entries: Vec<Entry> = quads
             .into_iter()
-            .map(|(hash, size_class, backend)| Entry {
+            .map(|(hash, size_class, backend, flags)| Entry {
                 hash,
                 backend,
                 size_class,
+                flags,
             })
             .collect();
 
@@ -330,6 +358,7 @@ impl PerfectHashTable {
                 hash: 0,
                 backend: Backend::System,
                 size_class: 0,
+                flags: 0,
             };
             n
         ];
@@ -416,6 +445,35 @@ impl PerfectHashTable {
         }
     }
 
+    /// [`lookup`](Self::lookup) that also returns the entry's `flags` byte
+    /// (see [`FLAG_HAS_CONTEXT`]). Same single-load cost: backend and flags
+    /// share one stored byte, so the split is two register ops on a value
+    /// already loaded — the flag-less 99% case pays nothing it wasn't
+    /// already paying.
+    #[inline]
+    pub fn lookup_with_flags(&self, hash: u64) -> Option<(Backend, u8)> {
+        let n = self.num_slots;
+        if n == 0 {
+            return None;
+        }
+        let g = self.global_seed;
+        let m = self.num_buckets;
+        let base = self.buf.as_ptr();
+        // SAFETY: identical bounds argument to `lookup` above.
+        unsafe {
+            let bucket = fastrange(mix(hash, g), m);
+            let d = u32::from_le_bytes(*(base.add(bucket * 4) as *const [u8; 4])) as u64;
+            let slot = fastrange(mix(hash, g ^ d), n);
+            let eoff = m * 4 + slot * ENTRY_BYTES;
+            let stored = u64::from_le_bytes(*(base.add(eoff) as *const [u8; 8]));
+            if stored != hash {
+                return None;
+            }
+            let b = *base.add(eoff + 8);
+            Some((backend_from_u8(b), b >> 2))
+        }
+    }
+
     /// Number of routing entries.
     pub fn len(&self) -> usize {
         self.num_slots
@@ -432,16 +490,27 @@ impl PerfectHashTable {
     /// (see `Entry`'s doc): 0–11 are the Slab classes, 12/13 are Buddy,
     /// 14 is System.
     pub fn entries(&self) -> Vec<(u64, u8, Backend)> {
-        let mut out: Vec<(u64, u8, Backend)> = (0..self.num_slots)
+        self.entries_flagged()
+            .into_iter()
+            .map(|(hash, sc, backend, _flags)| (hash, sc, backend))
+            .collect()
+    }
+
+    /// [`entries`](Self::entries) plus each entry's `flags` byte — the
+    /// serialization path and flag-aware diagnostics.
+    pub fn entries_flagged(&self) -> Vec<(u64, u8, Backend, u8)> {
+        let mut out: Vec<(u64, u8, Backend, u8)> = (0..self.num_slots)
             .map(|slot| {
+                let b = self.buf[self.entry_offset(slot) + 8];
                 (
                     self.entry_hash_at(slot),
                     self.entry_size_class_at(slot),
                     self.entry_backend_at(slot),
+                    b >> 2,
                 )
             })
             .collect();
-        out.sort_by_key(|(hash, _, _)| *hash);
+        out.sort_by_key(|(hash, _, _, _)| *hash);
         out
     }
 
@@ -484,14 +553,45 @@ pub struct FrozenRouting {
 }
 
 impl FrozenRouting {
-    /// Serialize both tables to a v3 `.lohalloc` binary byte vector.
+    /// The Phase-1 context-aware main-table probe, shared by the lock-free
+    /// inference fast path (`lib.rs::route_alloc_inner`) and any locked
+    /// fallback. Coarse lookup first; only an entry carrying
+    /// [`FLAG_HAS_CONTEXT`] triggers the second (fine) probe — the
+    /// overwhelmingly common unflagged hit pays nothing beyond the two
+    /// register ops that split the already-loaded backend byte. `ctx` is
+    /// `None` when the caller isn't maintaining the history register
+    /// (gate off / no context anywhere in this model): flagged entries then
+    /// serve their coarse verdict, degraded but correct.
+    #[inline]
+    pub fn route_main(&self, key: u64, ctx: Option<u8>) -> Option<Backend> {
+        let (backend, flags) = self.main.lookup_with_flags(key)?;
+        if flags & FLAG_HAS_CONTEXT != 0 {
+            if let Some(c) = ctx {
+                if let Some(fine) = self.main.lookup(crate::state::combine_key_ctx(key, c)) {
+                    return Some(fine);
+                }
+            }
+        }
+        Some(backend)
+    }
+
+    /// True if any main-table entry carries [`FLAG_HAS_CONTEXT`] —
+    /// allocation-free scan (runs at `freeze()`/`load()` publish time to
+    /// decide whether inference must keep maintaining the history
+    /// register).
+    pub fn has_context_entries(&self) -> bool {
+        let t = &self.main;
+        (0..t.num_slots).any(|slot| t.buf[t.entry_offset(slot) + 8] >> 2 != 0)
+    }
+
+    /// Serialize both tables to a v4 `.lohalloc` binary byte vector.
     ///
     /// Entries are written sorted by hash so the output is deterministic
     /// (independent of which construction seed each MPHF landed on) — MPHF
     /// metadata is rebuilt at `deserialize()` time, never serialized.
     pub fn serialize(&self) -> Vec<u8> {
-        let main = self.main.entries(); // already sorted by hash
-        let distilled = self.distilled.entries();
+        let main = self.main.entries_flagged(); // already sorted by hash
+        let distilled = self.distilled.entries_flagged();
 
         // magic(8) + version(4) + counts(4+4) + entries*12 + checksum(8)
         let mut buf = Vec::with_capacity(20 + (main.len() + distilled.len()) * 12 + 8);
@@ -503,11 +603,15 @@ impl FrozenRouting {
 
         let mut checksum: u64 = 0;
         for section in [&main, &distilled] {
-            for (hash, size_class, backend) in section.iter() {
+            for (hash, size_class, backend, flags) in section.iter() {
                 buf.extend_from_slice(&hash.to_le_bytes());
                 buf.push(*backend as u8);
                 buf.push(*size_class);
-                buf.extend_from_slice(&[0u8; 2]); // padding
+                // v4: flags in the first (previously always-zero) padding
+                // byte, so the wire backend byte stays a pure discriminant
+                // for external parsers.
+                buf.push(*flags);
+                buf.push(0u8); // remaining padding
                 checksum ^= hash;
             }
         }
@@ -559,7 +663,8 @@ impl FrozenRouting {
                 *pos += 8;
                 let backend_byte = data[*pos];
                 let size_class = data[*pos + 1];
-                *pos += 4; // backend(1) + size_class(1) + padding(2)
+                let flags = data[*pos + 2]; // v4: first ex-padding byte
+                *pos += 4; // backend(1) + size_class(1) + flags(1) + padding(1)
 
                 let backend = match backend_byte {
                     0 => Backend::Slab,
@@ -568,11 +673,17 @@ impl FrozenRouting {
                     3 => Backend::Arena,
                     _ => return None,
                 };
+                // Flags must fit the 6 spare bits of the in-memory packed
+                // byte (`backend | flags << 2`).
+                if flags > 0x3F {
+                    return None;
+                }
 
                 entries.push(Entry {
                     hash,
                     backend,
                     size_class,
+                    flags,
                 });
                 checksum ^= hash;
             }
@@ -596,12 +707,14 @@ impl FrozenRouting {
 
 impl PerfectHashTable {
     /// Rebuild the MPHF from parsed wire entries (re-applies last-wins
-    /// dedup in case the file carries duplicate hashes).
+    /// dedup in case the file carries duplicate hashes). Flag-preserving —
+    /// a `FLAG_HAS_CONTEXT` coarse entry must survive the round trip or a
+    /// loaded model would silently stop context-probing.
     fn rebuild(entries: Vec<Entry>) -> Self {
-        Self::from_entries(
+        Self::from_entries_flagged(
             entries
                 .into_iter()
-                .map(|e| (e.hash, e.size_class, e.backend))
+                .map(|e| (e.hash, e.size_class, e.backend, e.flags))
                 .collect(),
         )
     }
@@ -866,19 +979,19 @@ mod tests {
     }
 
     #[test]
-    fn serialized_bytes_are_sorted_and_v3() {
+    fn serialized_bytes_are_sorted_and_v4() {
         let table = make_table(&[
             (300, Backend::Arena),
             (100, Backend::Slab),
             (200, Backend::Buddy),
         ]);
         let bytes = table.serialize();
-        // Exact v3 layout: magic, version, main count, distilled count,
-        // 12-byte entries, checksum. `PerfectHashTable::serialize` emits an
-        // empty distilled section.
+        // Exact v4 layout: magic, version, main count, distilled count,
+        // 12-byte entries (flags in the first ex-padding byte), checksum.
+        // `PerfectHashTable::serialize` emits an empty distilled section.
         assert_eq!(bytes.len(), 20 + 3 * 12 + 8);
         assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), MAGIC);
-        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 4);
         assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 3);
         assert_eq!(
             u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
@@ -924,6 +1037,40 @@ mod tests {
         let table = PerfectHashTable::deserialize(&bytes).expect("deserialize");
         assert_eq!(table.len(), 1);
         assert_eq!(table.lookup(7), Some(Backend::Arena));
+    }
+
+    #[test]
+    fn flags_roundtrip_lookup_and_serialization() {
+        // Phase-1 context routing: a FLAG_HAS_CONTEXT coarse entry must (a)
+        // come back from lookup_with_flags, (b) survive
+        // serialize→deserialize (the loaded-model path), and (c) leave
+        // unflagged entries reading flags == 0.
+        let table = PerfectHashTable::from_entries_flagged(vec![
+            (111, 3, Backend::Slab, FLAG_HAS_CONTEXT),
+            (222, 3, Backend::Arena, 0),
+        ]);
+        assert_eq!(
+            table.lookup_with_flags(111),
+            Some((Backend::Slab, FLAG_HAS_CONTEXT))
+        );
+        assert_eq!(table.lookup_with_flags(222), Some((Backend::Arena, 0)));
+        // Plain lookup is flag-blind but backend-correct (flags share the
+        // stored byte — the mask must hide them).
+        assert_eq!(table.lookup(111), Some(Backend::Slab));
+
+        let restored = PerfectHashTable::deserialize(&table.serialize()).expect("valid v4");
+        assert_eq!(
+            restored.lookup_with_flags(111),
+            Some((Backend::Slab, FLAG_HAS_CONTEXT)),
+            "flags must survive the wire round trip"
+        );
+        assert_eq!(restored.lookup_with_flags(222), Some((Backend::Arena, 0)));
+        // And the wire keeps the backend byte a pure discriminant: flags
+        // live in the first ex-padding byte (offset +10 within the entry).
+        let bytes = table.serialize();
+        let e0 = 20; // first entry (hash 111 sorts first)
+        assert_eq!(bytes[e0 + 8], Backend::Slab as u8, "pure backend byte");
+        assert_eq!(bytes[e0 + 10], FLAG_HAS_CONTEXT, "flags in ex-pad byte");
     }
 
     #[test]

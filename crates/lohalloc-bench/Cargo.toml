@@ -35,6 +35,10 @@ alloc-system = []
 alloc-lohalloc = []
 alloc-jemalloc = ["dep:tikv-jemallocator"]
 alloc-mimalloc = ["dep:mimalloc"]
+# Forwards the allocator's routing/fine-map introspection counters — gates
+# the ctx_diag diagnostics in workloads.rs (run with:
+# cargo test -p lohalloc-bench --lib --features route-metrics ctx_diag -- --ignored --nocapture)
+route-metrics = ["lohalloc-alloc/route-metrics"]
 
 [[bench]]
 name = "backend_micro"
