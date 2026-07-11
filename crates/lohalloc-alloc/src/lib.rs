@@ -699,17 +699,43 @@ thread_local! {
     static AHR: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
 }
 
-/// Read this thread's routing context, then push the current alloc's 2-bit
-/// size-aware event code. Read-before-push is load-bearing: the context
-/// describes the history *before* this allocation, identically in training
-/// and inference.
+/// Read this thread's raw history (low 16 bits = 8 events), then push the
+/// current alloc's 2-bit size-aware event code. Read-before-push is
+/// load-bearing: the context describes the history *before* this allocation,
+/// identically in training and inference. Callers derive the actual routing
+/// contexts via [`ahr_shallow`] / [`ahr_deep`] — one register read, two
+/// context depths (Roadmap-D).
 #[inline(always)]
-fn ahr_ctx_and_push_alloc(size_class: u8) -> u8 {
+fn ahr_ctx_and_push_alloc(size_class: u8) -> u16 {
     AHR.with(|a| {
         let v = a.get();
         a.set((v << CTX_EVENT_BITS) | ahr_alloc_code(size_class));
-        (v & CTX_MASK) as u8
+        (v & 0xFFFF) as u16
     })
+}
+
+/// The shallow (3-event, 6-bit) routing context — the certified Phase-1/-3
+/// context every non-escalated site trains and routes on.
+#[inline(always)]
+fn ahr_shallow(raw: u16) -> u8 {
+    (raw as u64 & CTX_MASK) as u8
+}
+
+/// Roadmap-D: the deep (8-event) context, gshare-style **folded** from 16
+/// history bits into 8 by XOR of the two halves — genuinely longer history in
+/// the same `u8` the fine keys / wire already carry, at the cost of benign
+/// aliasing (folding is exactly how TAGE/gshare compress long histories).
+/// `0xFF` is remapped to `0xFE` so the value can never collide with
+/// `CTX_UNTRACKED`; the remap is applied identically at training and
+/// inference (same helper), preserving the C6 hash-identity invariant.
+#[inline(always)]
+fn ahr_deep(raw: u16) -> u8 {
+    let folded = ((raw >> 8) ^ (raw & 0xFF)) as u8;
+    if folded == CTX_UNTRACKED {
+        0xFE
+    } else {
+        folded
+    }
 }
 
 /// Push an alloc event without reading the context (paths that never
@@ -872,6 +898,45 @@ fn reward_track_enabled() -> bool {
 #[cfg(test)]
 fn reward_track_force(enabled: bool) {
     REWARD_TRACK_STATE.store(if enabled { 1 } else { 2 }, Ordering::Relaxed);
+}
+
+/// Servability-aware training enable latch (paradigm-investigation fix):
+/// `0` = uninit, `1` = on, `2` = off. **Default OFF** — the certified c9g
+/// A/B (`results/20260711T231127`, sv-on vs sv-off) REGRESSED the real
+/// suite (mean 1.234→1.263, mixed family 1.322→1.446; rust/c mt-mixed-t4
+/// +0.44–0.53 cross-language within-run): masking the un-servable Buddy arm
+/// redistributes UCB exploration onto the genuinely expensive arms (System
+/// ~1.3 µs pulls, extra Arena budget burn), costing the suite more than the
+/// free-rider trap costs it. The trap is real (headerless Buddy pulls fall
+/// through to warm Slab and the cheap outcome is attributed to Buddy —
+/// measured deciding the frozen verdict on aliased recursion shapes, see
+/// lohalloc-bench `tests/paradigm_diag.rs`), and on those shapes the mask
+/// freezes the ORACLE split — so `LOHALLOC_SERVABLE_TRAINING=1` opts in
+/// (exact-"1" getenv) for deep-callgraph/recursion-heavy deployments.
+static SERVABLE_TRAINING_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// Whether training masks inference-unservable arms (default **off**;
+/// `LOHALLOC_SERVABLE_TRAINING=1` enables). One relaxed load after the
+/// first call.
+#[inline]
+fn servable_training_enabled() -> bool {
+    let s = SERVABLE_TRAINING_STATE.load(Ordering::Relaxed);
+    if s != 0 {
+        return s == 1;
+    }
+    // SAFETY: NUL-terminated literal; getenv returns NULL or a pointer into
+    // the C environment (no setenv on the allocator hot path).
+    let p = unsafe { libc::getenv(b"LOHALLOC_SERVABLE_TRAINING\0".as_ptr().cast()) };
+    let on = !p.is_null() && unsafe { *p == b'1' as libc::c_char && *p.offset(1) == 0 };
+    SERVABLE_TRAINING_STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+    on
+}
+
+/// Test-only: force the servable-training latch (same rationale as
+/// [`reward_track_force`]).
+#[cfg(test)]
+fn servable_training_force(enabled: bool) {
+    SERVABLE_TRAINING_STATE.store(if enabled { 1 } else { 2 }, Ordering::Relaxed);
 }
 
 impl Default for Lohalloc {
@@ -1937,15 +2002,20 @@ impl Lohalloc {
         // this allocation) and unconditional-per-alloc-when-gated (every
         // alloc is part of every later alloc's history) are both
         // load-bearing for training/inference hash-identity — C6 class.
-        let ctx = if self.ahr_on.load(Ordering::Relaxed) {
+        // One raw register read yields both context depths (Roadmap-D): the
+        // shallow 3-event ctx (routing + Header + fine map, as before) and
+        // the deep 8-event folded ctx (deep fine map / FLAG_DEEP_CONTEXT
+        // probe). Deriving both is two ALU ops on the already-read value.
+        let ctx_raw = if self.ahr_on.load(Ordering::Relaxed) {
             Some(ahr_ctx_and_push_alloc(size_class))
         } else {
             None
         };
-        // Phase 1.5: the same ctx also rides in the allocation's Header so
+        let ctx = ctx_raw.map(|raw| (ahr_shallow(raw), ahr_deep(raw)));
+        // Phase 1.5: the shallow ctx also rides in the allocation's Header so
         // the dealloc side can attribute its latency to the fine arm the
         // alloc side observed (see `Header::ctx`).
-        let ctx_byte = ctx.unwrap_or(CTX_UNTRACKED);
+        let ctx_byte = ctx.map(|(s, _)| s).unwrap_or(CTX_UNTRACKED);
 
         // Inference fast path: the frozen table is immutable and published
         // via an atomic pointer, so a frozen allocator routes with zero
@@ -1996,9 +2066,28 @@ impl Lohalloc {
         } else {
             0
         };
+        // Servability-aware training (paradigm-investigation fix): mask the
+        // Buddy arm when this instance's OWN inference path would refuse the
+        // request — headerless Buddy serves only orders ≥ MIN_HEADERLESS_ORDER
+        // (16 KiB) at MIN_ALIGN. An unservable arm's pull always falls
+        // through (to warm Slab), and attributing that cheap outcome to
+        // Buddy made the un-servable arm read as the best one — training a
+        // verdict the freeze-time J5 clamp then silently rewrote. The mask
+        // costs one relaxed load + integer math, training-path only.
+        let unservable_mask: u8 = if self.buddy_headerless.load(Ordering::Relaxed)
+            && align <= MIN_ALIGN
+            && buddy::order_for(total)
+                .map(|o| o < buddy::MIN_HEADERLESS_ORDER)
+                .unwrap_or(false)
+            && servable_training_enabled()
+        {
+            1 << (Backend::Buddy as u8)
+        } else {
+            0
+        };
         let (recommended, is_training) = if let Ok(mut st) = self.state.lock() {
             (
-                Some(st.route_with_frame(hash, one_frame, size)),
+                Some(st.route_with_frame(hash, one_frame, size, unservable_mask)),
                 !st.is_inference(),
             )
         } else {
@@ -2045,9 +2134,16 @@ impl Lohalloc {
                     // Phase-1 shadow fine observation. The dealloc side
                     // mirrors this via the ctx carried in the Header (see
                     // `dealloc_with_header`) — or, on the headerless path, via
-                    // the reward-track ring recorded just below.
-                    if let Some(c) = ctx {
-                        st.record_fine_latency(hash, backend, size_class, c, latency_ns, total);
+                    // the reward-track ring recorded just below. Roadmap-D:
+                    // the deep map observes the same sample under the folded
+                    // 8-event ctx (a no-op when `escalate_variance == 0`).
+                    if let Some((shallow, deep)) = ctx {
+                        st.record_fine_latency(
+                            hash, backend, size_class, shallow, latency_ns, total,
+                        );
+                        st.record_fine_deep_latency(
+                            hash, backend, size_class, deep, latency_ns, total,
+                        );
                     }
                 }
             });
@@ -3065,9 +3161,11 @@ impl Lohalloc {
         // LOHALLOC_DEMOTE_FRACTION). `tune::config()` is one atomic load,
         // no I/O — safe under the realloc guard.
         let demote_fraction = crate::tune::config().demote_fraction;
+        // Roadmap-D: the variance gate for deep-context escalation (0 = off).
+        let escalate_variance = crate::tune::config().escalate_variance;
         Self::with_realloc_guard(|| {
             if let Ok(mut state) = self.state.lock() {
-                state.freeze(demote_arena, demote_fraction);
+                state.freeze(demote_arena, demote_fraction, escalate_variance);
                 self.publish_frozen_table(&state);
             }
         });
@@ -3122,6 +3220,21 @@ impl Lohalloc {
         Self::with_realloc_guard(|| {
             if let Ok(state) = self.state.lock() {
                 state.fine_snapshot()
+            } else {
+                Vec::new()
+            }
+        })
+    }
+
+    /// Diagnostic aliasing meter (paradigm investigation): per-Signature
+    /// `(caller_pc, size_class, total_pulls, verdict_backend,
+    /// verdict_arm_variance)` — see `BanditPolicy::variance_snapshot`.
+    /// Test/route-metrics introspection only; empty in Inference mode.
+    #[cfg(any(feature = "route-metrics", test))]
+    pub fn variance_snapshot(&self) -> Vec<(u64, u8, u32, lohalloc_core::Backend, f64)> {
+        Self::with_realloc_guard(|| {
+            if let Ok(state) = self.state.lock() {
+                state.variance_snapshot()
             } else {
                 Vec::new()
             }
@@ -4107,6 +4220,403 @@ mod integration_tests {
         unsafe {
             loaded.dealloc(p3, layout);
             loaded.dealloc(p4, layout);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Calling-paradigm capability probes (investigation 2026-07-11).
+    //
+    // Real-walk structural facts: what the fixed 3-frame window
+    // (`topology::NUM_FRAMES`) CAN and CANNOT distinguish, pinned as
+    // deterministic gating tests (repo convention: real-walk structure
+    // gates, like the pin-cache suite — a toolchain-induced failure here
+    // means hash identity shifted, which invalidates exported models and
+    // MUST be loud). The "cannot" assertions document the blind spots on
+    // purpose; if one starts failing because the walk got DEEPER, update
+    // the capability matrix in COPILOT.md alongside.
+    //
+    // Every wrapper asserts on the callee's result AFTER the call — that
+    // defeats sibling-call (tail-call) optimization, which would elide the
+    // frame and silently change what "N frames up" means.
+    // -----------------------------------------------------------------
+
+    /// The one shared allocation site every paradigm probe funnels into.
+    #[inline(never)]
+    fn probe_alloc_helper(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = unsafe { a.alloc(layout) };
+        assert!(!p.is_null(), "probe alloc failed");
+        p
+    }
+
+    // A shared 2-wrapper spine: fills frames 1–2 above the helper, so the
+    // chains below diverge only at frame ≥3 — outside the window.
+    #[inline(never)]
+    fn probe_spine_w1(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = probe_alloc_helper(a, layout);
+        let p = core::hint::black_box(p); // defeat sibling-call TCO: keep this frame
+        assert!(!p.is_null());
+        p
+    }
+    #[inline(never)]
+    fn probe_spine_w2(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = probe_spine_w1(a, layout);
+        let p = core::hint::black_box(p); // defeat sibling-call TCO: keep this frame
+        assert!(!p.is_null());
+        p
+    }
+    #[inline(never)]
+    fn probe_chain_a(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = probe_spine_w2(a, layout);
+        let p = core::hint::black_box(p); // defeat sibling-call TCO: keep this frame
+        assert!(!p.is_null());
+        p
+    }
+    #[inline(never)]
+    fn probe_chain_b(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = probe_spine_w2(a, layout);
+        let p = core::hint::black_box(p); // defeat sibling-call TCO: keep this frame
+        assert!(!p.is_null());
+        p
+    }
+    #[inline(never)]
+    fn probe_chain_c(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = probe_spine_w2(a, layout);
+        let p = core::hint::black_box(p); // defeat sibling-call TCO: keep this frame
+        assert!(!p.is_null());
+        p
+    }
+    #[inline(never)]
+    fn probe_chain_d(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = probe_spine_w2(a, layout);
+        let p = core::hint::black_box(p); // defeat sibling-call TCO: keep this frame
+        assert!(!p.is_null());
+        p
+    }
+
+    // Two DISTINCT 2-deep paths to the helper — divergence at frames 1–2,
+    // inside the window. Each path owns BOTH wrapper frames so the (test
+    // function's) unstable caller frame sits at frame ≥3, outside the
+    // window — probe expectations must never depend on test frames (loop
+    // unrolling gives each iteration its own call site).
+    #[inline(never)]
+    fn probe_dmid_a(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = probe_alloc_helper(a, layout);
+        let p = core::hint::black_box(p); // defeat sibling-call TCO: keep this frame
+        assert!(!p.is_null());
+        p
+    }
+    #[inline(never)]
+    fn probe_direct_a(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = probe_dmid_a(a, layout);
+        let p = core::hint::black_box(p); // defeat sibling-call TCO: keep this frame
+        assert!(!p.is_null());
+        p
+    }
+    #[inline(never)]
+    fn probe_dmid_b(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = probe_alloc_helper(a, layout);
+        let p = core::hint::black_box(p); // defeat sibling-call TCO: keep this frame
+        assert!(!p.is_null());
+        p
+    }
+    #[inline(never)]
+    fn probe_direct_b(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = probe_dmid_b(a, layout);
+        let p = core::hint::black_box(p); // defeat sibling-call TCO: keep this frame
+        assert!(!p.is_null());
+        p
+    }
+
+    #[test]
+    fn paradigm_p1_branching_beyond_three_frames_aliases() {
+        // P1: four call paths that diverge only at frame ≥3 (they share the
+        // helper + 2-wrapper spine that fills the whole window) must fold
+        // into ONE Signature — the documented spatial blind spot. Two paths
+        // that diverge at frames 1–2 must stay distinct. One call per path:
+        // signature counting needs no repeats, and repeats would let loop
+        // unrolling mint per-iteration call sites.
+        let a = Box::new(Lohalloc::new());
+        let layout = Layout::from_size_align(64, 16).unwrap();
+        let mut ptrs = Vec::new();
+        for f in [probe_chain_a, probe_chain_b, probe_chain_c, probe_chain_d] {
+            ptrs.push(f(&a, layout));
+        }
+        assert_eq!(
+            a.signature_count(),
+            1,
+            "paths diverging at frame >=3 must alias into ONE signature"
+        );
+        ptrs.push(probe_direct_a(&a, layout));
+        ptrs.push(probe_direct_b(&a, layout));
+        assert_eq!(
+            a.signature_count(),
+            1 + 2,
+            "paths diverging INSIDE the window must stay distinct"
+        );
+        for p in ptrs {
+            unsafe { a.dealloc(p, layout) };
+        }
+    }
+
+    /// Self-recursive allocator: allocates at the bottom of `depth` frames
+    /// of recursion. The trailing `black_box` defeats tail-call elision of
+    /// the recursive frame.
+    #[inline(never)]
+    fn probe_recurse(a: &Lohalloc, layout: Layout, depth: usize, out: &mut Vec<*mut u8>) {
+        if depth == 0 {
+            let p = unsafe { a.alloc(layout) };
+            assert!(!p.is_null(), "recursive probe alloc failed");
+            out.push(p);
+        } else {
+            probe_recurse(a, layout, depth - 1, out);
+            // Data-dependent anchor is impossible here (no value flows
+            // back); read the out-vec length instead — un-hoistable past
+            // the recursive call that appends to it.
+            core::hint::black_box(out.len());
+        }
+    }
+
+    #[test]
+    fn paradigm_p2_recursion_depth_collapses_beyond_the_window() {
+        // P2: recursion depths 0 and 1 leave non-recursive frames in the
+        // window (distinct signatures); every depth ≥2 fills the window
+        // with the same recursive call-site PCs, so depths 2, 8 and 64 all
+        // fold into ONE Signature — recursion depth is structurally
+        // invisible (safely: every alloc succeeds, per-depth frame
+        // pointers keep the guards and the raw-triple memo sound).
+        let a = Box::new(Lohalloc::new());
+        let layout = Layout::from_size_align(64, 16).unwrap();
+        let mut ptrs = Vec::new();
+        // One call per depth (repeats would let loop unrolling mint call
+        // sites for the shallow depths whose window reaches the test frame).
+        for depth in [0usize, 1, 2, 8, 64] {
+            probe_recurse(&a, layout, depth, &mut ptrs);
+        }
+        assert_eq!(
+            a.signature_count(),
+            3,
+            "depths 0 and 1 distinct; ALL depths >=2 must collapse into one"
+        );
+        for p in ptrs {
+            unsafe { a.dealloc(p, layout) };
+        }
+    }
+
+    // Mutual recursion f↔g, both allocating at the bottom: the window sees
+    // the alternating (bottom, other, bottom) PC triple, so only the
+    // PARITY of the depth (which function bottoms out) is distinguishable.
+    #[inline(never)]
+    fn probe_mut_f(a: &Lohalloc, layout: Layout, depth: usize, out: &mut Vec<*mut u8>) {
+        if depth == 0 {
+            let p = unsafe { a.alloc(layout) };
+            assert!(!p.is_null());
+            out.push(p);
+        } else {
+            probe_mut_g(a, layout, depth - 1, out);
+            // Data-dependent anchor is impossible here (no value flows
+            // back); read the out-vec length instead — un-hoistable past
+            // the recursive call that appends to it.
+            core::hint::black_box(out.len());
+        }
+    }
+    #[inline(never)]
+    fn probe_mut_g(a: &Lohalloc, layout: Layout, depth: usize, out: &mut Vec<*mut u8>) {
+        if depth == 0 {
+            let p = unsafe { a.alloc(layout) };
+            assert!(!p.is_null());
+            out.push(p);
+        } else {
+            probe_mut_f(a, layout, depth - 1, out);
+            // Data-dependent anchor is impossible here (no value flows
+            // back); read the out-vec length instead — un-hoistable past
+            // the recursive call that appends to it.
+            core::hint::black_box(out.len());
+        }
+    }
+
+    #[test]
+    fn paradigm_p3_mutual_recursion_discriminates_parity_only() {
+        // P3: from `probe_mut_f`, even depths bottom in f, odd in g. All
+        // even depths ≥4 share one Signature; adding odd depths adds
+        // exactly one more — parity-level discrimination, still
+        // depth-blind within a parity class.
+        let a = Box::new(Lohalloc::new());
+        let layout = Layout::from_size_align(64, 16).unwrap();
+        let mut ptrs = Vec::new();
+        for depth in [4usize, 6, 8] {
+            probe_mut_f(&a, layout, depth, &mut ptrs);
+        }
+        assert_eq!(
+            a.signature_count(),
+            1,
+            "even depths >=4 share one signature"
+        );
+        for depth in [5usize, 7] {
+            probe_mut_f(&a, layout, depth, &mut ptrs);
+        }
+        assert_eq!(
+            a.signature_count(),
+            2,
+            "odd depths add exactly the parity sibling"
+        );
+        for p in ptrs {
+            unsafe { a.dealloc(p, layout) };
+        }
+    }
+
+    // Indirect dispatch targets that allocate directly — the leaf return
+    // address lives in the TARGET, so fn-pointer/vtable dispatch to
+    // distinct allocating callees stays fully distinguishable. Two stable
+    // dispatcher frames sit between the targets and the (unstable) test
+    // frame so the window never reads it.
+    #[inline(never)]
+    fn probe_virt_x(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = unsafe { a.alloc(layout) };
+        assert!(!p.is_null());
+        p
+    }
+    #[inline(never)]
+    fn probe_virt_y(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = unsafe { a.alloc(layout) };
+        assert!(!p.is_null());
+        p
+    }
+    #[inline(never)]
+    fn probe_dispatch_inner(
+        f: fn(&Lohalloc, Layout) -> *mut u8,
+        a: &Lohalloc,
+        layout: Layout,
+    ) -> *mut u8 {
+        let p = f(a, layout);
+        let p = core::hint::black_box(p); // defeat sibling-call TCO: keep this frame
+        assert!(!p.is_null());
+        p
+    }
+    #[inline(never)]
+    fn probe_dispatch_outer(
+        f: fn(&Lohalloc, Layout) -> *mut u8,
+        a: &Lohalloc,
+        layout: Layout,
+    ) -> *mut u8 {
+        let p = probe_dispatch_inner(f, a, layout);
+        let p = core::hint::black_box(p); // defeat sibling-call TCO: keep this frame
+        assert!(!p.is_null());
+        p
+    }
+
+    #[test]
+    fn paradigm_p4_indirect_dispatch_distinguishes_allocating_targets() {
+        // P4: calls through a fn pointer — the walk keys on return
+        // addresses (call sites inside the frames), not call targets, so
+        // two allocating targets reached through the SAME dynamic-dispatch
+        // frames are two Signatures (window = [target, inner, outer]; only
+        // the target's leaf frame differs). A shared allocating helper
+        // BEHIND dispatch is the wrapper problem — P1 covers that collapse.
+        let a = Box::new(Lohalloc::new());
+        let layout = Layout::from_size_align(64, 16).unwrap();
+        let table: [fn(&Lohalloc, Layout) -> *mut u8; 2] = [probe_virt_x, probe_virt_y];
+        let mut ptrs = Vec::new();
+        for f in table {
+            ptrs.push(probe_dispatch_outer(f, &a, layout));
+        }
+        assert_eq!(
+            a.signature_count(),
+            2,
+            "distinct allocating targets behind indirect dispatch must stay distinct"
+        );
+        for p in ptrs {
+            unsafe { a.dealloc(p, layout) };
+        }
+    }
+
+    #[test]
+    fn paradigm_p5_task_interleaving_pollutes_thread_history() {
+        // P5: the AHR is per-THREAD, so logical tasks multiplexed on one
+        // thread (async executors, manual state machines) contaminate each
+        // other's history context: task A's alloc site reads a DIFFERENT
+        // ctx when task B's allocs interleave — the async-runtime caveat,
+        // pinned. (Fresh test thread → register starts 0.)
+        let small = state::size_class_for(64); // event code 1
+        let mid = state::size_class_for(64 * 1024); // Buddy -> event code 2
+
+        // Task A alone: three small allocs -> ctx 0b01_01_01 = 21.
+        ahr_push_alloc(small);
+        ahr_push_alloc(small);
+        ahr_push_alloc(small);
+        let ctx_alone = ahr_shallow(ahr_ctx_and_push_alloc(small));
+        assert_eq!(ctx_alone, 0b01_01_01);
+
+        // Interleaved with task B (mid-size allocs): pushes A,B,A,B then A
+        // allocates — its site reads the last three events (LSB = newest):
+        // newest B(10), then A(01), then B(10) -> 0b10_01_10 = 38.
+        ahr_push_alloc(small); // A
+        ahr_push_alloc(mid); // B
+        ahr_push_alloc(small); // A
+        ahr_push_alloc(mid); // B
+        let ctx_mixed = ahr_shallow(ahr_ctx_and_push_alloc(small));
+        assert_eq!(ctx_mixed, 0b10_01_10, "A's site reads B,A,B (LSB newest)");
+        assert_ne!(
+            ctx_mixed, ctx_alone,
+            "task B's interleaved allocs must change what task A's site observes"
+        );
+    }
+
+    // P6: wrappers in the ubiquitous plain `return f(...)` style — the
+    // sibling-call (tail-call) candidates. Deliberately NO post-call anchor:
+    // when the optimizer fires TCO these frames VANISH and the window lands
+    // on the callers instead. Discovered by this investigation: at release
+    // opt, LLVM infers the callee's return `nonnull`, folds even post-call
+    // asserts, and tail-calls the whole chain — so "3 frames" means 3
+    // MACHINE frames, and logical wrapper callers can be invisible.
+    #[inline(never)]
+    fn probe_tail_w1(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        probe_alloc_helper(a, layout)
+    }
+    #[inline(never)]
+    fn probe_tail_w2(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        probe_tail_w1(a, layout)
+    }
+    #[inline(never)]
+    fn probe_tail_caller_x(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = probe_tail_w2(a, layout);
+        let p = core::hint::black_box(p); // this caller's frame IS anchored
+        assert!(!p.is_null());
+        p
+    }
+    #[inline(never)]
+    fn probe_tail_caller_y(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = probe_tail_w2(a, layout);
+        let p = core::hint::black_box(p);
+        assert!(!p.is_null());
+        p
+    }
+
+    #[test]
+    fn paradigm_p6_tail_call_wrappers_may_leave_no_frame() {
+        // P6: two anchored callers reach the helper through a PURE-tail
+        // 2-wrapper spine. If the optimizer fires sibling-call TCO the spine
+        // frames vanish and the window reaches the two callers → 2
+        // Signatures; without TCO the spine fills the window → 1. Both are
+        // correct machine-level behavior — the pinned fact is that the
+        // answer is PROFILE-DEPENDENT (never more than the caller count,
+        // never zero), i.e. the model keys on machine frames, not logical
+        // calls. The eprintln records which world this build is in.
+        let a = Box::new(Lohalloc::new());
+        let layout = Layout::from_size_align(64, 16).unwrap();
+        let p1 = probe_tail_caller_x(&a, layout);
+        let p2 = probe_tail_caller_y(&a, layout);
+        let n = a.signature_count();
+        eprintln!(
+            "P6: pure-tail spine yielded {n} signature(s) in this profile \
+             (1 = frames kept, 2 = TCO erased the spine)"
+        );
+        assert!(
+            (1..=2).contains(&n),
+            "pure-tail chains must yield 1 (frames kept) or 2 (TCO) signatures, got {n}"
+        );
+        unsafe {
+            a.dealloc(p1, layout);
+            a.dealloc(p2, layout);
         }
     }
 
@@ -5289,6 +5799,63 @@ mod integration_tests {
     }
 
     #[test]
+    fn loaded_deep_ctx_model_routes_by_folded_history_register() {
+        // Roadmap-D end-to-end, deterministic: a hand-built v4 model whose
+        // coarse entry carries FLAG_DEEP_CONTEXT (Slab) with one DEEP fine
+        // sibling (Arena) is load()ed; routing must probe the 8-event FOLDED
+        // register. Fresh test thread → register starts 0; each 64-B alloc
+        // pushes event code 1, each dealloc pushes 0. After 4 filler allocs
+        // the raw low-16 history is 0b0101_0101 = 0x0055, whose fold is
+        // 0x55 ^ 0x00 = 85 — the deep ctx the model's Arena sibling is keyed
+        // under.
+        const H: u64 = 0x77AA_0003; // the deep-context-routed site
+        const F: u64 = 0x77AA_0004; // filler site (not in the model)
+        let size = 64usize;
+        let sc = state::size_class_for(size);
+        let key = state::combine_hash_size_class(H, sc);
+        let table = perfect_hash::PerfectHashTable::from_entries_flagged(vec![
+            (
+                key,
+                sc,
+                lohalloc_core::Backend::Slab,
+                perfect_hash::FLAG_DEEP_CONTEXT,
+            ),
+            (
+                state::combine_key_ctx_deep(key, 85),
+                sc,
+                lohalloc_core::Backend::Arena,
+                0,
+            ),
+        ]);
+        let h = Box::new(Lohalloc::new());
+        assert!(h.load(&table.serialize()), "v4 model with deep flag loads");
+
+        let layout = Layout::from_size_align(size, 16).unwrap();
+        let held: Vec<*mut u8> = (0..4)
+            .map(|_| unsafe { h.alloc_with_hash(layout, F) })
+            .collect();
+        let p_deep = unsafe { h.alloc_with_hash(layout, H) };
+        assert_eq!(
+            unsafe { h.backend_for_ptr(p_deep) },
+            Some(lohalloc_core::Backend::Arena),
+            "deep ctx 85 (fold of 8 small-alloc events) must take the deep Arena override"
+        );
+        unsafe { h.dealloc_with_hash(p_deep, layout) };
+        for p in held {
+            unsafe { h.dealloc_with_hash(p, layout) };
+        }
+        // 5 deallocs shifted the register: raw is now 0x5000, fold 0x50 = 80
+        // ≠ 85 → deep miss → coarse Slab.
+        let p_other = unsafe { h.alloc_with_hash(layout, H) };
+        assert_eq!(
+            unsafe { h.backend_for_ptr(p_other) },
+            Some(lohalloc_core::Backend::Slab),
+            "a different folded history must fall back to the coarse verdict"
+        );
+        unsafe { h.dealloc_with_hash(p_other, layout) };
+    }
+
+    #[test]
     fn dealloc_attributes_fine_reward_to_alloc_time_ctx() {
         // Phase 1.5 end-to-end, deterministic by counting: every dealloc
         // must mirror its latency into the fine arm keyed by the ctx this
@@ -5338,24 +5905,41 @@ mod integration_tests {
         let small = state::size_class_for(64); // Slab -> code 1
         let large = state::size_class_for(2 << 20); // > 1 MiB -> System -> code 3
 
-        // Three small allocs -> 0b01_01_01 = 21.
+        // Three small allocs -> shallow 0b01_01_01 = 21.
         ahr_push_alloc(small);
         ahr_push_alloc(small);
         ahr_push_alloc(small);
-        assert_eq!(ahr_ctx_and_push_alloc(small), 0b01_01_01);
+        assert_eq!(ahr_shallow(ahr_ctx_and_push_alloc(small)), 0b01_01_01);
 
-        // Three large allocs -> 0b11_11_11 = 63 — distinct from the small run,
-        // even though a 1-bit register would read both as all-allocs.
+        // Three large allocs -> shallow 0b11_11_11 = 63 — distinct from the
+        // small run, even though a 1-bit register would read both as
+        // all-allocs.
         ahr_push_alloc(large);
         ahr_push_alloc(large);
         ahr_push_alloc(large);
-        assert_eq!(ahr_ctx_and_push_alloc(large), 0b11_11_11);
+        assert_eq!(ahr_shallow(ahr_ctx_and_push_alloc(large)), 0b11_11_11);
 
         // Churn still separable: small, dealloc, small -> 0b01_00_01 = 17.
         ahr_push_alloc(small);
         ahr_push_dealloc();
         ahr_push_alloc(small);
-        assert_eq!(ahr_ctx_and_push_alloc(small), 0b01_00_01);
+        assert_eq!(ahr_shallow(ahr_ctx_and_push_alloc(small)), 0b01_00_01);
+    }
+
+    #[test]
+    fn ahr_deep_folds_eight_events_and_avoids_untracked_sentinel() {
+        // Roadmap-D: the deep context folds 16 history bits (8 events) into
+        // 8 by XOR of the halves, so two histories identical in their recent
+        // 4 events but different 5-8 events back produce DIFFERENT deep
+        // contexts (the shallow ctx cannot see that far).
+        let a: u16 = 0b01_01_01_01_01_01_01_01; // 8 small allocs
+        let b: u16 = 0b11_11_11_11_01_01_01_01; // 4 large then 4 small
+        assert_eq!(ahr_shallow(a), ahr_shallow(b), "recent 3 events identical");
+        assert_ne!(ahr_deep(a), ahr_deep(b), "deep fold must separate them");
+        // The fold can never emit the CTX_UNTRACKED sentinel.
+        let c: u16 = 0x00FF; // folds to 0xFF -> remapped
+        assert_eq!(ahr_deep(c), 0xFE);
+        assert_ne!(ahr_deep(c), CTX_UNTRACKED);
     }
 
     #[test]
@@ -5415,6 +5999,60 @@ mod integration_tests {
             "fine pulls ({total_fine_pulls}) must exceed the {n} alloc-side \
              samples — headerless dealloc-side attribution via the reward-track \
              ring is missing"
+        );
+    }
+
+    #[test]
+    fn servable_training_masks_unservable_headerless_buddy() {
+        // Paradigm-investigation fix: with the headerless paths latched
+        // (default-on), the Buddy arm is UNSERVABLE for sub-16KiB requests
+        // (MIN_HEADERLESS_ORDER) — its pull would fall through to warm Slab
+        // and free-ride on the attribution. With servable training ON, the
+        // bandit must NEVER recommend Buddy at 8 KiB (fine pulls track the
+        // recommended arm); with the off-switch forced, the old free-riding
+        // behavior returns (Buddy pulls > 0 under UCB exploration).
+        const H: u64 = 0x5E4A_0001;
+        let size = 8144usize; // MID_SLAB_REQUEST-class: sub-16KiB, Buddy-unservable headerless
+        let layout = Layout::from_size_align(size, 16).unwrap();
+        let buddy_arm = lohalloc_core::Backend::Buddy as usize;
+
+        let buddy_pulls = |h: &Lohalloc| -> u64 {
+            h.fine_snapshot()
+                .iter()
+                .filter(|r| r.0 == H)
+                .map(|r| u64::from(r.3[buddy_arm]))
+                .sum()
+        };
+
+        servable_training_force(true);
+        let h = Box::new(Lohalloc::new());
+        h.enable_training_headerless();
+        assert!(h.is_buddy_headerless());
+        for _ in 0..400 {
+            let p = unsafe { h.alloc_with_hash(layout, H) };
+            assert!(!p.is_null());
+            unsafe { h.dealloc_with_hash(p, layout) };
+        }
+        assert_eq!(
+            buddy_pulls(&h),
+            0,
+            "servable training must never recommend the unservable Buddy arm"
+        );
+
+        // Control: off-switch restores the pre-fix exploration behavior.
+        servable_training_force(false);
+        let h2 = Box::new(Lohalloc::new());
+        h2.enable_training_headerless();
+        for _ in 0..400 {
+            let p = unsafe { h2.alloc_with_hash(layout, H) };
+            assert!(!p.is_null());
+            unsafe { h2.dealloc_with_hash(p, layout) };
+        }
+        // Restore the certified default before asserting (assert may panic).
+        servable_training_force(true);
+        assert!(
+            buddy_pulls(&h2) > 0,
+            "off-switch must restore Buddy exploration (the free-riding control)"
         );
     }
 

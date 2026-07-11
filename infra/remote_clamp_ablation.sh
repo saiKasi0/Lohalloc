@@ -86,11 +86,33 @@ fi
 # "rt-on:LOHALLOC_REWARD_TRACK=1" vs "rt-off:" — semantics inverted vs the
 # certified run, which predated the flip):
 #   CELLS=( "rt-on:LOHALLOC_REWARD_TRACK=1" "rt-off:" )
+#   CELLS=( "off:LOHALLOC_CLAMP_PERCENTILE=0" "p85:LOHALLOC_CLAMP_PERCENTILE=85" \
+#           "p90:LOHALLOC_CLAMP_PERCENTILE=90" "p95:LOHALLOC_CLAMP_PERCENTILE=95" )
+#
+#   Roadmap-D A/B — CERTIFIED (results/20260711T195855): d-on was a wash on
+#   mean, improved mixed, but regressed slab (c/slab 1.470->1.993 = worst
+#   row) -> escalate_variance default = 0 (off), 0.01 stays the opt-in:
+#   CELLS=( "d-on:LOHALLOC_ESCALATE_VARIANCE=0.01" "d-off:LOHALLOC_ESCALATE_VARIANCE=0" )
+#
+#   Roadmap-D REFINED re-test — CERTIFIED (results/20260711T204412): the
+#   three gates fixed the c/slab regression (1.993 -> 1.482), mixed gains
+#   reproduced (rust/mt-mixed-t1 good-attractor 4/4 across both A/Bs) ->
+#   escalate_variance default = 0.01 (ON). Only counter-signals were a
+#   documented lottery row (c/mt-mixed-t1, bimodal ~1.12/~1.50 under ANY
+#   config) and a 1.500->1.502 threshold graze:
+#   CELLS=( "d-on:LOHALLOC_ESCALATE_VARIANCE=0.01" "d-off:LOHALLOC_ESCALATE_VARIANCE=0" )
+#
+#   servability-aware-training A/B — CERTIFIED (results/20260711T231127):
+#   sv-on REGRESSED the suite (mean 1.234->1.263, mixed 1.322->1.446;
+#   rust/c mt-mixed-t4 +0.44-0.53 cross-language) — masking Buddy
+#   redistributes exploration onto expensive arms. Default = OFF,
+#   LOHALLOC_SERVABLE_TRAINING=1 opts in (deep-callgraph/recursion apps):
+#   CELLS=( "sv-on:LOHALLOC_SERVABLE_TRAINING=1" "sv-off:LOHALLOC_SERVABLE_TRAINING=0" )
+#
+# ACTIVE: the certified defaults, single sanity cell (edit CELLS per the
+# historical configs above for the next ablation).
 CELLS=(
-    "off:LOHALLOC_CLAMP_PERCENTILE=0"
-    "p85:LOHALLOC_CLAMP_PERCENTILE=85"
-    "p90:LOHALLOC_CLAMP_PERCENTILE=90"
-    "p95:LOHALLOC_CLAMP_PERCENTILE=95"
+    "defaults:"
 )
 
 BASE="results/$(date +%Y%m%dT%H%M%S)-clamp-sweep"

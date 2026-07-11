@@ -60,6 +60,10 @@ harness = false
 # Engine could capture on workloads whose per-site optimum changes at
 # runtime. See the bench's module doc for the decision rule.
 [[bench]]
+name = "paradigm_gap"
+harness = false
+
+[[bench]]
 name = "context_gap"
 harness = false
 

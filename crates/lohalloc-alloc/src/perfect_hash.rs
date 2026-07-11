@@ -121,6 +121,16 @@ const VERSION: u32 = 4;
 /// Phase-1 context-routing design). Fine entries themselves carry no flags.
 pub const FLAG_HAS_CONTEXT: u8 = 1;
 
+/// Roadmap-D entry flag bit: this coarse entry's fine siblings are keyed on
+/// the **deep** (8-event folded) context — Inference probes
+/// `combine_key_ctx_deep(key, deep_ctx)` instead of the shallow key.
+/// Mutually exclusive with [`FLAG_HAS_CONTEXT`] by freeze construction (a
+/// site routes at exactly one context depth). Rides the same v4 flags byte —
+/// no wire-format bump (models are per-binary and regenerated per run;
+/// `has_context_entries`' any-flag scan already covers it, so a deep-only
+/// model still keeps the history register on at load).
+pub const FLAG_DEEP_CONTEXT: u8 = 2;
+
 /// One routing entry: a combined `(hash, size_class)` key
 /// (`state::combine_hash_size_class`) mapped to the backend that won the
 /// bandit's training for that signature. `size_class` is carried alongside
@@ -556,18 +566,33 @@ impl FrozenRouting {
     /// The Phase-1 context-aware main-table probe, shared by the lock-free
     /// inference fast path (`lib.rs::route_alloc_inner`) and any locked
     /// fallback. Coarse lookup first; only an entry carrying
-    /// [`FLAG_HAS_CONTEXT`] triggers the second (fine) probe — the
-    /// overwhelmingly common unflagged hit pays nothing beyond the two
-    /// register ops that split the already-loaded backend byte. `ctx` is
-    /// `None` when the caller isn't maintaining the history register
-    /// (gate off / no context anywhere in this model): flagged entries then
-    /// serve their coarse verdict, degraded but correct.
+    /// [`FLAG_HAS_CONTEXT`] (probe the shallow fine key) or
+    /// [`FLAG_DEEP_CONTEXT`] (Roadmap-D: probe the deep 8-event folded key)
+    /// triggers the second (fine) probe — the overwhelmingly common
+    /// unflagged hit pays nothing beyond the two register ops that split the
+    /// already-loaded backend byte. `ctx` is `None` when the caller isn't
+    /// maintaining the history register (gate off / no context anywhere in
+    /// this model): flagged entries then serve their coarse verdict,
+    /// degraded but correct. When present it is `(shallow, deep)` — the two
+    /// derivations of one register read (`lib.rs::ahr_shallow`/`ahr_deep`).
     #[inline]
-    pub fn route_main(&self, key: u64, ctx: Option<u8>) -> Option<Backend> {
+    pub fn route_main(&self, key: u64, ctx: Option<(u8, u8)>) -> Option<Backend> {
         let (backend, flags) = self.main.lookup_with_flags(key)?;
         if flags & FLAG_HAS_CONTEXT != 0 {
-            if let Some(c) = ctx {
-                if let Some(fine) = self.main.lookup(crate::state::combine_key_ctx(key, c)) {
+            if let Some((shallow, _)) = ctx {
+                if let Some(fine) = self
+                    .main
+                    .lookup(crate::state::combine_key_ctx(key, shallow))
+                {
+                    return Some(fine);
+                }
+            }
+        } else if flags & FLAG_DEEP_CONTEXT != 0 {
+            if let Some((_, deep)) = ctx {
+                if let Some(fine) = self
+                    .main
+                    .lookup(crate::state::combine_key_ctx_deep(key, deep))
+                {
                     return Some(fine);
                 }
             }

@@ -51,6 +51,7 @@
 //! | `reward_batch`      | 16      | latency samples averaged per bandit reward update; de-quantizes the ARM ~42ns `Instant` tick floor. `1` = pre-Ladder-4 per-op behavior |
 //! | `demote_fraction`   | 0.10    | freeze-time Arena-demotion volume threshold (J5-A bisect knob): `0.0` = demote every Arena verdict (J4-C blanket), `>1.0` = never demote |
 //! | `clamp_percentile`  | 90      | Task B per-arm spike winsorization: each latency sample is capped at a running percentile of *its own arm's* latency distribution *before* entering its reward batch (replaces the retired fixed `latency_clamp_ns` constant); `0` disables winsorization, valid range `0..=100` |
+//! | `escalate_variance` | 0.01    | Roadmap-D TAGE-style context escalation (REFINED, certified default-on): a high-variance multi-size site whose shallow (3-event) context produced no override gets **deep** (8-event folded) fine entries at freeze, gated by a 5% ctx-traffic floor, margin-dominance over shallow, and a single-size-class exemption; `0` disables deep context entirely (rollback) |
 
 /// How the training→inference transition is triggered (consumed by
 /// `lohalloc-cabi`'s auto-freeze and `native_workload`'s driver — the
@@ -109,6 +110,19 @@ pub struct TrainingConfig {
     /// `state::winsorize_latency`). `0` disables winsorization entirely
     /// (pre-1.5 behavior); valid range `0..=100`.
     pub clamp_percentile: u8,
+    /// Roadmap-D TAGE-style variance-gated context escalation: the minimum
+    /// batch-reward **variance** (Welford M2/n over the batch-mean rewards
+    /// fed to `update_weighted` — see `bandit::ArmStats`) of a Signature's
+    /// frozen verdict arm for that site to qualify for **deep** context. A
+    /// high-variance arm means the shallow (3-event) context leaves reward
+    /// spread unexplained; if the shallow fine map also produced no
+    /// override, `freeze` emits fine entries keyed by the deep (8-event
+    /// **folded**, gshare-style) context and flags the site
+    /// `FLAG_DEEP_CONTEXT`. Low-variance sites never pay a deep probe or
+    /// table entry — the table-bloat guard that makes context depth
+    /// spend-where-it-pays. `0` disables deep context entirely (no deep
+    /// training upserts, no deep emission — the pre-D certified behavior).
+    pub escalate_variance: f64,
 }
 
 impl TrainingConfig {
@@ -128,6 +142,7 @@ impl TrainingConfig {
             reward_batch: 16,
             demote_fraction: crate::state::ARENA_DEMOTE_VOLUME_FRACTION,
             clamp_percentile: 90,
+            escalate_variance: 0.01,
         }
     }
 }
@@ -140,7 +155,7 @@ impl Default for TrainingConfig {
 
 /// The known keys, used both for file parsing and for deriving the
 /// `LOHALLOC_<KEY>` env-override names.
-const KEYS: [&str; 15] = [
+const KEYS: [&str; 16] = [
     "focus",
     "ucb_c",
     "hysteresis",
@@ -156,6 +171,7 @@ const KEYS: [&str; 15] = [
     "reward_batch",
     "demote_fraction",
     "clamp_percentile",
+    "escalate_variance",
 ];
 
 /// Apply a `focus` preset. Only sets the reward-shape pair — everything
@@ -228,6 +244,13 @@ fn apply_key(cfg: &mut TrainingConfig, key: &str, value: &str) {
             Ok(v) if v.is_finite() && v >= 0.0 => cfg.demote_fraction = v,
             _ => eprintln!(
                 "lohalloc tune: bad value '{value}' for demote_fraction (must be >= 0) ignored"
+            ),
+        },
+        // `0` is valid here (disables deep-context escalation entirely).
+        "escalate_variance" => match value.parse::<f64>() {
+            Ok(v) if v.is_finite() && v >= 0.0 => cfg.escalate_variance = v,
+            _ => eprintln!(
+                "lohalloc tune: bad value '{value}' for escalate_variance (must be >= 0) ignored"
             ),
         },
         // `0` is a valid value here (disables winsorization); values above
@@ -427,6 +450,28 @@ mod tests {
         assert_eq!(cfg.demote_fraction, 2.0);
         apply_key(&mut cfg, "demote_fraction", "junk");
         assert_eq!(cfg.demote_fraction, 2.0);
+    }
+
+    #[test]
+    fn escalate_variance_parses_and_rejects() {
+        let mut cfg = TrainingConfig::default();
+        assert_eq!(
+            cfg.escalate_variance, 0.01,
+            "Roadmap-D REFINED default ON (certified c9g A/B 20260711T204412: \
+             refined gates fixed the c/slab regression, mixed gains reproduced)"
+        );
+        // 0 is valid: disables deep-context escalation entirely.
+        apply_key(&mut cfg, "escalate_variance", "0");
+        assert_eq!(cfg.escalate_variance, 0.0);
+        apply_key(&mut cfg, "escalate_variance", "0.05");
+        assert_eq!(cfg.escalate_variance, 0.05);
+        // Rejected values keep the current setting.
+        apply_key(&mut cfg, "escalate_variance", "-1");
+        assert_eq!(cfg.escalate_variance, 0.05);
+        apply_key(&mut cfg, "escalate_variance", "nan");
+        assert_eq!(cfg.escalate_variance, 0.05);
+        apply_key(&mut cfg, "escalate_variance", "junk");
+        assert_eq!(cfg.escalate_variance, 0.05);
     }
 
     #[test]

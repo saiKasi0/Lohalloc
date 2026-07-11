@@ -463,6 +463,16 @@ run_lohalloc_triple() {
     # certified rt A/B, results/20260711T183928: the ring re-broke the mt-mixed
     # rows the size-aware context register had fixed).
     [ -n "${LOHALLOC_REWARD_TRACK:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_REWARD_TRACK=$LOHALLOC_REWARD_TRACK"
+    # Roadmap-D deep-context escalation gate (LOHALLOC_ESCALATE_VARIANCE, a
+    # tune key): reward/model-shaping, so it rides the train + train/export
+    # legs. `0` disables deep context entirely (training + freeze).
+    [ -n "${LOHALLOC_ESCALATE_VARIANCE:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_ESCALATE_VARIANCE=$LOHALLOC_ESCALATE_VARIANCE"
+    # Servability-aware training opt-in (LOHALLOC_SERVABLE_TRAINING=1):
+    # reward/model-shaping (training must not recommend arms inference cannot
+    # serve — the headerless-Buddy free-rider fix), rides the train +
+    # train/export legs. Unset = default OFF (certified 231127: masking costs
+    # the suite more than the free-rider trap does).
+    [ -n "${LOHALLOC_SERVABLE_TRAINING:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_SERVABLE_TRAINING=$LOHALLOC_SERVABLE_TRAINING"
     run_one "$lang" "$binary" "$workload" "lohalloc" "$preload" "training" "$tune_env"
     local model="$MODEL_DIR/model-${lang}-${workload}.lohalloc"
     echo "==> [train+export] $lang/$workload -> $model (train ops=$TRAIN_OPS)"

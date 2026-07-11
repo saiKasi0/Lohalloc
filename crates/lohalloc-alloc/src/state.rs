@@ -96,6 +96,17 @@ pub fn combine_key_ctx(key: u64, ctx: u8) -> u64 {
         .rotate_left(23)
 }
 
+/// Roadmap-D: the DEEP fine routing key — same derivation as
+/// [`combine_key_ctx`] over a salted coarse key, so a shallow entry at ctx
+/// `x` and a deep entry at deep-ctx `x` for the same site can never alias in
+/// the shared MPHF even though both ctx values live in the same `u8` space.
+/// (Freeze also makes the two families mutually exclusive per site — the
+/// salt is defense in depth and keeps `model_dump` diffs unambiguous.)
+#[inline]
+pub fn combine_key_ctx_deep(key: u64, deep_ctx: u8) -> u64 {
+    combine_key_ctx(key ^ 0xA5A5_5A5A_C33C_3CC3, deep_ctx)
+}
+
 /// One in-flight reward batch for a (Signature, Backend) arm — raw latency
 /// and fragmentation sums awaiting enough samples to convert to a reward.
 #[derive(Clone, Copy, Default)]
@@ -194,6 +205,10 @@ pub struct PendingRewards {
     /// pre-context policy. Fed from both sides: alloc (live AHR ctx) and,
     /// since Phase 1.5, dealloc (the alloc-time ctx from the `Header`).
     fine_batches: BTreeMap<(Signature, u8, u8), PendingBatch>,
+    /// Roadmap-D deep fine batches, keyed `(Signature, backend, deep_ctx)`.
+    /// Alloc-side only, and empty whenever `escalate_variance == 0` (see
+    /// [`AllocatorState::record_fine_deep_latency`]).
+    fine_deep_batches: BTreeMap<(Signature, u8, u8), PendingBatch>,
     /// Task B: per-arm latency histograms keyed `(Signature, backend)` —
     /// **without** ctx, so a coarse `record_latency` sample and a fine
     /// `record_fine_latency` sample for the same arm feed the SAME
@@ -211,6 +226,7 @@ impl PendingRewards {
         Self {
             batches: BTreeMap::new(),
             fine_batches: BTreeMap::new(),
+            fine_deep_batches: BTreeMap::new(),
             hists: BTreeMap::new(),
         }
     }
@@ -272,19 +288,30 @@ impl AllocatorState {
     ///   default backend determined by size class (Slab for small, Buddy
     ///   for medium, System for large).
     pub fn route(&mut self, hash: u64, size: usize) -> Backend {
-        self.route_with_frame(hash, 0, size)
+        self.route_with_frame(hash, 0, size, 0)
     }
 
     /// [`route`](Self::route) plus the J2/Ladder-6 one-frame hash for this
     /// call site (`0` = unknown, e.g. the replay path). Training retains it
     /// per Signature so `freeze()` can distill unambiguous sites into the
     /// 1-frame pin table; Inference ignores it entirely.
-    pub fn route_with_frame(&mut self, hash: u64, one_frame: u64, size: usize) -> Backend {
+    ///
+    /// `unservable_mask`: bit-per-`Backend` arms training must not select
+    /// because this instance's inference path cannot serve them — see
+    /// `BanditPolicy::select_with_frame`. Ignored in Inference (the frozen
+    /// table already passed the freeze-time servability clamp).
+    pub fn route_with_frame(
+        &mut self,
+        hash: u64,
+        one_frame: u64,
+        size: usize,
+        unservable_mask: u8,
+    ) -> Backend {
         match self {
             Self::Training { bandit, .. } => {
                 let size_class = size_class_for(size);
                 let sig = Signature::new(hash, size_class);
-                bandit.select_with_frame(sig, one_frame, crate::tune::config())
+                bandit.select_with_frame(sig, one_frame, crate::tune::config(), unservable_mask)
             }
             Self::Inference { routing } => {
                 // Hash-and-jump: O(1) minimal perfect hash lookup. Zero allocations.
@@ -417,6 +444,69 @@ impl AllocatorState {
         }
     }
 
+    /// Roadmap-D deep counterpart of
+    /// [`record_fine_latency`](Self::record_fine_latency): the same batching,
+    /// keyed on the 8-event **folded** deep context, feeding the bandit's
+    /// passive `fine_deep` map. No-op when `escalate_variance == 0` (the
+    /// disable switch removes the training-time upsert cost too, so the
+    /// off-cell of an A/B is byte-identical to pre-D training). Alloc-side
+    /// only — the `Header` carries just the shallow ctx, and the Part-2 rt
+    /// verdict showed dealloc-side samples are where the noise lives anyway.
+    /// Winsorization: the sample is clamped at the arm's existing histogram
+    /// quantile WITHOUT re-recording it (the coarse/shallow record paths in
+    /// the same lock section already recorded this very sample; a third
+    /// record would over-count it in the arm's distribution).
+    pub fn record_fine_deep_latency(
+        &mut self,
+        hash: u64,
+        backend: Backend,
+        size_class: u8,
+        deep_ctx: u8,
+        latency_ns: u64,
+        total_bytes: usize,
+    ) {
+        if let Self::Training { bandit, pending } = self {
+            let cfg = crate::tune::config();
+            if cfg.escalate_variance <= 0.0 {
+                return;
+            }
+            let sig = Signature::new(hash, size_class);
+            // Peek-clamp against the arm's histogram (same warmup rule as
+            // `winsorize_latency`, minus the record).
+            let latency_ns = if cfg.clamp_percentile > 0 {
+                match pending.hists.get(&(sig, backend as u8)) {
+                    Some(h) if h.total >= cfg.reward_batch as u64 => {
+                        latency_ns.min(h.quantile(cfg.clamp_percentile))
+                    }
+                    _ => latency_ns,
+                }
+            } else {
+                latency_ns
+            };
+            let frag_pct = if cfg.frag_weight > 0.0 {
+                crate::frag_pct_for(backend, total_bytes)
+            } else {
+                0.0
+            };
+            let batch = pending
+                .fine_deep_batches
+                .entry((sig, backend as u8, deep_ctx))
+                .or_default();
+            batch.latency_sum += latency_ns;
+            batch.frag_sum += frag_pct;
+            batch.count += 1;
+            if batch.count >= cfg.reward_batch {
+                let mean_latency = batch.latency_sum / batch.count as u64;
+                let mean_frag = batch.frag_sum / batch.count as f32;
+                let reward = shaped_reward(mean_latency, mean_frag, cfg);
+                bandit.update_fine_deep(sig, deep_ctx, backend, reward, batch.count);
+                pending
+                    .fine_deep_batches
+                    .remove(&(sig, backend as u8, deep_ctx));
+            }
+        }
+    }
+
     /// True when this state's routing has stabilized enough to freeze —
     /// the `freeze_mode=converged` trigger, forwarded to
     /// [`BanditPolicy::is_converged`] with the configured thresholds.
@@ -467,7 +557,7 @@ impl AllocatorState {
     ///
     /// Panics if called when already in Inference mode. `freeze()` is a
     /// one-way transition.
-    pub fn freeze(&mut self, demote_arena: bool, demote_fraction: f64) {
+    pub fn freeze(&mut self, demote_arena: bool, demote_fraction: f64, escalate_variance: f64) {
         match self {
             Self::Training { bandit, .. } => {
                 // Same per-size-class clamp for both tables: a distilled
@@ -514,7 +604,7 @@ impl AllocatorState {
                     .iter()
                     .map(|&(key, _, _, heavy)| (key, heavy))
                     .collect();
-                let fine = bandit.freeze_fine(&final_map);
+                let fine = bandit.freeze_fine(&final_map, escalate_variance);
                 // One pass: clamp each fine entry with its parent's heavy
                 // verdict; drop any whose clamped verdict collapses back to
                 // the parent's final backend (it would only buy an extra
@@ -536,12 +626,32 @@ impl AllocatorState {
                     fine_entries.push((fine_key, size_class, clamped, 0u8));
                     surviving_parents.insert(coarse_key);
                 }
+                // Roadmap-D deep entries: same clamp/collapse rules. Deep and
+                // shallow parents are disjoint by bandit construction (deep
+                // is only emitted where no shallow entry was), so each site
+                // carries at most one of the two flags.
+                let mut deep_surviving_parents: BTreeSet<u64> = BTreeSet::new();
+                for &(deep_key, coarse_key, size_class, backend) in &fine.deep_entries {
+                    let parent_heavy = heavy_map.get(&coarse_key).copied().unwrap_or(true);
+                    let clamped = clamp_backend_for_size_class(
+                        size_class,
+                        backend,
+                        demote_arena && parent_heavy,
+                    );
+                    if final_map.get(&coarse_key) == Some(&clamped) {
+                        continue;
+                    }
+                    fine_entries.push((deep_key, size_class, clamped, 0u8));
+                    deep_surviving_parents.insert(coarse_key);
+                }
 
                 let mut main_quads: Vec<(u64, u8, lohalloc_core::Backend, u8)> = main_clamped
                     .into_iter()
                     .map(|(key, size_class, backend, _)| {
                         let flags = if surviving_parents.contains(&key) {
                             crate::perfect_hash::FLAG_HAS_CONTEXT
+                        } else if deep_surviving_parents.contains(&key) {
+                            crate::perfect_hash::FLAG_DEEP_CONTEXT
                         } else {
                             0
                         };
@@ -595,6 +705,17 @@ impl AllocatorState {
     pub fn fine_snapshot(&self) -> Vec<crate::bandit::FineSnapshotRow> {
         match self {
             Self::Training { bandit, .. } => bandit.fine_snapshot(),
+            Self::Inference { .. } => Vec::new(),
+        }
+    }
+
+    /// Diagnostic passthrough to [`BanditPolicy::variance_snapshot`] — the
+    /// paradigm-investigation aliasing meter (empty in Inference mode).
+    /// Test/route-metrics introspection only.
+    #[cfg(any(feature = "route-metrics", test))]
+    pub fn variance_snapshot(&self) -> Vec<(u64, u8, u32, Backend, f64)> {
+        match self {
+            Self::Training { bandit, .. } => bandit.variance_snapshot(),
             Self::Inference { .. } => Vec::new(),
         }
     }
@@ -1088,7 +1209,7 @@ mod tests {
             state.record_latency(100, backend, size_class_for(64), 10, 64);
         }
         assert!(!state.is_inference());
-        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
         assert!(state.is_inference());
     }
 
@@ -1105,7 +1226,7 @@ mod tests {
                 state.record_latency(100, Backend::Arena, size_class_for(64), 10, 64);
             }
         }
-        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
 
         // In Inference, routing for hash 100 should return the frozen backend.
         let backend = state.route(100, 64);
@@ -1125,7 +1246,7 @@ mod tests {
             let backend = state.route(50, 64);
             state.record_latency(50, backend, size_class_for(64), 10, 64);
         }
-        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
 
         // record_latency() in Inference mode should be a no-op (not panic).
         state.record_latency(50, Backend::Slab, size_class_for(64), 10, 64);
@@ -1140,7 +1261,7 @@ mod tests {
             let backend = state.route(100, 64);
             state.record_latency(100, backend, size_class_for(64), 10, 64);
         }
-        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
 
         // Hash 999 was never seen → should fall back to size-based default.
         let backend = state.route(999, 64);
@@ -1151,7 +1272,7 @@ mod tests {
     #[test]
     fn inference_falls_back_for_large_size() {
         let mut state = AllocatorState::new_training();
-        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
         // Size > BUDDY_MAX → System.
         let backend = state.route(999, 2 * 1024 * 1024);
         assert_eq!(backend, Backend::System);
@@ -1172,7 +1293,7 @@ mod tests {
             // `inference_mode_routes_via_perfect_hash`'s forced-Arena case.
             state.record_latency(200, Backend::System, sc, 10, size);
         }
-        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
 
         let backend = state.route(200, size);
         assert_ne!(
@@ -1196,7 +1317,7 @@ mod tests {
             let _ = state.route(201, size);
             state.record_latency(201, Backend::System, sc, 10, size);
         }
-        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
 
         assert_eq!(state.route(201, size), Backend::System);
     }
@@ -1220,11 +1341,11 @@ mod tests {
         // backend instead — Slab for slab-range, Buddy for buddy-range.
         // This is what kills the freeze-at-1000 arena/slab coin flip.
         let mut small = train_arena_locked(300, 64); // sc 0-11 → Slab
-        small.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION);
+        small.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
         assert_eq!(small.route(300, 64), Backend::Slab);
 
         let mut mid = train_arena_locked(301, 20_000); // sc 12 → Buddy
-        mid.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION);
+        mid.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
         assert_eq!(mid.route(301, 20_000), Backend::Buddy);
     }
 
@@ -1233,7 +1354,7 @@ mod tests {
         // A deployment that resets its arena (GUI/replay) keeps Arena
         // verdicts — demotion is strictly opt-in via the flag.
         let mut state = train_arena_locked(302, 64);
-        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
         assert_eq!(state.route(302, 64), Backend::Arena);
     }
 
@@ -1243,7 +1364,7 @@ mod tests {
         // blanket behavior) — any signature with pulls > 0 satisfies
         // `pulls/total >= 0.0`.
         let mut state = train_arena_locked(303, 64);
-        state.freeze(true, 0.0);
+        state.freeze(true, 0.0, 0.0);
         assert_eq!(state.route(303, 64), Backend::Slab);
     }
 
@@ -1254,7 +1375,7 @@ mod tests {
         // (train_arena_locked's single signature IS 100% of its table, the
         // heaviest case possible.)
         let mut state = train_arena_locked(304, 64);
-        state.freeze(true, 2.0);
+        state.freeze(true, 2.0, 0.0);
         assert_eq!(state.route(304, 64), Backend::Arena);
     }
 
@@ -1282,16 +1403,16 @@ mod tests {
             state.record_fine_latency(hash, Backend::Slab, sc, 7, 20_000, size);
         }
         // demote_arena=false (resets observed): fine Arena verdicts survive.
-        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
 
         let routing = state.routing().expect("inference");
         let key = combine_hash_size_class(hash, sc);
         // Unrelated ctx → coarse verdict.
-        assert_eq!(routing.route_main(key, Some(3)), Some(Backend::Slab));
+        assert_eq!(routing.route_main(key, Some((3, 0))), Some(Backend::Slab));
         // No register maintained → coarse verdict (degraded, correct).
         assert_eq!(routing.route_main(key, None), Some(Backend::Slab));
         // ctx 7 → the fine override.
-        assert_eq!(routing.route_main(key, Some(7)), Some(Backend::Arena));
+        assert_eq!(routing.route_main(key, Some((7, 0))), Some(Backend::Arena));
         // The coarse entry itself is flagged.
         assert_eq!(
             routing.main.lookup_with_flags(key).map(|(_, f)| f),
@@ -1323,10 +1444,10 @@ mod tests {
         // the fine Arena verdict clamps to Slab == parent → dropped, and
         // with no surviving fine sibling the coarse entry must NOT be
         // flagged (a flag with no siblings is a wasted probe forever).
-        state.freeze(true, 0.0);
+        state.freeze(true, 0.0, 0.0);
         let routing = state.routing().expect("inference");
         let key = combine_hash_size_class(hash, sc);
-        assert_eq!(routing.route_main(key, Some(7)), Some(Backend::Slab));
+        assert_eq!(routing.route_main(key, Some((7, 0))), Some(Backend::Slab));
         assert_eq!(routing.main.lookup_with_flags(key).map(|(_, f)| f), Some(0));
         assert!(!routing.has_context_entries());
     }
@@ -1342,10 +1463,10 @@ mod tests {
         let sc = size_class_for(size);
         let mut state = AllocatorState::new_training();
         for _ in 0..20 {
-            let _ = state.route_with_frame(400, 41, size);
+            let _ = state.route_with_frame(400, 41, size, 0);
             state.record_latency(400, Backend::Arena, sc, 10, size);
         }
-        state.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
         let distilled = state.distilled_table().expect("inference mode");
         let key = combine_hash_size_class(41, sc);
         match distilled.lookup(key) {
@@ -1440,7 +1561,7 @@ mod tests {
             let _ = state.route(501, 256);
             state.record_latency(501, Backend::Slab, size_class_for(256), 10, 256);
         }
-        state.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
         assert_eq!(
             state.route(500, size),
             Backend::Arena,
@@ -1465,7 +1586,7 @@ mod tests {
             let _ = state.route(511, size);
             state.record_latency(511, Backend::Arena, sc, 10, size);
         }
-        state.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
         assert_eq!(
             state.route(510, size),
             Backend::Slab,
@@ -1489,15 +1610,15 @@ mod tests {
         let mut state = AllocatorState::new_training();
         // Light arena site with a stable one-frame (so distill() emits it).
         for _ in 0..20 {
-            let _ = state.route_with_frame(520, 61, size);
+            let _ = state.route_with_frame(520, 61, size, 0);
             state.record_latency(520, Backend::Arena, sc, 10, size);
         }
         // Heavy slab site on a different one-frame, dominating volume.
         for _ in 0..1000 {
-            let _ = state.route_with_frame(521, 62, 256);
+            let _ = state.route_with_frame(521, 62, 256, 0);
             state.record_latency(521, Backend::Slab, size_class_for(256), 10, 256);
         }
-        state.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(true, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
         let distilled = state.distilled_table().expect("inference mode");
         let key = combine_hash_size_class(61, sc);
         match distilled.lookup(key) {
@@ -1525,7 +1646,7 @@ mod tests {
             let backend = state.route(2, 256);
             state.record_latency(2, backend, size_class_for(256), 10, 256);
         }
-        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
 
         // Export.
         let bytes = state.export().expect("export should work in Inference");
@@ -1546,7 +1667,7 @@ mod tests {
             let backend = state.route(42, 64);
             state.record_latency(42, backend, size_class_for(64), 10, 64);
         }
-        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
         let bytes = state.export().unwrap();
 
         let loaded = AllocatorState::load(&bytes).unwrap();
@@ -1557,8 +1678,8 @@ mod tests {
     #[should_panic(expected = "freeze() called on an already-frozen")]
     fn freeze_twice_panics() {
         let mut state = AllocatorState::new_training();
-        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
-        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION); // Should panic.
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION, 0.0); // Should panic.
     }
 
     #[test]
@@ -1610,7 +1731,7 @@ mod tests {
             let b = state.route(42, 64);
             state.record_latency(42, b, size_class_for(64), 10, 64);
         }
-        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
         assert!(state.routing_snapshot().is_empty());
         assert_eq!(state.signature_count(), 0);
     }
@@ -1625,7 +1746,7 @@ mod tests {
         assert!(!state.is_inference());
         assert_eq!(state.signature_count(), 1);
 
-        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION);
+        state.freeze(false, ARENA_DEMOTE_VOLUME_FRACTION, 0.0);
         assert!(state.is_inference());
         assert_eq!(state.signature_count(), 0);
 
