@@ -50,6 +50,7 @@
 //! | `freeze_after`      | (none)  | op-count threshold; the env var `LOHALLOC_FREEZE_AFTER` (read by `lohalloc-cabi`) takes precedence over this key |
 //! | `reward_batch`      | 16      | latency samples averaged per bandit reward update; de-quantizes the ARM ~42ns `Instant` tick floor. `1` = pre-Ladder-4 per-op behavior |
 //! | `demote_fraction`   | 0.10    | freeze-time Arena-demotion volume threshold (J5-A bisect knob): `0.0` = demote every Arena verdict (J4-C blanket), `>1.0` = never demote |
+//! | `clamp_percentile`  | 90      | Task B per-arm spike winsorization: each latency sample is capped at a running percentile of *its own arm's* latency distribution *before* entering its reward batch (replaces the retired fixed `latency_clamp_ns` constant); `0` disables winsorization, valid range `0..=100` |
 
 /// How the training→inference transition is triggered (consumed by
 /// `lohalloc-cabi`'s auto-freeze and `native_workload`'s driver — the
@@ -92,6 +93,22 @@ pub struct TrainingConfig {
     /// verdict (the J4-C blanket behavior); `0.10` is the certified J5
     /// volume-selective default; `> 1.0` never demotes.
     pub demote_fraction: f64,
+    /// Task B per-arm spike winsorization: cap each raw latency sample at a
+    /// running high percentile of *its own arm's* latency distribution
+    /// *before* it enters its reward batch. Why: rewards are credited per
+    /// *batch mean* with weight `batch.count`, so one cold chunk/segment mmap
+    /// spike (10-100µs) in a 16-sample batch drags the whole batch's reward
+    /// toward 0 and poisons 16 pulls at once — the bandit then scores an arm
+    /// by its refill spikes instead of its steady-state cost. The retired
+    /// Phase-1.5 `latency_clamp_ns` used one global constant for this, which
+    /// helps a cold-spike bump arena but hurts a high-tail contended slab mix
+    /// (a real c9g A/B split). A per-arm quantile lets a bump arena self-clamp
+    /// low (its spikes are noise) while a contended slab mix self-clamps high
+    /// (its tail is signal). Applies to both alloc- and dealloc-side samples,
+    /// sharing one histogram per `(Signature, backend)` (see
+    /// `state::winsorize_latency`). `0` disables winsorization entirely
+    /// (pre-1.5 behavior); valid range `0..=100`.
+    pub clamp_percentile: u8,
 }
 
 impl TrainingConfig {
@@ -110,6 +127,7 @@ impl TrainingConfig {
             freeze_after: None,
             reward_batch: 16,
             demote_fraction: crate::state::ARENA_DEMOTE_VOLUME_FRACTION,
+            clamp_percentile: 90,
         }
     }
 }
@@ -122,7 +140,7 @@ impl Default for TrainingConfig {
 
 /// The known keys, used both for file parsing and for deriving the
 /// `LOHALLOC_<KEY>` env-override names.
-const KEYS: [&str; 14] = [
+const KEYS: [&str; 15] = [
     "focus",
     "ucb_c",
     "hysteresis",
@@ -137,6 +155,7 @@ const KEYS: [&str; 14] = [
     "freeze_after",
     "reward_batch",
     "demote_fraction",
+    "clamp_percentile",
 ];
 
 /// Apply a `focus` preset. Only sets the reward-shape pair — everything
@@ -209,6 +228,14 @@ fn apply_key(cfg: &mut TrainingConfig, key: &str, value: &str) {
             Ok(v) if v.is_finite() && v >= 0.0 => cfg.demote_fraction = v,
             _ => eprintln!(
                 "lohalloc tune: bad value '{value}' for demote_fraction (must be >= 0) ignored"
+            ),
+        },
+        // `0` is a valid value here (disables winsorization); values above
+        // 100 are meaningless as a percentile and are rejected.
+        "clamp_percentile" => match value.parse::<u8>() {
+            Ok(v) if v <= 100 => cfg.clamp_percentile = v,
+            _ => eprintln!(
+                "lohalloc tune: bad value '{value}' for clamp_percentile (must be 0..=100) ignored"
             ),
         },
         other => eprintln!("lohalloc tune: unknown key '{other}' ignored"),
@@ -400,6 +427,26 @@ mod tests {
         assert_eq!(cfg.demote_fraction, 2.0);
         apply_key(&mut cfg, "demote_fraction", "junk");
         assert_eq!(cfg.demote_fraction, 2.0);
+    }
+
+    #[test]
+    fn clamp_percentile_parses_and_rejects() {
+        let mut cfg = TrainingConfig::default();
+        assert_eq!(cfg.clamp_percentile, 90, "Task B default");
+        // 0 is valid: it disables winsorization (pre-1.5 behavior).
+        apply_key(&mut cfg, "clamp_percentile", "0");
+        assert_eq!(cfg.clamp_percentile, 0);
+        apply_key(&mut cfg, "clamp_percentile", "95");
+        assert_eq!(cfg.clamp_percentile, 95);
+        apply_key(&mut cfg, "clamp_percentile", "100");
+        assert_eq!(cfg.clamp_percentile, 100);
+        // Rejected values keep the current setting: > 100, negative, non-numeric.
+        apply_key(&mut cfg, "clamp_percentile", "101");
+        assert_eq!(cfg.clamp_percentile, 100);
+        apply_key(&mut cfg, "clamp_percentile", "-1");
+        assert_eq!(cfg.clamp_percentile, 100);
+        apply_key(&mut cfg, "clamp_percentile", "junk");
+        assert_eq!(cfg.clamp_percentile, 100);
     }
 
     #[test]

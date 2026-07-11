@@ -67,6 +67,13 @@ const MAGIC: u64 = 0x534d4152414c4844; // "LOHALALHD"
 /// (the re-entrancy-guard bypass, the standalone `arena_alloc` helper).
 const SIZE_CLASS_UNTRACKED: u8 = 0xFF;
 
+/// `Header::ctx` value meaning "no allocation-history context was captured
+/// at alloc time" — allocations that bypass `route_alloc_inner` (re-entrancy
+/// bypass, `arena_alloc`, the cabi fused helpers, the pin fast path) and
+/// allocations made while the AHR is gated off. Real contexts are `0..2^CTX_BITS`
+/// (`CTX_BITS` = 6 → `0..=63`), so `0xFF` can never collide.
+const CTX_UNTRACKED: u8 = 0xFF;
+
 /// Per-allocation header prepended to the user-visible pointer. Lets
 /// `dealloc` identify the owning backend without guessing by size.
 ///
@@ -99,7 +106,16 @@ struct Header {
     /// hint 5/256 but a 298-byte total in class 6/512).
     /// [`SIZE_CLASS_UNTRACKED`] for every non-Slab backend.
     slab_class: u8,
-    _pad: [u8; 4],
+    /// Phase 1.5: the allocation-history context (`AHR` low `CTX_BITS`) this
+    /// allocation was routed under, captured at alloc time so the dealloc
+    /// side can attribute its latency to the *same* fine `(Signature, ctx)`
+    /// arm the alloc side observed — this is what makes Arena's
+    /// free-is-a-no-op advantage visible to the shadow fine bandit (the
+    /// alloc-side-only fine map scored Slab above Arena in every ctx while
+    /// forced-arena wall time won 4.5×). [`CTX_UNTRACKED`] when no context
+    /// was captured (Decision-Engine bypass, AHR gated off).
+    ctx: u8,
+    _pad: [u8; 3],
     /// Size passed to the backend's `alloc` (the *total* including this
     /// header's padding). Slab/Buddy use it to compute the free-list/ order on
     /// dealloc. System ignores it (uses `base`/`map_len`).
@@ -358,6 +374,18 @@ pub struct Lohalloc {
     /// existing GUI/training reward-attribution path, which needs the
     /// header's `hash`/`size_class_hint` on dealloc).
     slab_headerless: CachePadded<AtomicBool>,
+    /// Phase 1.6 (default-on): one-time guard for the first-allocation
+    /// training-headerless latch. `false` until the very first allocation
+    /// this instance serves runs `latch_train_headerless_once`, which flips
+    /// it `true` (a `swap`) and — unless the instance is already frozen or
+    /// `LOHALLOC_TRAIN_HEADERLESS=0` is set — latches the header-free fast
+    /// paths so the bandit's alloc-side reward is measured on the same path
+    /// inference runs (see `latch_train_headerless_once`'s doc). The hot
+    /// path reads it with one relaxed load; after the first alloc it is a
+    /// never-again-written shared load. Not `load()`-related: an
+    /// inference-booted instance skips the latch via the `frozen` check but
+    /// still flips this once so it never re-enters the cold path.
+    train_headerless_init: CachePadded<AtomicBool>,
     /// Maps a header-free Slab segment's base address to its class, so
     /// `dealloc`/cabi entry points can recover a headerless block's class
     /// from its address alone. See `registry::SegmentRegistry`.
@@ -541,16 +569,83 @@ fn record_slab_central_refill(_steps: u64, _sibling_hit: bool) {
     }
 }
 
+/// Phase 1.6 reward-basis diagnostic (route-metrics/test only). Per-backend
+/// cumulative *measured* alloc- and dealloc-latency and op counts, so the
+/// per-op cost the bandit's reward is built from can be decomposed against
+/// the wall-clock truth (`context_gap` shows forced-Arena beating
+/// forced-Slab several× on wall time while the per-op reward ranks Slab
+/// higher — this is the instrument to find out why). Indexed by
+/// `Backend as usize` = `[Slab, Buddy, System, Arena]`. Unconditionally
+/// recorded (both Training and Inference) under the gate so a *forced*
+/// inference run — the only way to isolate one backend — is measurable;
+/// production builds emit none of it.
+#[cfg(any(feature = "route-metrics", test))]
+static ALLOC_NS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+#[cfg(any(feature = "route-metrics", test))]
+static ALLOC_CNT: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+#[cfg(any(feature = "route-metrics", test))]
+static DEALLOC_NS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+#[cfg(any(feature = "route-metrics", test))]
+static DEALLOC_CNT: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Accumulate one measured alloc latency for `backend`. Only compiled (and
+/// only called — its call site is behind the same gate) under
+/// `route-metrics`/`test`; production emits neither the symbol nor the
+/// `now_ns()` timing that feeds it.
+#[cfg(any(feature = "route-metrics", test))]
+#[inline(always)]
+fn record_alloc_latency(backend: lohalloc_core::Backend, ns: u64) {
+    let i = backend as usize;
+    ALLOC_NS[i].fetch_add(ns, Ordering::Relaxed);
+    ALLOC_CNT[i].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Accumulate one measured dealloc latency for `backend`. Same gating as
+/// [`record_alloc_latency`].
+#[cfg(any(feature = "route-metrics", test))]
+#[inline(always)]
+fn record_dealloc_latency(backend: lohalloc_core::Backend, ns: u64) {
+    let i = backend as usize;
+    DEALLOC_NS[i].fetch_add(ns, Ordering::Relaxed);
+    DEALLOC_CNT[i].fetch_add(1, Ordering::Relaxed);
+}
+
 // ---------------------------------------------------------------------------
 // Phase-1 context routing: the per-thread Allocation-History Register (AHR).
 //
-// A gshare-style global history register (branch-predictor import): one bit
-// per allocator event — `1` per alloc, `0` per dealloc, LSB = most recent.
-// The low [`CTX_BITS`] bits are the routing context: a churn regime reads as
-// alternating `…1010`, a burst regime as a run of `…1111` — separable even
-// when every allocation has the *same* size class (which is exactly where
-// `(site, size_class)` routing is structurally blind; size-class history
-// would carry zero signal there). The context feeds two places:
+// A gshare-style global history register (branch-predictor import): a fixed
+// **2-bit code per allocator event**, LSB = most recent event —
+//   `0` = dealloc,  `1` = small alloc (Slab),  `2` = mid alloc (Buddy),
+//   `3` = large alloc (System).
+// The low [`CTX_BITS`] bits (= [`CTX_EVENTS`] events) are the routing context.
+// Part 3 (size-aware register): the original encoding was one bit per event
+// (alloc=1/dealloc=0), which separates churn (`…1010`) from burst (`…1111`)
+// but is **size-blind** — useless for multi-size workloads (e.g. adv-mixed,
+// where every alloc under one call site draws a random size and the *only*
+// discriminating signal is the size sequence). The 2-bit code is a strict
+// superset: dealloc stays `0`, so churn-vs-burst is still separable (any
+// alloc code is nonzero), while a varying size stream now carries signal too.
+// The context feeds two places:
 //
 // - Training: the shadow fine bandit (`BanditPolicy::update_fine`) learns
 //   per-`(Signature, ctx)` reward statistics from alloc-side rewards.
@@ -565,27 +660,54 @@ fn record_slab_central_refill(_steps: u64, _sibling_hit: bool) {
 // `Lohalloc` instances — history is a property of the thread's allocation
 // stream, and training/inference consistency only requires that reads and
 // pushes happen at the same points in both modes (they do: ctx is read
-// before the current alloc's push; deallocs push but never read).
+// before the current alloc's push; deallocs push but never read). The 2-bit
+// event code must be pushed identically in both modes (it is — the `ahr_*`
+// helpers are mode-agnostic), preserving the C6 hash-identity invariant.
 // ---------------------------------------------------------------------------
 
-/// Number of history bits in the routing context (16 context values).
-pub(crate) const CTX_BITS: u32 = 4;
+/// Bits per event in the register (Part 3: 2-bit size-aware event code).
+const CTX_EVENT_BITS: u32 = 2;
+/// Number of events of history in the routing context.
+pub(crate) const CTX_EVENTS: u32 = 3;
+/// Number of history bits in the routing context (`CTX_EVENTS * CTX_EVENT_BITS`
+/// = 6 → 64 context values, all `< CTX_UNTRACKED = 0xFF`).
+pub(crate) const CTX_BITS: u32 = CTX_EVENTS * CTX_EVENT_BITS;
 /// Low-bits mask selecting the context from the register.
 pub(crate) const CTX_MASK: u64 = (1 << CTX_BITS) - 1;
 
+/// The 2-bit event code for an alloc of the given `size_class` (never `0`, so
+/// it is always distinguishable from a dealloc). Slab (`≤ SLAB_MAX`, classes
+/// `0..=11`) → `1`, Buddy (mid) → `2`, System (large) → `3`. `SIZE_CLASS_UNTRACKED`
+/// (Decision-Engine-bypass allocs) maps to `1` — those never context-route, so
+/// their code only feeds *other* sites' history, where "some small-ish alloc
+/// happened" is the honest summary.
+#[inline(always)]
+fn ahr_alloc_code(size_class: u8) -> u64 {
+    // Slab size classes span 0..=11 (≤ 16 KiB); Buddy 12..=13 (≤ 1 MiB);
+    // System 14.. — see `state::size_class_for`.
+    if size_class == SIZE_CLASS_UNTRACKED || size_class <= 11 {
+        1
+    } else if size_class <= 13 {
+        2
+    } else {
+        3
+    }
+}
+
 thread_local! {
-    /// The allocation-history register: event bits, LSB = most recent.
+    /// The allocation-history register: 2-bit event codes, LSB = most recent.
     static AHR: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
 }
 
-/// Read this thread's routing context, then push the current alloc's event
-/// bit. Read-before-push is load-bearing: the context describes the history
-/// *before* this allocation, identically in training and inference.
+/// Read this thread's routing context, then push the current alloc's 2-bit
+/// size-aware event code. Read-before-push is load-bearing: the context
+/// describes the history *before* this allocation, identically in training
+/// and inference.
 #[inline(always)]
-fn ahr_ctx_and_push_alloc() -> u8 {
+fn ahr_ctx_and_push_alloc(size_class: u8) -> u8 {
     AHR.with(|a| {
         let v = a.get();
-        a.set((v << 1) | 1);
+        a.set((v << CTX_EVENT_BITS) | ahr_alloc_code(size_class));
         (v & CTX_MASK) as u8
     })
 }
@@ -594,14 +716,162 @@ fn ahr_ctx_and_push_alloc() -> u8 {
 /// context-probe, e.g. the pin-cache-served fast path — their events are
 /// still part of every other site's history).
 #[inline(always)]
-fn ahr_push_alloc() {
-    AHR.with(|a| a.set((a.get() << 1) | 1));
+fn ahr_push_alloc(size_class: u8) {
+    AHR.with(|a| a.set((a.get() << CTX_EVENT_BITS) | ahr_alloc_code(size_class)));
 }
 
-/// Push a dealloc event (`0` bit).
+/// Push a dealloc event (code `0`).
 #[inline(always)]
 fn ahr_push_dealloc() {
-    AHR.with(|a| a.set(a.get() << 1));
+    AHR.with(|a| a.set(a.get() << CTX_EVENT_BITS));
+}
+
+// ---------------------------------------------------------------------------
+// Part 2: bilateral reward recovery on the headerless training path.
+//
+// Headerless training (default-on) drops the 48-byte `Header`, so the free
+// path early-returns before `dealloc_with_header` and the bandit never sees a
+// backend's *free* cost — fine for Arena (free is a no-op) and Slab (a
+// magazine push), but the deciding signal for Buddy/System-range sizes
+// (coalescing / munmap), which is exactly the mixed/adv-mixed regression front.
+//
+// Recovery without re-introducing the header: a per-thread, fixed-capacity,
+// allocation-free **direct-mapped** table maps a recent headerless alloc's
+// user pointer to the routing key it was served under `(hash, size_class, ctx,
+// size)`. On a headerless free, the branch that fires already tells us the
+// ACTUAL serving backend (Slab/Buddy/Arena registry hit — the same fact
+// `dealloc_with_header` reads from `header.backend`), so the table only needs
+// the routing key. A hit attributes the timed free to that arm via the SAME
+// `record_latency`/`record_fine_latency` path header-based training uses; a
+// miss (slot evicted by a newer alloc, or foreign ptr) simply skips
+// attribution — never incorrect, just alloc-side-only as before. Direct-mapped
+// (not a scan) keeps both record and lookup O(1); the ptr-tag check makes a
+// collision a miss, so it degrades safely. It preferentially captures
+// short-lived churny frees — where free cost matters most — which is the right
+// sample bias.
+// ---------------------------------------------------------------------------
+
+/// Direct-mapped reward-track slots per thread (power of two). 512 × 24 B =
+/// 12 KiB/thread, lives inline in the TLS block (no heap, no destructor —
+/// same discipline as `AHR`) — captures the recent-alloc working set of the
+/// churny workloads this targets without the memory of a full ptr map.
+const REWARD_TRACK_SLOTS: usize = 512;
+const REWARD_TRACK_MASK: usize = REWARD_TRACK_SLOTS - 1;
+
+/// One recorded headerless-alloc routing decision. `ptr == 0` = empty slot.
+/// Backend is deliberately absent — the dealloc branch recovers it.
+#[derive(Clone, Copy)]
+struct RewardTrackEntry {
+    ptr: usize,
+    hash: u64,
+    size: u32,
+    size_class: u8,
+    ctx: u8,
+}
+
+impl RewardTrackEntry {
+    const EMPTY: Self = Self {
+        ptr: 0,
+        hash: 0,
+        size: 0,
+        size_class: 0,
+        ctx: 0,
+    };
+}
+
+thread_local! {
+    /// Per-thread reward-track table, inline in the TLS block (`const` init =
+    /// zero-cost until first touch, **no heap allocation and no destructor** —
+    /// the same dtor-free discipline as `AHR`; a boxed version would allocate
+    /// through our own allocator on first use and run a free at thread exit).
+    /// `UnsafeCell` (not `RefCell`): access is single-threaded and the
+    /// record/lookup bodies never allocate or re-enter, so there is no borrow
+    /// to check.
+    static REWARD_TRACK: core::cell::UnsafeCell<[RewardTrackEntry; REWARD_TRACK_SLOTS]> =
+        const { core::cell::UnsafeCell::new([RewardTrackEntry::EMPTY; REWARD_TRACK_SLOTS]) };
+}
+
+/// Slot for a user pointer: pointers are ≥ `MIN_ALIGN`-aligned, so the low
+/// bits are constant — shift them out before masking, like the pin cache.
+#[inline(always)]
+fn reward_track_slot(ptr: usize) -> usize {
+    (ptr >> 4) & REWARD_TRACK_MASK
+}
+
+/// Record a headerless alloc's routing key, keyed by its user pointer.
+/// Overwrites whatever shared the slot (eviction = a future miss, harmless).
+#[inline]
+fn reward_track_record(ptr: usize, hash: u64, size: u32, size_class: u8, ctx: u8) {
+    REWARD_TRACK.with(|t| {
+        // SAFETY: single-threaded TLS access; the write does not allocate or
+        // re-enter the allocator, so no other borrow of this cell is live.
+        let table = unsafe { &mut *t.get() };
+        table[reward_track_slot(ptr)] = RewardTrackEntry {
+            ptr,
+            hash,
+            size,
+            size_class,
+            ctx,
+        };
+    })
+}
+
+/// Look up and CLEAR a headerless block's recorded routing key on free.
+/// `None` on a miss (slot evicted / never recorded / foreign ptr). Clearing
+/// prevents a double-free or a realloc-freed pointer from attributing twice.
+#[inline]
+fn reward_track_take(ptr: usize) -> Option<RewardTrackEntry> {
+    REWARD_TRACK.with(|t| {
+        // SAFETY: as in `reward_track_record` — single-threaded, non-reentrant.
+        let table = unsafe { &mut *t.get() };
+        let slot = &mut table[reward_track_slot(ptr)];
+        if slot.ptr == ptr {
+            let entry = *slot;
+            slot.ptr = 0;
+            Some(entry)
+        } else {
+            None
+        }
+    })
+}
+
+/// Process-global reward-track enable latch: `0` = uninit, `1` = on, `2` =
+/// off. **Default OFF** — the certified rt-on/rt-off c9g A/B
+/// (`results/20260711T183928`) showed the ring's dealloc-side samples
+/// re-break every mt-mixed-t4/t8 row (+0.42–0.46 vs jemalloc) and adv-mixed:
+/// with the Part-3 size-aware context register the alloc-side reward already
+/// ranks the mixed arms correctly, and folding in noisy free-cost samples
+/// (Buddy coalescing / magazine flush variance) mis-shapes what was right.
+/// `LOHALLOC_REWARD_TRACK=1` opts in (diagnostic / future re-evaluation, e.g.
+/// once TAGE variance-escalation can down-weight noisy arms). Read once via
+/// `getenv` then cached — same allocation-free discipline as
+/// `stripe_override`/`train_headerless_disabled`.
+static REWARD_TRACK_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// Whether headerless-path bilateral reward attribution is enabled (default
+/// **off**; `LOHALLOC_REWARD_TRACK=1` enables). One relaxed load after the
+/// first call.
+#[inline]
+fn reward_track_enabled() -> bool {
+    let s = REWARD_TRACK_STATE.load(Ordering::Relaxed);
+    if s != 0 {
+        return s == 1;
+    }
+    // SAFETY: NUL-terminated literal; getenv returns NULL or a pointer into
+    // the C environment (no setenv on the allocator hot path).
+    let p = unsafe { libc::getenv(b"LOHALLOC_REWARD_TRACK\0".as_ptr().cast()) };
+    let on = !p.is_null() && unsafe { *p == b'1' as libc::c_char && *p.offset(1) == 0 };
+    REWARD_TRACK_STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+    on
+}
+
+/// Test-only: force the reward-track latch, bypassing the env read — the
+/// latch is process-global and the test harness runs many tests in one
+/// process, so env manipulation cannot reliably reach a specific test's
+/// first-read window.
+#[cfg(test)]
+fn reward_track_force(enabled: bool) {
+    REWARD_TRACK_STATE.store(if enabled { 1 } else { 2 }, Ordering::Relaxed);
 }
 
 impl Default for Lohalloc {
@@ -672,6 +942,29 @@ fn stripe_override() -> Option<usize> {
     Some(n)
 }
 
+/// Allocation-free read of the `LOHALLOC_TRAIN_HEADERLESS` off-switch — the
+/// rollback/ablation hatch for Phase 1.6's default-on training-headerless
+/// latch. Same `getenv` discipline as [`stripe_override`] (runs inside the
+/// allocator on the first-allocation latch; `std::env::var` would allocate +
+/// take std's env lock, the re-entrancy deadlock class). Returns `true` only
+/// when the value is exactly `"0"`; **unset (the default) — and any other
+/// value — is treated as ON**, so the latch fires unless a run deliberately
+/// disables it. Not a `TrainingConfig` key: the certified default is on, and
+/// this exists purely for the A/B control cell and emergency rollback.
+fn train_headerless_disabled() -> bool {
+    // SAFETY: NUL-terminated literal; getenv returns NULL or a pointer into
+    // the C environment, valid for the duration of this read (no setenv on
+    // the allocator hot path — the bench sets it via std::env before any
+    // instance's first alloc, single-threaded).
+    let p = unsafe { libc::getenv(b"LOHALLOC_TRAIN_HEADERLESS\0".as_ptr().cast()) };
+    if p.is_null() {
+        return false; // unset = default ON
+    }
+    // Exactly "0" disables; anything else (incl. "1") leaves it ON.
+    // SAFETY: reading the first two bytes of the NUL-terminated C string.
+    unsafe { *p == b'0' as libc::c_char && *p.offset(1) == 0 }
+}
+
 /// Pure latch computation, split out so it is unit-testable without touching
 /// the process-global `STRIPE_MASK` latch.
 ///
@@ -734,6 +1027,7 @@ impl Lohalloc {
             magazine_id: CachePadded::new(AtomicU64::new(0)),
             frozen_table: CachePadded::new(AtomicPtr::new(core::ptr::null_mut())),
             slab_headerless: CachePadded::new(AtomicBool::new(false)),
+            train_headerless_init: CachePadded::new(AtomicBool::new(false)),
             segment_registry: registry::SegmentRegistry::new(),
             buddy_headerless: CachePadded::new(AtomicBool::new(false)),
             arena_headerless: CachePadded::new(AtomicBool::new(false)),
@@ -804,6 +1098,87 @@ impl Lohalloc {
     fn invalidate_magazines(&self) {
         let fresh = NEXT_MAGAZINE_ID.fetch_add(1, Ordering::Relaxed);
         self.magazine_id.store(fresh, Ordering::Relaxed);
+    }
+
+    /// Latch the header-free fast paths on an *untouched* instance: Slab
+    /// unconditionally (header and headerless blocks live on physically
+    /// separate `Slab::hl` tiers, so a touched-by-the-runtime Slab is still
+    /// safe — see `load()`'s J4-A comment), Buddy and Arena only if no block
+    /// was ever served through them (region/chunk registration must precede
+    /// the first headerless block, so the gate can only open before any
+    /// allocation escapes). Shared by [`load`](Self::load) (inference) and
+    /// [`enable_training_headerless`](Self::enable_training_headerless)
+    /// (Phase 1.6 training-measurement fidelity).
+    fn latch_headerless(&self) {
+        // J4-A: latch header-free Slab unconditionally, then invalidate the
+        // one shared surface (the per-thread magazine) so every thread
+        // refills fresh through the headerless path after this point.
+        self.slab_headerless.store(true, Ordering::Release);
+        self.invalidate_magazines();
+        // J1: Buddy only if every stripe is untouched. Flip each stripe's
+        // order-recording flag under its own lock BEFORE publishing the gate,
+        // so no block is ever served headerless from a stripe that isn't
+        // recording orders.
+        let all_buddy_untouched = self.buddy.iter().all(|stripe| {
+            stripe
+                .lock()
+                .map(|mut b| {
+                    if b.region_count() == 0 {
+                        b.set_record_orders();
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false)
+        });
+        if all_buddy_untouched {
+            self.buddy_headerless.store(true, Ordering::Release);
+        }
+        // Ladder 5: Arena only if lazily-uninitialized (`None` = no block ever
+        // served, no chunk descriptor ever published) — every chunk it will
+        // create is registered by the gated slow path before any headerless
+        // block escapes.
+        let arena_untouched = self
+            .arena
+            .lock()
+            .map(|guard| guard.is_none())
+            .unwrap_or(false);
+        if arena_untouched {
+            self.arena_headerless.store(true, Ordering::Release);
+        }
+    }
+
+    /// Phase 1.6 (default-on): the first-allocation training-headerless
+    /// latch. Called from the top of [`route_alloc_inner`](Self::route_alloc_inner)
+    /// on every alloc but does real work exactly **once** per instance — the
+    /// `swap` self-guards, and the caller only reaches here while
+    /// `train_headerless_init` is still `false` (one relaxed load on the hot
+    /// path). Firing on the very first allocation is what makes the latch
+    /// succeed for Buddy/Arena under a `#[global_allocator]`: the language
+    /// runtime allocates before `main`, so a `main()`-time call would already
+    /// find the arena/buddy touched (and early UCB1 exploration would have
+    /// routed some of those pre-`main` allocs there) — the latch must run
+    /// before the first alloc is served, while every backend is pristine.
+    /// `latch_headerless` is allocation-free (backend-lock reads + atomic
+    /// stores only), so calling it from inside the allocator is re-entrancy
+    /// safe. Skipped for a `load()`-booted inference instance (`frozen`
+    /// already true, already latched) and via the `LOHALLOC_TRAIN_HEADERLESS=0`
+    /// off-switch. `#[cold]` so the once-per-instance path never bloats the
+    /// hot route.
+    #[cold]
+    #[inline(never)]
+    fn latch_train_headerless_once(&self) {
+        if self.train_headerless_init.swap(true, Ordering::AcqRel) {
+            return; // another thread (or an earlier alloc) already ran the check
+        }
+        if self.frozen.load(Ordering::Relaxed) {
+            return; // inference instance — load() already latched headerless
+        }
+        if train_headerless_disabled() {
+            return; // rollback/ablation off-switch
+        }
+        self.latch_headerless();
     }
 }
 
@@ -1128,7 +1503,13 @@ unsafe impl GlobalAlloc for Lohalloc {
         // thread (e.g. a backend's `Vec` growing), serve directly from mmap.
         let depth = IN_ALLOC.get();
         if depth > 0 {
-            return self.system_alloc_with_header(total, align, 0, SIZE_CLASS_UNTRACKED);
+            return self.system_alloc_with_header(
+                total,
+                align,
+                0,
+                SIZE_CLASS_UNTRACKED,
+                CTX_UNTRACKED,
+            );
         }
 
         IN_ALLOC.set(depth + 1);
@@ -1152,19 +1533,29 @@ unsafe impl GlobalAlloc for Lohalloc {
         }
         // Header-free fast path: must run BEFORE any header read — a
         // headerless block's `ptr - HEADER_SIZE` is not valid header
-        // memory (see `headerless_class_for`'s doc).
+        // memory (see `headerless_class_for`'s doc). Part 2: each branch's
+        // registry hit identifies the ACTUAL serving backend, so the free is
+        // routed through `headerless_free_attributed` to recover the
+        // dealloc-side reward the headerless path used to drop.
         if let Some(class) = self.headerless_class_for(ptr) {
-            self.slab_dealloc_headerless(ptr, class);
+            self.headerless_free_attributed(ptr, Backend::Slab, || {
+                self.slab_dealloc_headerless(ptr, class)
+            });
             return;
         }
         if let Some(order) = self.buddy_headerless_order_for(ptr) {
-            unsafe { self.buddy_dealloc_via_magazine(ptr, buddy::block_size_of(order)) };
+            self.headerless_free_attributed(ptr, Backend::Buddy, || unsafe {
+                self.buddy_dealloc_via_magazine(ptr, buddy::block_size_of(order))
+            });
             return;
         }
         // Ladder 5: headerless arena block — free is a no-op (bump arenas
         // reclaim via reset, never per-pointer), and reading `ptr - 48`
-        // would read a neighboring live block's tail.
+        // would read a neighboring live block's tail. The no-op free is still
+        // attributed (dt ≈ 0 → high reward): Arena's free-is-free advantage is
+        // exactly the signal to recover.
         if self.arena_headerless_hit(ptr) {
+            self.headerless_free_attributed(ptr, Backend::Arena, || {});
             return;
         }
         // Read the header (unaligned) sitting immediately before the user ptr.
@@ -1222,6 +1613,12 @@ impl Lohalloc {
         } else {
             None
         };
+        // Phase 1.6 diagnostic: time the free work for EVERY dealloc (both
+        // modes, independent of `track_reward`) under the route-metrics gate
+        // — a forced *inference* run is the only way to isolate one
+        // backend's per-op cost, and inference skips the reward `t0` above.
+        #[cfg(any(feature = "route-metrics", test))]
+        let diag_t0 = clock::now_ns();
 
         // Recompute `pad` from the header's own `align_log2` rather than
         // trusting the caller's `layout` — the two always agree for a
@@ -1304,6 +1701,12 @@ impl Lohalloc {
             }
         }
 
+        // Phase 1.6 diagnostic accumulate (route-metrics/test only).
+        #[cfg(any(feature = "route-metrics", test))]
+        if let Some(core_backend) = Backend::from_u8(header.backend).map(Backend::to_core) {
+            record_dealloc_latency(core_backend, clock::now_ns().saturating_sub(diag_t0));
+        }
+
         if let (Some(t0), Some(core_backend)) =
             (t0, Backend::from_u8(header.backend).map(Backend::to_core))
         {
@@ -1324,9 +1727,74 @@ impl Lohalloc {
                         dt,
                         header.size,
                     );
+                    // Phase 1.5: mirror the sample into the fine arm this
+                    // allocation was routed under (the ctx captured at ALLOC
+                    // time, carried in the header — dealloc-time history is
+                    // not what routing saw). This is the half of the reward
+                    // the alloc-side-only fine map was blind to: Arena frees
+                    // are no-ops (dt ≈ 0 → reward ≈ 1) while Slab frees pay
+                    // magazine pushes and periodic locked flushes.
+                    if header.ctx != CTX_UNTRACKED {
+                        st.record_fine_latency(
+                            header.hash,
+                            core_backend,
+                            header.size_class_hint,
+                            header.ctx,
+                            dt,
+                            header.size,
+                        );
+                    }
                 }
             });
         }
+    }
+
+    /// Part 2: run a headerless block's `free` work and attribute its timed
+    /// cost to the bandit arm the alloc was routed under — the dealloc-side
+    /// reward the headerless path otherwise drops. `backend` is the ACTUAL
+    /// serving backend, recovered by the caller from which headerless registry
+    /// recognized `ptr` (the same fact `dealloc_with_header` reads from
+    /// `header.backend`). On a ring miss / inference / disabled, it just runs
+    /// `free` — alloc-side-only reward, exactly as before. Mirrors
+    /// `dealloc_with_header`'s reward section (same `record_latency` /
+    /// `record_fine_latency` arm, same `with_realloc_guard` deadlock guard).
+    #[inline]
+    fn headerless_free_attributed(&self, ptr: *mut u8, backend: Backend, free: impl FnOnce()) {
+        // Inference or disabled: no reward bookkeeping, and a `take` would be a
+        // wasted lookup — skip straight to the free.
+        if self.frozen.load(Ordering::Relaxed) || !reward_track_enabled() {
+            free();
+            return;
+        }
+        let Some(rec) = reward_track_take(ptr as usize) else {
+            free();
+            return;
+        };
+        let t0 = clock::now_ns();
+        free();
+        let dt = clock::now_ns().saturating_sub(t0);
+        let core_backend = backend.to_core();
+        Self::with_realloc_guard(|| {
+            if let Ok(mut st) = self.state.lock() {
+                st.record_latency(
+                    rec.hash,
+                    core_backend,
+                    rec.size_class,
+                    dt,
+                    rec.size as usize,
+                );
+                if rec.ctx != CTX_UNTRACKED {
+                    st.record_fine_latency(
+                        rec.hash,
+                        core_backend,
+                        rec.size_class,
+                        rec.ctx,
+                        dt,
+                        rec.size as usize,
+                    );
+                }
+            }
+        });
     }
 }
 
@@ -1377,15 +1845,21 @@ impl Lohalloc {
                             // table), but their alloc is still part of every
                             // other site's history — push, don't read.
                             if self.ahr_on.load(Ordering::Relaxed) {
-                                ahr_push_alloc();
+                                ahr_push_alloc(size_class);
                             }
                             // Header hash = sentinel (0): in Inference the
                             // header's hash is telemetry-only (no reward
                             // bookkeeping), same degradation as a failed
                             // frame-pointer guard.
-                            if let Some(ptr) =
-                                self.try_backend(backend, total, align, pad, 0, size_class)
-                            {
+                            if let Some(ptr) = self.try_backend(
+                                backend,
+                                total,
+                                align,
+                                pad,
+                                0,
+                                size_class,
+                                CTX_UNTRACKED,
+                            ) {
                                 record_route(backend);
                                 return ptr;
                             }
@@ -1396,6 +1870,7 @@ impl Lohalloc {
                                 pad,
                                 0,
                                 size_class,
+                                CTX_UNTRACKED,
                                 Some(backend),
                             );
                         }
@@ -1442,6 +1917,17 @@ impl Lohalloc {
         pad: usize,
         total: usize,
     ) -> *mut u8 {
+        // Phase 1.6 (default-on): latch the header-free training paths on the
+        // very first allocation this instance serves, before any backend is
+        // touched, so the bandit measures the same headerless path inference
+        // runs (see `latch_train_headerless_once`). One relaxed load per alloc
+        // after the first; the cold latch runs once. Placed before the ctx
+        // read / backend touch — both this native path and the replay path
+        // (`route_alloc_with_hash`) funnel through here, and neither reaches
+        // it under the `IN_ALLOC` bypass, so it is always a top-level alloc.
+        if !self.train_headerless_init.load(Ordering::Relaxed) {
+            self.latch_train_headerless_once();
+        }
         let size_class = state::size_class_for(size);
 
         // Phase-1 context: read this thread's history context and push the
@@ -1452,10 +1938,14 @@ impl Lohalloc {
         // alloc is part of every later alloc's history) are both
         // load-bearing for training/inference hash-identity — C6 class.
         let ctx = if self.ahr_on.load(Ordering::Relaxed) {
-            Some(ahr_ctx_and_push_alloc())
+            Some(ahr_ctx_and_push_alloc(size_class))
         } else {
             None
         };
+        // Phase 1.5: the same ctx also rides in the allocation's Header so
+        // the dealloc side can attribute its latency to the fine arm the
+        // alloc side observed (see `Header::ctx`).
+        let ctx_byte = ctx.unwrap_or(CTX_UNTRACKED);
 
         // Inference fast path: the frozen table is immutable and published
         // via an atomic pointer, so a frozen allocator routes with zero
@@ -1476,14 +1966,24 @@ impl Lohalloc {
                     state::default_backend_for_size(size)
                 }
             };
-            if let Some(ptr) = self.try_backend(backend, total, align, pad, hash, size_class) {
+            if let Some(ptr) =
+                self.try_backend(backend, total, align, pad, hash, size_class, ctx_byte)
+            {
                 record_route(backend);
                 return ptr;
             }
             // Fallthrough remembers the failed backend so it's never
             // re-locked/re-tried inside the size chain.
             record_fallthrough();
-            return self.route_by_size(total, align, pad, hash, size_class, Some(backend));
+            return self.route_by_size(
+                total,
+                align,
+                pad,
+                hash,
+                size_class,
+                ctx_byte,
+                Some(backend),
+            );
         }
 
         // Only reached when no frozen table is published (Training, or the
@@ -1510,11 +2010,13 @@ impl Lohalloc {
             // the recommended backend, falling through to size-based
             // routing on failure, as before.
             if let Some(backend) = recommended {
-                if let Some(ptr) = self.try_backend(backend, total, align, pad, hash, size_class) {
+                if let Some(ptr) =
+                    self.try_backend(backend, total, align, pad, hash, size_class, ctx_byte)
+                {
                     return ptr;
                 }
             }
-            return self.route_by_size(total, align, pad, hash, size_class, recommended);
+            return self.route_by_size(total, align, pad, hash, size_class, ctx_byte, recommended);
         }
 
         // Training: time the *actual* outcome (success, or failure +
@@ -1523,11 +2025,11 @@ impl Lohalloc {
         let t0 = clock::now_ns();
         let ptr = match recommended {
             Some(backend) => self
-                .try_backend(backend, total, align, pad, hash, size_class)
+                .try_backend(backend, total, align, pad, hash, size_class, ctx_byte)
                 .unwrap_or_else(|| {
-                    self.route_by_size(total, align, pad, hash, size_class, Some(backend))
+                    self.route_by_size(total, align, pad, hash, size_class, ctx_byte, Some(backend))
                 }),
-            None => self.route_by_size(total, align, pad, hash, size_class, None),
+            None => self.route_by_size(total, align, pad, hash, size_class, ctx_byte, None),
         };
         let latency_ns = clock::now_ns().saturating_sub(t0);
 
@@ -1540,14 +2042,31 @@ impl Lohalloc {
             Self::with_realloc_guard(|| {
                 if let Ok(mut st) = self.state.lock() {
                     st.record_latency(hash, backend, size_class, latency_ns, total);
-                    // Phase-1 shadow fine observation (alloc-side only —
-                    // dealloc has no ctx). Same lock section, one extra
-                    // BTreeMap upsert per training op.
+                    // Phase-1 shadow fine observation. The dealloc side
+                    // mirrors this via the ctx carried in the Header (see
+                    // `dealloc_with_header`) — or, on the headerless path, via
+                    // the reward-track ring recorded just below.
                     if let Some(c) = ctx {
                         st.record_fine_latency(hash, backend, size_class, c, latency_ns, total);
                     }
                 }
             });
+        }
+
+        // Part 2: record this alloc's routing key so its (headerless) free can
+        // be attributed to the same arm. Gated on the headerless-training
+        // signal (`slab_headerless` — the first-alloc latch sets it whenever
+        // training-headerless is on; when the off-switch disabled it, the
+        // header path attributes and the ring is unnecessary) and the
+        // reward-track enable latch. `ptr` non-null and `total` within a
+        // headerless backend's bound (≤ 1 MiB) — larger goes to System (never
+        // headerless), so `u32` never truncates a real headerless block.
+        if !ptr.is_null()
+            && self.slab_headerless.load(Ordering::Relaxed)
+            && reward_track_enabled()
+            && total <= u32::MAX as usize
+        {
+            reward_track_record(ptr as usize, hash, total as u32, size_class, ctx_byte);
         }
 
         ptr
@@ -2035,7 +2554,16 @@ impl Lohalloc {
         }
     }
 
+    /// Attempt an allocation via a specific backend. Returns the user pointer
     /// on success, `None` on failure (e.g. Arena full, Slab exhausted).
+    ///
+    /// Thin wrapper over [`try_backend_inner`] that, under `route-metrics`/
+    /// `test` only, times the served backend's alloc cost into the Phase-1.6
+    /// per-backend diagnostic accumulators (`record_alloc_latency`). The
+    /// `now_ns()` calls and the whole wrapper collapse to a direct call in
+    /// production builds.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn try_backend(
         &self,
         backend: lohalloc_core::Backend,
@@ -2044,6 +2572,31 @@ impl Lohalloc {
         pad: usize,
         hash: u64,
         size_class_hint: u8,
+        ctx: u8,
+    ) -> Option<*mut u8> {
+        #[cfg(any(feature = "route-metrics", test))]
+        {
+            let t0 = clock::now_ns();
+            let r = self.try_backend_inner(backend, total, align, pad, hash, size_class_hint, ctx);
+            if r.is_some() {
+                record_alloc_latency(backend, clock::now_ns().saturating_sub(t0));
+            }
+            r
+        }
+        #[cfg(not(any(feature = "route-metrics", test)))]
+        self.try_backend_inner(backend, total, align, pad, hash, size_class_hint, ctx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_backend_inner(
+        &self,
+        backend: lohalloc_core::Backend,
+        total: usize,
+        align: usize,
+        pad: usize,
+        hash: u64,
+        size_class_hint: u8,
+        ctx: u8,
     ) -> Option<*mut u8> {
         let local_backend = Backend::from_core(backend);
         match backend {
@@ -2067,6 +2620,7 @@ impl Lohalloc {
                         0,
                         hash,
                         size_class_hint,
+                        ctx,
                         align,
                     )
                 })
@@ -2090,6 +2644,7 @@ impl Lohalloc {
                         0,
                         hash,
                         size_class_hint,
+                        ctx,
                         align,
                     )
                 })
@@ -2130,6 +2685,7 @@ impl Lohalloc {
                         0,
                         hash,
                         size_class_hint,
+                        ctx,
                         align,
                     ));
                 }
@@ -2187,6 +2743,7 @@ impl Lohalloc {
                             0,
                             hash,
                             size_class_hint,
+                            ctx,
                             align,
                         ))
                     }
@@ -2205,7 +2762,7 @@ impl Lohalloc {
                 result
             }
             lohalloc_core::Backend::System => {
-                let ptr = self.system_alloc_with_header(total, align, hash, size_class_hint);
+                let ptr = self.system_alloc_with_header(total, align, hash, size_class_hint, ctx);
                 if ptr.is_null() {
                     None
                 } else {
@@ -2225,6 +2782,7 @@ impl Lohalloc {
     /// just failed is guaranteed wasted work, and before this parameter
     /// existed a failed recommendation re-walked the whole chain including
     /// the failed backend — measurable under the arena-exhaustion pathology.
+    #[allow(clippy::too_many_arguments)]
     fn route_by_size(
         &self,
         total: usize,
@@ -2232,6 +2790,7 @@ impl Lohalloc {
         pad: usize,
         hash: u64,
         size_class_hint: u8,
+        ctx: u8,
         skip: Option<lohalloc_core::Backend>,
     ) -> *mut u8 {
         // 1. Slab: small, naturally-aligned requests (magazine-first).
@@ -2251,6 +2810,7 @@ impl Lohalloc {
                     0,
                     hash,
                     size_class_hint,
+                    ctx,
                     align,
                 );
             }
@@ -2273,13 +2833,14 @@ impl Lohalloc {
                     0,
                     hash,
                     size_class_hint,
+                    ctx,
                     align,
                 );
             }
         }
 
         // 3. System Fallback: any size/alignment.
-        self.system_alloc_with_header(total, align, hash, size_class_hint)
+        self.system_alloc_with_header(total, align, hash, size_class_hint, ctx)
     }
 
     /// Allocate `total` bytes at `align` via the System Fallback, write a
@@ -2291,6 +2852,7 @@ impl Lohalloc {
         align: usize,
         hash: u64,
         size_class_hint: u8,
+        ctx: u8,
     ) -> *mut u8 {
         let pad = header_pad(align);
         let eff_align = align.max(system::page_size());
@@ -2313,6 +2875,7 @@ impl Lohalloc {
                 raw_len,
                 hash,
                 size_class_hint,
+                ctx,
                 align,
             );
         }
@@ -2337,6 +2900,7 @@ impl Lohalloc {
             raw_len,
             hash,
             size_class_hint,
+            ctx,
             align,
         )
     }
@@ -2355,6 +2919,7 @@ impl Lohalloc {
         map_len: usize,
         hash: u64,
         size_class_hint: u8,
+        ctx: u8,
         align: usize,
     ) -> *mut u8 {
         let user = unsafe { block.add(pad) };
@@ -2375,7 +2940,8 @@ impl Lohalloc {
             size_class_hint,
             align_log2: align.trailing_zeros() as u8,
             slab_class,
-            _pad: [0; 4],
+            ctx,
+            _pad: [0; 3],
             size: total,
             base,
             map_len,
@@ -2460,12 +3026,13 @@ impl Lohalloc {
                     0,
                     hash,
                     SIZE_CLASS_UNTRACKED,
+                    CTX_UNTRACKED,
                     align,
                 );
             }
         }
         // Arena full or init failed → fall through to System.
-        self.system_alloc_with_header(total, align, 0, SIZE_CLASS_UNTRACKED)
+        self.system_alloc_with_header(total, align, 0, SIZE_CLASS_UNTRACKED, CTX_UNTRACKED)
     }
 
     // -----------------------------------------------------------------
@@ -2634,63 +3201,71 @@ impl Lohalloc {
                     *state = s;
                     self.publish_frozen_table(&state);
                     self.frozen.store(true, Ordering::Release);
-                    // J4-A: latch header-free Slab **unconditionally**. The
-                    // old code required a pristine Slab (`region_count() == 0`
-                    // on every stripe) so header and headerless blocks could
-                    // never share a class free list — but as the global
-                    // allocator the Rust runtime touches the Slab before
-                    // `main` (before `LOHALLOC_MODEL` is even read), so that
-                    // check always failed for exactly the slab-routed rows the
-                    // header-free path exists to speed up. The `Slab` now keeps
-                    // header and headerless blocks on physically separate
-                    // tiers (`Slab::hl`), so a touched Slab is safe: the
-                    // headerless alloc path can never pop a pre-load header
-                    // block. The per-thread magazine is the one shared surface,
-                    // so invalidate it here — every thread refills fresh
-                    // through the headerless path after this point (see
-                    // `invalidate_magazines`; pre-load header frees bypass the
-                    // magazine in `dealloc_with_header`).
-                    self.slab_headerless.store(true, Ordering::Release);
-                    self.invalidate_magazines();
-                    // J1: same untouched-instance argument for Buddy. Flip
-                    // each stripe's order-recording flag under its own lock
-                    // BEFORE publishing the gate, so no block is ever
-                    // served headerless from a stripe that isn't recording.
-                    let all_buddy_untouched = self.buddy.iter().all(|stripe| {
-                        stripe
-                            .lock()
-                            .map(|mut b| {
-                                if b.region_count() == 0 {
-                                    b.set_record_orders();
-                                    true
-                                } else {
-                                    false
-                                }
-                            })
-                            .unwrap_or(false)
-                    });
-                    if all_buddy_untouched {
-                        self.buddy_headerless.store(true, Ordering::Release);
-                    }
-                    // Ladder 5: same untouched-instance argument for Arena.
-                    // The arena is created lazily on its first allocation,
-                    // so `None` here means no block was ever served (and no
-                    // chunk descriptor was ever published) — every chunk
-                    // this instance will ever create is registered by the
-                    // gated slow path before any headerless block escapes.
-                    let arena_untouched = self
-                        .arena
-                        .lock()
-                        .map(|guard| guard.is_none())
-                        .unwrap_or(false);
-                    if arena_untouched {
-                        self.arena_headerless.store(true, Ordering::Release);
-                    }
+                    // Serve the frozen inference path header-free (see
+                    // `latch_headerless`'s doc for the per-backend safety
+                    // argument).
+                    self.latch_headerless();
                     return true;
                 }
             }
             false
         })
+    }
+
+    /// Phase 1.6: latch the header-free fast paths for a **training**
+    /// instance, so the bandit's alloc-side latency reward is measured on the
+    /// SAME path inference will run (headerless) instead of the header-based
+    /// path. The 1.6 decomposition showed the training-only 48-byte header
+    /// write lands on a bump arena's *cold* freshly-bumped target and erases
+    /// its real inference-path advantage, so the header-based reward ranks
+    /// Slab ≈ Arena while the headerless inference path has Arena decisively
+    /// faster — the bandit could never learn a ranking it never measured.
+    ///
+    /// Must be called on a fresh instance **before any allocation** (same
+    /// untouched precondition as [`load`](Self::load); Slab always latches,
+    /// Buddy/Arena only while pristine). Trade-off, by construction:
+    /// dealloc-side reward attribution is dropped for headerless frees (no
+    /// `Header` to recover the `(Signature, ctx)` — the free path early-returns
+    /// before `dealloc_with_header`), so the fine/coarse maps train on
+    /// alloc-side rewards only. The 1.6 finding established that the
+    /// alloc-side headerless measurement alone ranks backends by their true
+    /// inference cost; Arena's free-is-a-no-op is expressed as the *absence*
+    /// of any dealloc cost rather than a positive reward.
+    ///
+    /// As of Phase 1.6 default-on this is **also** applied automatically on the
+    /// first allocation of every training instance (see
+    /// [`latch_train_headerless_once`](Self::latch_train_headerless_once)); the
+    /// explicit method stays public because bench/tests want the latch *before*
+    /// their first replay alloc and because it ignores the
+    /// `LOHALLOC_TRAIN_HEADERLESS=0` off-switch (an explicit caller is opting
+    /// in unconditionally). It also flips `train_headerless_init` so the
+    /// automatic first-alloc path is a no-op on the same instance.
+    pub fn enable_training_headerless(&self) {
+        Self::with_realloc_guard(|| {
+            debug_assert!(
+                !self.frozen.load(Ordering::Relaxed),
+                "enable_training_headerless is a training-only latch"
+            );
+            // Suppress the automatic first-alloc latch on this instance — the
+            // explicit call is authoritative and unconditional.
+            self.train_headerless_init.store(true, Ordering::Release);
+            self.latch_headerless();
+        });
+    }
+
+    /// Deterministic, race-free inverse of the default-on training-headerless
+    /// latch: suppress the automatic first-alloc latch on **this** instance so
+    /// it trains on the **header-based** path (Slab/Buddy/Arena all keep writing
+    /// the 48-byte `Header`). Must be called before the first allocation — it
+    /// flips `train_headerless_init` without latching, so a later first alloc
+    /// is a no-op. Use this when the training run needs the `Header`'s
+    /// `(hash, ctx, size_class_hint)` on the dealloc side: the GUI/server live
+    /// reward view, and any test asserting on dealloc-side fine-reward
+    /// attribution or header-based distillation. Equivalent to setting
+    /// `LOHALLOC_TRAIN_HEADERLESS=0` for one instance, but with no process
+    /// env and no cross-instance race.
+    pub fn disable_training_headerless(&self) {
+        self.train_headerless_init.store(true, Ordering::Release);
     }
 
     /// Returns `true` if the Decision Engine is in Inference (frozen) mode.
@@ -2703,8 +3278,9 @@ impl Lohalloc {
     }
 
     /// True if this instance is currently serving Slab allocations
-    /// header-free (only ever set by `load()` on a still-empty Slab — see
-    /// `slab_headerless`'s doc). Test/introspection only.
+    /// header-free (set by `load()`, or by `enable_training_headerless()` on
+    /// a still-empty Slab — see `slab_headerless`'s doc). Test/introspection
+    /// only.
     pub fn is_slab_headerless(&self) -> bool {
         self.slab_headerless.load(Ordering::Relaxed)
     }
@@ -2794,6 +3370,42 @@ impl Lohalloc {
         }
     }
 
+    /// Phase 1.6 diagnostic: process-wide `(alloc_ns, alloc_cnt, dealloc_ns,
+    /// dealloc_cnt)` measured for `backend`, so `total_ns/cnt` gives the mean
+    /// per-op latency the reward is built from. All `0` unless built with
+    /// `route-metrics` (or under test). See `ALLOC_NS`'s doc for why this
+    /// exists (the per-op-latency-vs-wall-clock disagreement on bump arenas).
+    pub fn latency_profile(backend: lohalloc_core::Backend) -> (u64, u64, u64, u64) {
+        #[cfg(any(feature = "route-metrics", test))]
+        {
+            let i = backend as usize;
+            (
+                ALLOC_NS[i].load(Ordering::Relaxed),
+                ALLOC_CNT[i].load(Ordering::Relaxed),
+                DEALLOC_NS[i].load(Ordering::Relaxed),
+                DEALLOC_CNT[i].load(Ordering::Relaxed),
+            )
+        }
+        #[cfg(not(any(feature = "route-metrics", test)))]
+        {
+            let _ = backend;
+            (0, 0, 0, 0)
+        }
+    }
+
+    /// Zero the Phase 1.6 latency-profile accumulators (route-metrics/test
+    /// only) — lets a diagnostic isolate one forced-routing run from any
+    /// warm-up traffic that preceded it.
+    pub fn reset_latency_profile() {
+        #[cfg(any(feature = "route-metrics", test))]
+        for i in 0..4 {
+            ALLOC_NS[i].store(0, Ordering::Relaxed);
+            ALLOC_CNT[i].store(0, Ordering::Relaxed);
+            DEALLOC_NS[i].store(0, Ordering::Relaxed);
+            DEALLOC_CNT[i].store(0, Ordering::Relaxed);
+        }
+    }
+
     /// Process-wide count of Inference-mode allocations actually served by
     /// `backend` (frozen fast path only). See `ROUTE_COUNTS`'s doc. Always
     /// `0` unless built with the `route-metrics` feature (or under test) —
@@ -2856,7 +3468,13 @@ impl Lohalloc {
 
         let depth = IN_ALLOC.get();
         if depth > 0 {
-            return self.system_alloc_with_header(total, align, hash, SIZE_CLASS_UNTRACKED);
+            return self.system_alloc_with_header(
+                total,
+                align,
+                hash,
+                SIZE_CLASS_UNTRACKED,
+                CTX_UNTRACKED,
+            );
         }
 
         IN_ALLOC.set(depth + 1);
@@ -2913,7 +3531,13 @@ impl Lohalloc {
 
         let depth = IN_ALLOC.get();
         if depth > 0 {
-            return self.system_alloc_with_header(total, align, hash, SIZE_CLASS_UNTRACKED);
+            return self.system_alloc_with_header(
+                total,
+                align,
+                hash,
+                SIZE_CLASS_UNTRACKED,
+                CTX_UNTRACKED,
+            );
         }
 
         // If the strategy specifies a preferred backend, try it first. This
@@ -2922,9 +3546,15 @@ impl Lohalloc {
         // so `dealloc` skips reward bookkeeping for this allocation.
         if let Some(preferred) = strategy.preferred_backend(size) {
             IN_ALLOC.set(depth + 1);
-            if let Some(ptr) =
-                self.try_backend(preferred, total, align, pad, hash, SIZE_CLASS_UNTRACKED)
-            {
+            if let Some(ptr) = self.try_backend(
+                preferred,
+                total,
+                align,
+                pad,
+                hash,
+                SIZE_CLASS_UNTRACKED,
+                CTX_UNTRACKED,
+            ) {
                 IN_ALLOC.set(depth);
                 return ptr;
             }
@@ -3093,15 +3723,23 @@ impl Lohalloc {
         if ptr.is_null() {
             return false;
         }
+        // Part 2: attribute the headerless free to the alloc-time arm (the
+        // cabi/LD_PRELOAD C/C++ free path — same recovery as GlobalAlloc's
+        // `dealloc`). The registry hit names the actual serving backend.
         if let Some(class) = self.headerless_class_for(ptr) {
-            self.slab_dealloc_headerless(ptr, class);
+            self.headerless_free_attributed(ptr, Backend::Slab, || {
+                self.slab_dealloc_headerless(ptr, class)
+            });
             return true;
         }
         if let Some(order) = self.buddy_headerless_order_for(ptr) {
-            unsafe { self.buddy_dealloc_via_magazine(ptr, buddy::block_size_of(order)) };
+            self.headerless_free_attributed(ptr, Backend::Buddy, || unsafe {
+                self.buddy_dealloc_via_magazine(ptr, buddy::block_size_of(order))
+            });
             return true;
         }
         if self.arena_headerless_hit(ptr) {
+            self.headerless_free_attributed(ptr, Backend::Arena, || {});
             return true; // ours; free is a no-op (bump arena)
         }
         let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
@@ -3194,13 +3832,23 @@ impl Lohalloc {
     /// # Safety
     /// `ptr` must be the same live allocation the token was created from.
     pub unsafe fn dealloc_with_header_token(&self, ptr: *mut u8, token: ReallocToken) {
+        // Part 2: the headerless variants attribute the realloc'd-away block's
+        // free to its alloc-time arm (realloc-heavy rows: cpp-vector/string).
         match token.0 {
             ReallocTokenInner::Header(header) => unsafe { self.dealloc_with_header(ptr, header) },
-            ReallocTokenInner::Headerless(class) => self.slab_dealloc_headerless(ptr, class),
-            ReallocTokenInner::BuddyHeaderless(order) => unsafe {
-                self.buddy_dealloc_via_magazine(ptr, buddy::block_size_of(order))
-            },
-            ReallocTokenInner::ArenaHeaderless => {} // bump arena: free is a no-op
+            ReallocTokenInner::Headerless(class) => {
+                self.headerless_free_attributed(ptr, Backend::Slab, || {
+                    self.slab_dealloc_headerless(ptr, class)
+                })
+            }
+            ReallocTokenInner::BuddyHeaderless(order) => {
+                self.headerless_free_attributed(ptr, Backend::Buddy, || unsafe {
+                    self.buddy_dealloc_via_magazine(ptr, buddy::block_size_of(order))
+                })
+            }
+            ReallocTokenInner::ArenaHeaderless => {
+                self.headerless_free_attributed(ptr, Backend::Arena, || {})
+            } // bump arena: free is a no-op
         }
     }
 }
@@ -3314,6 +3962,11 @@ mod integration_tests {
         layout: Layout,
         n: usize,
     ) -> Vec<u8> {
+        // These pin-cache/distillation tests validate the header-based
+        // training mechanism (and assert deterministic single-site distilled
+        // counts). Keep the trainer on the header path so the Phase-1.6
+        // default-on headerless latch doesn't reshape its verdicts.
+        a.disable_training_headerless();
         for _ in 0..n {
             let p = site(a, layout);
             assert!(!p.is_null());
@@ -3800,6 +4453,71 @@ mod integration_tests {
             );
         }
         unsafe { alloc.dealloc_with_hash(new_ptr, layout) };
+    }
+
+    #[test]
+    fn headerless_arena_realloc_copy_bound_overlaps_new_block() {
+        // Regression for the cabi `realloc` UB that Phase-1.6 default-on
+        // training-headerless exposed under real interposition: a headerless
+        // BUMP-ARENA block's `usable_size_for_realloc` returns the OVERSTATED
+        // distance-to-chunk-end as the copy bound, and `malloc(new_size)` bumps
+        // a NEW ADJACENT block in the same chunk — so the realloc data copy's
+        // src and dst OVERLAP. `copy_nonoverlapping` is UB there; the fix is
+        // `core::ptr::copy` (memmove). This test proves (a) the overlap is real
+        // and (b) memmove preserves the original bytes.
+        use lohalloc_core::Strategy;
+        let h = Box::new(Lohalloc::new());
+        h.enable_training_headerless();
+        assert!(
+            h.is_arena_headerless(),
+            "pristine arena must latch headerless"
+        );
+
+        let old_size = 40usize;
+        let layout = Layout::from_size_align(old_size, 16).unwrap();
+        // ThroughputPriority forces small allocs onto Arena (headerless here).
+        let p1 =
+            unsafe { h.alloc_with_hash_and_strategy(layout, 0xA1, Strategy::ThroughputPriority) };
+        assert!(!p1.is_null());
+        assert!(
+            h.arena_headerless_hit(p1),
+            "p1 must be a headerless arena block"
+        );
+        unsafe { core::ptr::write_bytes(p1, 0x5A, old_size) };
+
+        let (copy_bound, token) =
+            unsafe { h.usable_size_for_realloc(p1) }.expect("arena headerless realloc bound");
+        assert!(
+            !token.allows_in_place(),
+            "arena headerless token must forbid in-place (overstated bound)"
+        );
+
+        // The realloc grow: a second arena bump, adjacent, then the copy.
+        let new_size = 4096usize;
+        let new_layout = Layout::from_size_align(new_size, 16).unwrap();
+        let p2 = unsafe {
+            h.alloc_with_hash_and_strategy(new_layout, 0xA1, Strategy::ThroughputPriority)
+        };
+        assert!(!p2.is_null());
+        let copy_len = copy_bound.min(new_size);
+        // The overlap the fix exists for: p2 lies within [p1, p1 + copy_len).
+        assert!(
+            (p2 as usize) >= (p1 as usize) && (p2 as usize) < (p1 as usize) + copy_len,
+            "the new adjacent bump block must fall inside the overstated copy range \
+             (p1={p1:?} p2={p2:?} copy_len={copy_len})"
+        );
+        // memmove (the shipped cabi primitive) copies correctly despite overlap.
+        unsafe {
+            core::ptr::copy(p1, p2, copy_len);
+            h.dealloc_with_header_token(p1, token);
+        }
+        for i in 0..old_size {
+            assert_eq!(
+                unsafe { *p2.add(i) },
+                0x5A,
+                "byte {i} must survive the overlapping realloc memmove"
+            );
+        }
     }
 
     #[test]
@@ -4509,12 +5227,15 @@ mod integration_tests {
     #[test]
     fn loaded_ctx_model_routes_by_real_history_register() {
         // Phase-1 end-to-end, deterministic: a hand-built v4 model with a
-        // FLAG_HAS_CONTEXT coarse entry (Slab) and one fine sibling at
-        // ctx 15 (Arena) is load()ed, then the REAL per-thread history
+        // FLAG_HAS_CONTEXT coarse entry (Slab) and one fine sibling at the
+        // burst ctx (Arena) is load()ed, then the REAL per-thread history
         // register decides routing. Each test runs on its own thread, so
         // the register starts at 0, and only this instance's ops push
         // events (the test harness's own Vec allocations go through the
-        // process global allocator, never this instance).
+        // process global allocator, never this instance). Part 3: with the
+        // 2-bit size-aware encoding and CTX_EVENTS=3, a run of 3+ small
+        // (Slab) allocs reads ctx = 0b01_01_01 = 21 (burst); alloc/free churn
+        // reads ...01_00 -> ctx 4.
         const H: u64 = 0x77AA_0001; // the context-routed site
         const F: u64 = 0x77AA_0002; // filler site (not in the model)
         let size = 64usize;
@@ -4528,7 +5249,7 @@ mod integration_tests {
                 perfect_hash::FLAG_HAS_CONTEXT,
             ),
             (
-                state::combine_key_ctx(key, 15),
+                state::combine_key_ctx(key, 21),
                 sc,
                 lohalloc_core::Backend::Arena,
                 0,
@@ -4538,7 +5259,7 @@ mod integration_tests {
         assert!(h.load(&table.serialize()), "v4 model must load");
 
         let layout = Layout::from_size_align(size, 16).unwrap();
-        // Burst history: 4 held allocs -> register 0b1111 -> ctx 15.
+        // Burst history: 3+ held small allocs -> register ...01_01_01 -> ctx 21.
         let held: Vec<*mut u8> = (0..4)
             .map(|_| unsafe { h.alloc_with_hash(layout, F) })
             .collect();
@@ -4546,14 +5267,14 @@ mod integration_tests {
         assert_eq!(
             unsafe { h.backend_for_ptr(p_burst) },
             Some(lohalloc_core::Backend::Arena),
-            "ctx 15 (burst history) must take the fine Arena override"
+            "ctx 21 (burst history) must take the fine Arena override"
         );
         unsafe { h.dealloc_with_hash(p_burst, layout) };
         for p in held {
             unsafe { h.dealloc_with_hash(p, layout) };
         }
-        // Churn history: alloc/free alternation -> register ...1010 ->
-        // ctx 10 -> fine miss -> coarse Slab.
+        // Churn history: alloc/free alternation -> register ...01_00 ->
+        // ctx 4 -> fine miss -> coarse Slab.
         for _ in 0..2 {
             let p = unsafe { h.alloc_with_hash(layout, F) };
             unsafe { h.dealloc_with_hash(p, layout) };
@@ -4562,9 +5283,233 @@ mod integration_tests {
         assert_eq!(
             unsafe { h.backend_for_ptr(p_churn) },
             Some(lohalloc_core::Backend::Slab),
-            "ctx 10 (churn history) must fall back to the coarse verdict"
+            "ctx 4 (churn history) must fall back to the coarse verdict"
         );
         unsafe { h.dealloc_with_hash(p_churn, layout) };
+    }
+
+    #[test]
+    fn dealloc_attributes_fine_reward_to_alloc_time_ctx() {
+        // Phase 1.5 end-to-end, deterministic by counting: every dealloc
+        // must mirror its latency into the fine arm keyed by the ctx this
+        // allocation was ROUTED under (carried in the Header), not the
+        // history at free time. Alloc-allthen-free-all 260 blocks at one site:
+        // the alloc side can contribute AT MOST 260 fine samples (one per
+        // alloc); freeing them all adds up to 260 MORE dealloc-side samples.
+        // Summed across all ctx (encoding-agnostic — Part 3 changed the exact
+        // ctx values), flushed fine pulls therefore exceed 260 only if
+        // dealloc-side attribution flowed. Batches (16) keyed (sig, backend,
+        // ctx) with a handful of keys drop ≤ ~15 each, well inside the margin
+        // (~520 samples total).
+        const H: u64 = 0x15_5001;
+        let size = 64usize;
+        let h = Box::new(Lohalloc::new());
+        // Dealloc-side ctx attribution rides the Header, so this test needs
+        // the header-based path (the Phase-1.6 default-on latch would drop it).
+        h.disable_training_headerless();
+        let layout = Layout::from_size_align(size, 16).unwrap();
+        let ptrs: Vec<*mut u8> = (0..260)
+            .map(|_| unsafe { h.alloc_with_hash(layout, H) })
+            .collect();
+        for p in ptrs {
+            unsafe { h.dealloc_with_hash(p, layout) };
+        }
+        let fine_pulls: u64 = h
+            .fine_snapshot()
+            .iter()
+            .filter(|r| r.0 == H)
+            .map(|r| r.3.iter().map(|&p| u64::from(p)).sum::<u64>())
+            .sum();
+        assert!(
+            fine_pulls > 260,
+            "fine pulls ({fine_pulls}) must exceed the 260 alloc-side maximum \
+             — dealloc-side Header-ctx attribution missing"
+        );
+    }
+
+    #[test]
+    fn ahr_size_aware_ctx_distinguishes_size_sequences() {
+        // Part 3: the register encodes a 2-bit size code per event, so
+        // different SIZE sequences produce different contexts — the signal a
+        // 1-bit alloc/dealloc register was blind to — while dealloc still reads
+        // as 0, preserving churn/burst discrimination. The ctx is the low
+        // CTX_BITS (= 3 events) at read time, so 3 fresh pushes fully determine
+        // it regardless of any prior thread history.
+        let small = state::size_class_for(64); // Slab -> code 1
+        let large = state::size_class_for(2 << 20); // > 1 MiB -> System -> code 3
+
+        // Three small allocs -> 0b01_01_01 = 21.
+        ahr_push_alloc(small);
+        ahr_push_alloc(small);
+        ahr_push_alloc(small);
+        assert_eq!(ahr_ctx_and_push_alloc(small), 0b01_01_01);
+
+        // Three large allocs -> 0b11_11_11 = 63 — distinct from the small run,
+        // even though a 1-bit register would read both as all-allocs.
+        ahr_push_alloc(large);
+        ahr_push_alloc(large);
+        ahr_push_alloc(large);
+        assert_eq!(ahr_ctx_and_push_alloc(large), 0b11_11_11);
+
+        // Churn still separable: small, dealloc, small -> 0b01_00_01 = 17.
+        ahr_push_alloc(small);
+        ahr_push_dealloc();
+        ahr_push_alloc(small);
+        assert_eq!(ahr_ctx_and_push_alloc(small), 0b01_00_01);
+    }
+
+    #[test]
+    fn reward_track_ring_records_takes_and_misses() {
+        // Part 2 primitive: a recorded routing key round-trips by pointer, a
+        // take clears the slot (no double-attribution), and a wrong/absent
+        // pointer misses. Direct-mapped, so a collision is a safe miss.
+        let p1 = 0x1000usize;
+        reward_track_record(p1, 0xAB, 128, 3, 7);
+        // Wrong pointer: miss (nothing recorded there or a collision).
+        assert!(reward_track_take(0x2001).is_none());
+        let got = reward_track_take(p1).expect("recorded pointer must round-trip");
+        assert_eq!(
+            (got.hash, got.size, got.size_class, got.ctx),
+            (0xAB, 128, 3, 7)
+        );
+        // Take clears the slot — a second take (double free) must miss.
+        assert!(reward_track_take(p1).is_none());
+    }
+
+    #[test]
+    fn headerless_dealloc_attributes_free_reward_via_reward_track_ring() {
+        // Part 2 integration: on the headerless path (no Header), a block's
+        // free cost is recovered from the per-thread reward-track ring and
+        // attributed to the arm its alloc was routed under. The ring is
+        // DEFAULT-OFF (certified rt A/B, results/20260711T183928 — see
+        // REWARD_TRACK_STATE's doc), so the mechanism is force-enabled here;
+        // it stays available as the LOHALLOC_REWARD_TRACK=1 opt-in.
+        // Interleaved alloc/free keeps each block's ring slot fresh (100%
+        // hit) and stabilizes the AHR ctx, so total fine pulls for the
+        // signature must exceed the alloc-side-only count `n` (each op
+        // contributes one alloc sample; the ring adds one dealloc sample per
+        // freed block).
+        const H: u64 = 0x5A5A_0002;
+        let size = 64usize;
+        reward_track_force(true);
+        let h = Box::new(Lohalloc::new());
+        h.enable_training_headerless(); // deterministic latch (auto would also fire)
+        assert!(h.is_slab_headerless());
+        let layout = Layout::from_size_align(size, 16).unwrap();
+        let n = 400usize;
+        for _ in 0..n {
+            let p = unsafe { h.alloc_with_hash(layout, H) };
+            assert!(!p.is_null());
+            unsafe { h.dealloc_with_hash(p, layout) };
+        }
+        // Restore the certified default before asserting (assert may panic).
+        reward_track_force(false);
+        let total_fine_pulls: u64 = h
+            .fine_snapshot()
+            .iter()
+            .filter(|r| r.0 == H)
+            .map(|r| r.3.iter().map(|&p| u64::from(p)).sum::<u64>())
+            .sum();
+        assert!(
+            total_fine_pulls > n as u64,
+            "fine pulls ({total_fine_pulls}) must exceed the {n} alloc-side \
+             samples — headerless dealloc-side attribution via the reward-track \
+             ring is missing"
+        );
+    }
+
+    #[test]
+    fn training_headerless_latches_and_serves_correctly() {
+        // Phase 1.6: enable_training_headerless() on a fresh instance must
+        // latch all three header-free fast paths (Slab always; Buddy/Arena
+        // because pristine) WITHOUT freezing (still Training), and the
+        // allocator must keep alloc'ing and freeing correctly through the
+        // headerless path — a mis-latch would corrupt the free path or
+        // deadlock. Deterministic: asserts on latch flags + round-trips, no
+        // timing.
+        let h = Box::new(Lohalloc::new());
+        h.enable_training_headerless();
+        assert!(h.is_slab_headerless(), "Slab must latch headerless");
+        assert!(h.is_buddy_headerless(), "pristine Buddy must latch");
+        assert!(h.is_arena_headerless(), "pristine Arena must latch");
+        assert!(!h.is_inference(), "still Training — no freeze happened");
+
+        // Alloc + free a spread of sizes (Slab, Buddy ranges) through the
+        // real training path (bandit routing) under the headerless latch.
+        for size in [64usize, 256, 8144, 20 * 1024, 200 * 1024] {
+            let layout = Layout::from_size_align(size, 16).unwrap();
+            let ptrs: Vec<*mut u8> = (0..64)
+                .map(|_| unsafe { h.alloc_with_hash(layout, 0xC0FFEE ^ size as u64) })
+                .collect();
+            for p in ptrs {
+                assert!(!p.is_null(), "headerless training alloc ({size}B) served");
+                unsafe { h.dealloc_with_hash(p, layout) };
+            }
+        }
+    }
+
+    #[test]
+    fn training_headerless_on_touched_instance_only_latches_slab() {
+        // The Buddy/Arena latches require a pristine instance (registration
+        // must precede the first headerless block). If a block was already
+        // served through them, the latch must decline for those backends —
+        // Slab still latches (separate hl tiers make it always safe).
+        let h = Box::new(Lohalloc::new());
+        // Touch Buddy and Arena via their internal paths so they're no longer
+        // pristine.
+        let big = h.buddy_block_via_magazine(20 * 1024).expect("buddy serves");
+        let arena_ptr = h.arena_alloc(64, 16);
+        assert!(!arena_ptr.is_null());
+        h.enable_training_headerless();
+        assert!(h.is_slab_headerless(), "Slab latches unconditionally");
+        assert!(!h.is_buddy_headerless(), "touched Buddy must NOT latch");
+        assert!(!h.is_arena_headerless(), "touched Arena must NOT latch");
+        unsafe { h.buddy_dealloc_via_magazine(big, 20 * 1024) };
+    }
+
+    #[test]
+    fn training_headerless_auto_latches_on_first_alloc() {
+        // Phase 1.6 default-on: WITHOUT any explicit enable_training_headerless
+        // call, the very first allocation an instance serves must auto-latch
+        // all three header-free paths (backends pristine before the first
+        // route). This is the mechanism that makes default-on work under a
+        // #[global_allocator] (pre-main allocs are the first allocs).
+        let h = Box::new(Lohalloc::new());
+        assert!(!h.is_slab_headerless(), "must start un-latched");
+        assert!(!h.is_arena_headerless(), "must start un-latched");
+        let layout = Layout::from_size_align(64, 16).unwrap();
+        let p = unsafe { h.alloc_with_hash(layout, 0xABCD) };
+        assert!(!p.is_null());
+        assert!(h.is_slab_headerless(), "first alloc must auto-latch Slab");
+        assert!(
+            h.is_buddy_headerless(),
+            "first alloc must auto-latch pristine Buddy"
+        );
+        assert!(
+            h.is_arena_headerless(),
+            "first alloc must auto-latch pristine Arena"
+        );
+        assert!(!h.is_inference(), "still Training — no freeze");
+        unsafe { h.dealloc_with_hash(p, layout) };
+    }
+
+    #[test]
+    fn train_headerless_disabled_reads_off_switch_exactly() {
+        // The getenv off-switch is exact-"0"-only; unset or any other value is
+        // ON. Tested on the private helper (not through a live instance) so it
+        // never sets a process-global env that could race other tests' first
+        // allocs. Serialized guard: this test mutates the shared env var.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("LOHALLOC_TRAIN_HEADERLESS");
+        assert!(!train_headerless_disabled(), "unset = default ON");
+        std::env::set_var("LOHALLOC_TRAIN_HEADERLESS", "0");
+        assert!(train_headerless_disabled(), "\"0\" = disabled");
+        std::env::set_var("LOHALLOC_TRAIN_HEADERLESS", "1");
+        assert!(!train_headerless_disabled(), "\"1\" = ON");
+        std::env::set_var("LOHALLOC_TRAIN_HEADERLESS", "00");
+        assert!(!train_headerless_disabled(), "\"00\" is not exact-0 = ON");
+        std::env::remove_var("LOHALLOC_TRAIN_HEADERLESS");
     }
 
     #[test]

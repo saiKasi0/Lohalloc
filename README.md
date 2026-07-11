@@ -151,6 +151,63 @@ Rust API. `.github/workflows/bench.yml` (manual dispatch only) extends
 this to Terraform-provisioned AWS `c6i.large`/`c6g.large` instances for a
 real x86/ARM A/B.
 
+### Context-awareness & reward-fidelity benchmarks
+
+The `context_gap` bench measures the headroom of a *context-aware* Decision
+Engine — workloads whose best backend flips at runtime by allocation
+history, not size — and holds the learner accountable against per-phase
+oracle and best-static baselines:
+
+```bash
+cargo bench -p lohalloc-bench --bench context_gap    # oracle gap + trained_frozen{,_header}
+```
+
+As of Phase 1.6 (default-on), every training instance latches the header-free
+fast paths on its **first allocation**, so the bandit's reward is measured on
+the same headerless path inference runs — the fix for the training/inference
+cost skew where a 48-byte training header write lands on a bump arena's cold
+target and erases its real advantage. `trained_frozen` is therefore the
+headerless default; the `trained_frozen_header` contrast row forces the old
+header-based path (`LOHALLOC_TRAIN_HEADERLESS=0`) to keep the comparison honest.
+Rollback/ablation off-switch: `LOHALLOC_TRAIN_HEADERLESS=0`. Diagnostic:
+
+```bash
+# Per-backend alloc/dealloc latency decomposition (inference vs training path)
+cargo test -p lohalloc-bench --release --lib --features route-metrics \
+    decompose_arena_vs_slab_per_op_cost -- --ignored --nocapture
+```
+
+See `COPILOT.md` (Phase 1.5/1.6) for the reward model — dealloc-side fine
+attribution via a `Header` context nibble (on the headerless path a
+pointer→arm reward-track ring exists but is **default-off**: the certified rt
+A/B showed it re-breaks the mixed rows; `LOHALLOC_REWARD_TRACK=1` opts in for
+diagnostics), the per-arm `clamp_percentile` spike-winsorization (default p90,
+certified better than clamp-off, replacing the retired fixed `latency_clamp_ns`
+constant), the default-on headerless-training fix, and the size-aware
+allocation-history context register (a 2-bit size code per event — the change
+that recovered the mixed/adv-mixed rows on c9g).
+
+### Hybrid cloud benchmarking & ablations
+
+`infra/cloud_bench.sh` provisions ONE ARM64 EC2 box, **rsyncs the working
+tree** (uncommitted changes included), runs a remote script, pulls
+`results/<ts>_<type>/` back, and **always destroys the instance** (EXIT
+trap). The remote script is swappable via `REMOTE_SCRIPT=`:
+
+```bash
+# Full certified suite (make bench + native + cachegrind), the default:
+bash infra/cloud_bench.sh c9g.4xlarge
+
+# Single-provisioning ablations (native timing only, one cell per env knob):
+REMOTE_SCRIPT=infra/remote_bisect.sh         bash infra/cloud_bench.sh c9g.4xlarge  # stripes x demote_fraction
+REMOTE_SCRIPT=infra/remote_clamp_ablation.sh bash infra/cloud_bench.sh c9g.4xlarge  # Task A+B A/B: new defaults vs all-off
+```
+
+Ablation knobs are runtime env vars (`crates/lohalloc-alloc/src/tune.rs`),
+forwarded by `bench/run_native.sh` into every lohalloc training leg, so all
+cells share one build and one provisioning. **Billable** (2 EC2 resources
+per run); requires AWS credentials + `~/.ssh/id_ed25519`.
+
 ---
 
 ## ARCHITECTURE
@@ -242,7 +299,7 @@ instances via Terraform.
 |       |-- hooks/            # useTelemetry (WS), useApi (REST)
 |       `-- types/            # TS types mirroring Rust telemetry schema
 |-- docker/                   # Dockerfile.linux-{x86,arm}, Dockerfile.bench (native harness image)
-|-- infra/                    # Terraform: AWS instances for hybrid bench + remote_bench.sh
+|-- infra/                    # Terraform + cloud_bench.sh; remote_{bench,bisect,clamp_ablation}.sh
 |-- results/                  # make bench-all output: raw JSON + bench-report.{json,md} + graphs/
 |-- .github/workflows/        # bench.yml: manual-dispatch AWS x86+arm bench run
 ```

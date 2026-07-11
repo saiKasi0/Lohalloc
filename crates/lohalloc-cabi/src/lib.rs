@@ -505,7 +505,17 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, new_size: usize) -> *mut c_vo
     }
     let copy_len = old_usable.min(new_size);
     unsafe {
-        core::ptr::copy_nonoverlapping(p, new_ptr as *mut u8, copy_len);
+        // `copy` (memmove), not `copy_nonoverlapping`: when the old block is a
+        // headerless BUMP-ARENA block (Phase-1.6 default-on training-headerless
+        // makes this reachable under real interposition), `old_usable` is the
+        // OVERSTATED distance to the chunk end (see `usable_size_for_realloc`),
+        // and `malloc(new_size)` may bump a *new adjacent block in the same
+        // chunk* — so `[p, p+copy_len)` can overlap `[new_ptr, new_ptr+copy_len)`.
+        // memmove copies the real `min(old,new)` bytes correctly regardless;
+        // any overstated tail is a harmless self-copy. Both ranges stay in
+        // bounds: `copy_len <= new_size` bounds the destination and
+        // `copy_len <= copy_bound (chunk end)` bounds the source.
+        core::ptr::copy(p, new_ptr as *mut u8, copy_len);
         ALLOC.dealloc_with_header_token(p, token);
     }
     new_ptr

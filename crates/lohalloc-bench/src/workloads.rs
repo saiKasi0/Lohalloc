@@ -791,4 +791,124 @@ mod ctx_diag {
             lohalloc_alloc::Lohalloc::pht_miss_count(),
         );
     }
+
+    /// Phase 1.6 reward-basis diagnostic (run with `--features route-metrics`,
+    /// `--ignored --nocapture`). Drives `arena_fill_churn` forced entirely to
+    /// Arena, then entirely to Slab, and prints, for each, the WALL time next
+    /// to the mean measured per-op alloc/dealloc latency the reward is built
+    /// from. Purpose: `context_gap` shows forced-Arena wins wall time several×
+    /// while the trained bandit's per-op reward ranks Slab higher — this
+    /// decomposition finds WHERE that disagreement lives (arena alloc? arena
+    /// dealloc? work outside the timed windows?) so the reward redesign
+    /// targets the real mechanism instead of guessing.
+    #[test]
+    #[ignore]
+    fn decompose_arena_vs_slab_per_op_cost() {
+        use std::time::Instant;
+        const OPS: usize = 24_000;
+        let mid = MID_SLAB_REQUEST;
+
+        for (label, backend) in [("ARENA", Backend::Arena), ("SLAB", Backend::Slab)] {
+            let h = HarnessDriver::with_alloc(crate::forced::lohalloc_forced_single(
+                hashes::W_FILL_A,
+                mid,
+                backend,
+            ));
+            lohalloc_alloc::Lohalloc::reset_latency_profile();
+            let t = Instant::now();
+            workload_arena_fill_churn(&h, hashes::W_FILL_A, hashes::W_FILL_A, OPS);
+            let wall = t.elapsed();
+            eprintln!("== forced {label}: wall={wall:?} over {OPS} ops");
+            for b in [
+                Backend::Slab,
+                Backend::Buddy,
+                Backend::System,
+                Backend::Arena,
+            ] {
+                let (ans, acnt, dns, dcnt) = lohalloc_alloc::Lohalloc::latency_profile(b);
+                if acnt == 0 && dcnt == 0 {
+                    continue;
+                }
+                let amean = ans.checked_div(acnt).unwrap_or(0);
+                let dmean = dns.checked_div(dcnt).unwrap_or(0);
+                eprintln!(
+                    "    {b:?}: alloc {acnt} ops mean {amean}ns (sum {ans}ns) | dealloc {dcnt} ops mean {dmean}ns (sum {dns}ns)"
+                );
+            }
+        }
+
+        // Header-based (training) view of the SAME workload: a fresh
+        // real-bandit run explores both arms, so its fine map holds the per-op
+        // reward the bandit ACTUALLY trains on. Convert reward r back to the
+        // latency it implies (`shaped_reward` = 50/(50+L) ⇒ L = 50·(1−r)/r)
+        // and compare to the headerless per-op means above. A large arena
+        // training-vs-inference gap = the reward is measuring a header-write
+        // cost (cold target for a bump arena) that the headerless inference
+        // path never pays — i.e. a training/inference execution skew, not a
+        // per-op-vs-wall-clock problem.
+        let implied_ns = |r: f64| {
+            if r > 0.0 {
+                50.0 * (1.0 - r) / r
+            } else {
+                f64::NAN
+            }
+        };
+        let dump_fine = |label: &str, h: &HarnessDriver| {
+            eprintln!("== training ({label}) fine means for W_FILL_A -> implied ns:");
+            for (hash, _sc, ctx, pulls, means) in h.alloc.fine_snapshot() {
+                if hash != hashes::W_FILL_A {
+                    continue;
+                }
+                eprintln!(
+                    "  ctx={ctx:2} pulls={pulls:?} slab r={:.3} ({:.0}ns)  arena r={:.3} ({:.0}ns)",
+                    means[0],
+                    implied_ns(means[0]),
+                    means[3],
+                    implied_ns(means[3]),
+                );
+            }
+        };
+
+        // (1) header-based (today's default): arena's cold header write ties
+        // it with slab, so the bandit never prefers arena.
+        let h_hdr = HarnessDriver::new();
+        workload_arena_fill_churn(&h_hdr, hashes::W_FILL_A, hashes::W_FILL_A, OPS);
+        dump_fine("HEADER-BASED", &h_hdr);
+
+        // (2) Phase 1.6 fix: latch headerless BEFORE any alloc, so the reward
+        // is measured on the path inference runs. Arena should now read
+        // clearly faster than slab, and a freeze should route arena.
+        let h_hl = HarnessDriver::new();
+        h_hl.alloc.enable_training_headerless();
+        workload_arena_fill_churn(&h_hl, hashes::W_FILL_A, hashes::W_FILL_A, OPS);
+        dump_fine("HEADERLESS (1.6 fix)", &h_hl);
+        h_hl.alloc.reset_arena();
+        h_hl.alloc.freeze();
+        // `route_count`/`fallthrough_count` are process-wide cumulative (the
+        // forced runs above already bumped them), so measure the frozen
+        // re-run as a delta.
+        let bks = [
+            Backend::Slab,
+            Backend::Buddy,
+            Backend::System,
+            Backend::Arena,
+        ];
+        let before: Vec<u64> = bks
+            .iter()
+            .map(|&b| lohalloc_alloc::Lohalloc::route_count(b))
+            .collect();
+        let ft_before = lohalloc_alloc::Lohalloc::fallthrough_count();
+        workload_arena_fill_churn(&h_hl, hashes::W_FILL_A, hashes::W_FILL_A, OPS);
+        eprint!("== headerless-trained frozen routes (delta):");
+        for (i, &b) in bks.iter().enumerate() {
+            eprint!(
+                " {b:?}={}",
+                lohalloc_alloc::Lohalloc::route_count(b) - before[i]
+            );
+        }
+        eprintln!(
+            " fallthrough={}",
+            lohalloc_alloc::Lohalloc::fallthrough_count() - ft_before
+        );
+    }
 }

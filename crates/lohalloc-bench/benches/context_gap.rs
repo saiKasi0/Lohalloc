@@ -118,11 +118,49 @@ where
     // training pass makes freeze() demote heavy Arena verdicts — including
     // the fine overrides the contextual learner just discovered
     // (occupancy-aware demotion is the Phase-2 answer; see COPILOT.md).
+    // As of Phase 1.6 default-on, this row is now the HEADERLESS default: the
+    // first training alloc auto-latches the header-free paths (see
+    // `Lohalloc::latch_train_headerless_once`), so the bandit's reward is
+    // measured on the same path the frozen run executes. This is where a
+    // learned contextual policy shows up (or doesn't). The pre-freeze
+    // `reset_arena` marks the training/measurement cluster boundary: without
+    // it, a reset-free training pass makes freeze() demote heavy Arena
+    // verdicts — including the fine overrides the contextual learner just
+    // discovered (occupancy-aware demotion is the Phase-2 answer; see
+    // COPILOT.md).
     group.bench_function("trained_frozen", |bch| {
         bch.iter_batched(
             || {
                 let h = HarnessDriver::new();
                 run(&h, hash_a, hash_a);
+                h.alloc.reset_arena();
+                h.alloc.freeze();
+                h
+            },
+            |h| run(&h, hash_a, hash_a),
+            BatchSize::PerIteration,
+        );
+    });
+    // Phase-1.6 accountability CONTRAST row: identical to `trained_frozen`
+    // except training is forced back onto the HEADER-based path via the
+    // `LOHALLOC_TRAIN_HEADERLESS=0` off-switch, so the bandit's reward carries
+    // the training-only 48-byte header write that lands on a bump arena's cold
+    // target and erases its real advantage. Comparing this against
+    // `trained_frozen` (headerless default) on the same machine is the direct
+    // header-vs-headerless measurement the 1.6 fix is built on. The env var is
+    // read by `latch_train_headerless_once` at the instance's first alloc, so
+    // it must be set BEFORE `run()`; it is removed right after training since
+    // the instance is latched-or-not for its lifetime by then (prevents leak
+    // into other rows). Criterion runs bench functions sequentially and these
+    // workloads are single-threaded, so the process-global env window is
+    // deterministic.
+    group.bench_function("trained_frozen_header", |bch| {
+        bch.iter_batched(
+            || {
+                std::env::set_var("LOHALLOC_TRAIN_HEADERLESS", "0");
+                let h = HarnessDriver::new();
+                run(&h, hash_a, hash_a);
+                std::env::remove_var("LOHALLOC_TRAIN_HEADERLESS");
                 h.alloc.reset_arena();
                 h.alloc.freeze();
                 h

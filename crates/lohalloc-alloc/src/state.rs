@@ -105,6 +105,62 @@ struct PendingBatch {
     count: u32,
 }
 
+/// Number of log2 buckets in a [`LatencyHist`]. Bucket `i` covers
+/// `[2^i, 2^(i+1)) ns`, so 24 buckets span ~1 ns … ~16 ms — every real
+/// alloc/free latency plus the cold mmap/segment spikes the winsorizer trims.
+const LATENCY_HIST_BUCKETS: usize = 24;
+
+/// Task B: a fixed log-bucketed latency histogram for one `(Signature,
+/// Backend)` arm, the per-arm estimator that replaced the Phase-1.5 global
+/// `latency_clamp_ns` constant. A bump arena self-clamps low (its cold spikes
+/// are noise), a contended slab mix self-clamps high (its tail is signal) —
+/// the split a single constant could not express. Allocation-free, O(1)
+/// `record`, O(buckets) `quantile` — a deterministic histogram was chosen
+/// over P²'s float markers precisely so the trained model is reproducible.
+#[derive(Default)]
+struct LatencyHist {
+    buckets: [u32; LATENCY_HIST_BUCKETS],
+    total: u64,
+}
+
+impl LatencyHist {
+    /// `floor(log2(max(ns, 1)))`, clamped to the top bucket.
+    #[inline]
+    fn bucket_of(ns: u64) -> usize {
+        let lz = ns.max(1).leading_zeros(); // 0..=63
+        ((63 - lz) as usize).min(LATENCY_HIST_BUCKETS - 1)
+    }
+
+    #[inline]
+    fn record(&mut self, ns: u64) {
+        let b = Self::bucket_of(ns);
+        self.buckets[b] = self.buckets[b].saturating_add(1);
+        self.total = self.total.saturating_add(1);
+    }
+
+    /// Winsorization threshold at percentile `pct` (1..=100): the upper edge
+    /// `2^(i+1)` of the bucket that contains the `pct`-th percentile sample.
+    /// Conservative — a sample at or below this passes through unchanged; a
+    /// higher sample is clamped down to it. Returns `u64::MAX` (no clamp) when
+    /// the arm has no samples yet.
+    fn quantile(&self, pct: u8) -> u64 {
+        if self.total == 0 {
+            return u64::MAX;
+        }
+        let pct = pct.min(100) as u64;
+        // 1-based rank of the target sample: ceil(total * pct / 100), >= 1.
+        let target = (self.total * pct).div_ceil(100).max(1);
+        let mut cum: u64 = 0;
+        for (i, &c) in self.buckets.iter().enumerate() {
+            cum += c as u64;
+            if cum >= target {
+                return 1u64 << (i + 1);
+            }
+        }
+        u64::MAX
+    }
+}
+
 /// Per-(Signature, Backend) reward batching (see [`AllocatorState::record_latency`]).
 ///
 /// # Why rewards are batched (the ARM clock-floor fix)
@@ -135,8 +191,19 @@ pub struct PendingRewards {
     /// DELIBERATELY separate from `batches`: folding ctx into the coarse
     /// key would split coarse batches 16 ways and change their flush
     /// cadence — coarse training must stay byte-identical to the
-    /// pre-context policy. Fed alloc-side only (dealloc has no ctx).
+    /// pre-context policy. Fed from both sides: alloc (live AHR ctx) and,
+    /// since Phase 1.5, dealloc (the alloc-time ctx from the `Header`).
     fine_batches: BTreeMap<(Signature, u8, u8), PendingBatch>,
+    /// Task B: per-arm latency histograms keyed `(Signature, backend)` —
+    /// **without** ctx, so a coarse `record_latency` sample and a fine
+    /// `record_fine_latency` sample for the same arm feed the SAME
+    /// distribution (they measure the same backend's latency). Unlike
+    /// `batches`/`fine_batches` this **persists across flushes** — the running
+    /// quantile is what winsorizes each new sample. Bounded by observed
+    /// signatures (same order as the bandit's `stats`), fixed-size buckets, so
+    /// no unbounded growth; dropped whole at `freeze()` (Training→Inference),
+    /// never carried into the frozen table.
+    hists: BTreeMap<(Signature, u8), LatencyHist>,
 }
 
 impl PendingRewards {
@@ -144,6 +211,7 @@ impl PendingRewards {
         Self {
             batches: BTreeMap::new(),
             fine_batches: BTreeMap::new(),
+            hists: BTreeMap::new(),
         }
     }
 }
@@ -258,6 +326,16 @@ impl AllocatorState {
         if let Self::Training { bandit, pending } = self {
             let sig = Signature::new(hash, size_class);
             let cfg = crate::tune::config();
+            // Task B per-arm spike winsorization (see `winsorize_latency`):
+            // bound a single cold refill spike's influence on its batch — a
+            // batch reward is credited with weight `count`, so an unclamped
+            // 20µs mmap spike poisons 16 pulls at once. The threshold is this
+            // arm's own running `clamp_percentile` quantile, not a global
+            // constant.
+            let latency_ns = {
+                let hist = pending.hists.entry((sig, backend as u8)).or_default();
+                winsorize_latency(hist, latency_ns, cfg)
+            };
             let frag_pct = if cfg.frag_weight > 0.0 {
                 crate::frag_pct_for(backend, total_bytes)
             } else {
@@ -288,13 +366,16 @@ impl AllocatorState {
         }
     }
 
-    /// Phase-1 shadow fine reward: the alloc-side counterpart of
+    /// Phase-1 shadow fine reward: the counterpart of
     /// [`record_latency`](Self::record_latency), additionally keyed on the
-    /// allocation-history context. Called ONLY from the alloc path (the
-    /// dealloc path has no ctx — the history at alloc time is what routing
-    /// would have seen). Batching mirrors `record_latency` exactly; flushes
-    /// land in the bandit's passive fine map (`update_fine`), never
-    /// touching coarse routing.
+    /// allocation-history context. Called from the alloc path with the ctx
+    /// read from the live AHR, and (Phase 1.5) from the dealloc path with
+    /// the *alloc-time* ctx carried in the allocation's `Header` — the
+    /// history at alloc time is what routing would have seen, so both
+    /// halves of an allocation's lifecycle credit the same fine arm.
+    /// Batching mirrors `record_latency` exactly; flushes land in the
+    /// bandit's passive fine map (`update_fine`), never touching coarse
+    /// routing.
     pub fn record_fine_latency(
         &mut self,
         hash: u64,
@@ -307,6 +388,13 @@ impl AllocatorState {
         if let Self::Training { bandit, pending } = self {
             let sig = Signature::new(hash, size_class);
             let cfg = crate::tune::config();
+            // Same per-arm winsorization as `record_latency`, sharing the arm's
+            // histogram (keyed without ctx) so both alloc- and dealloc-side
+            // samples update one distribution.
+            let latency_ns = {
+                let hist = pending.hists.entry((sig, backend as u8)).or_default();
+                winsorize_latency(hist, latency_ns, cfg)
+            };
             let frag_pct = if cfg.frag_weight > 0.0 {
                 crate::frag_pct_for(backend, total_bytes)
             } else {
@@ -680,6 +768,32 @@ pub(crate) fn shaped_reward(
         - cfg.frag_weight * f64::from(frag_pct) / 100.0
 }
 
+/// Task B per-arm spike winsorization (see `TrainingConfig::clamp_percentile`):
+/// cap one raw latency sample at a running high percentile of THIS arm's own
+/// distribution before it enters a reward batch. A bump arena self-clamps low
+/// (cold spikes are noise) and a contended slab mix self-clamps high (its tail
+/// is signal) — the split the fixed Phase-1.5 clamp could not express. The
+/// histogram is updated with the current sample **first** (so it is
+/// represented in its own quantile), then the sample is capped at the arm's
+/// `clamp_percentile` quantile. **Warmup:** below `reward_batch` samples the
+/// arm has no reliable quantile, so the sample passes through unclamped.
+/// `clamp_percentile == 0` disables winsorization entirely (pre-1.5 behavior).
+#[inline]
+fn winsorize_latency(
+    hist: &mut LatencyHist,
+    latency_ns: u64,
+    cfg: &crate::tune::TrainingConfig,
+) -> u64 {
+    if cfg.clamp_percentile == 0 {
+        return latency_ns;
+    }
+    hist.record(latency_ns);
+    if hist.total < cfg.reward_batch as u64 {
+        return latency_ns; // warmup: no reliable quantile yet
+    }
+    latency_ns.min(hist.quantile(cfg.clamp_percentile))
+}
+
 /// J5-A: the volume threshold for freeze-time Arena demotion. A signature
 /// whose `total_pulls` is at least this fraction of the table's total is
 /// "heavy": in a reset-free deployment it will dominate arena traffic,
@@ -826,6 +940,80 @@ mod tests {
             slab_wins > 45,
             "de-quantized rewards must let the decisively-faster arm win \
              ({slab_wins}/50 for Slab)"
+        );
+    }
+
+    #[test]
+    fn per_arm_winsorization_trims_spike_but_not_a_steady_arm() {
+        // Task B: winsorization is now per-arm against the arm's OWN running
+        // quantile (default p90), not a global constant. Two properties:
+        //   (1) A near-instant arm (Arena) with one huge cold spike must have
+        //       that spike trimmed to its own low quantile, so the spike does
+        //       not poison the batch and Arena still outscores a steady slow
+        //       arm (Slab at 200ns) — the regime the Phase-1 finding showed
+        //       the myopic reward model getting backwards.
+        //   (2) A steady arm whose samples all sit in one low bucket is
+        //       unaffected (its p90 == its steady cost, nothing to trim).
+        // reward_batch default is 16, which is also the warmup floor: the
+        // first 16 samples pass unclamped, so we drive 32 samples per arm
+        // (two full batches) — the spike lands after warmup and is trimmed.
+        let mut state = AllocatorState::new_training();
+        let sc = size_class_for(64);
+        // Arena: 31 near-instant samples (bucket 0-ish) + 1 giant 1ms spike.
+        for _ in 0..31 {
+            state.record_fine_latency(7, Backend::Arena, sc, 3, 1, 64);
+        }
+        state.record_fine_latency(7, Backend::Arena, sc, 3, 1_000_000, 64);
+        // Slab: 32 steady 200ns samples.
+        for _ in 0..32 {
+            state.record_fine_latency(7, Backend::Slab, sc, 3, 200, 64);
+        }
+        let rows = state.fine_snapshot();
+        let row = rows
+            .iter()
+            .find(|r| r.0 == 7 && r.2 == 3)
+            .expect("fine row for (hash 7, ctx 3)");
+        let (slab_i, arena_i) = (Backend::Slab as usize, Backend::Arena as usize);
+        assert_eq!(row.3[arena_i], 32, "both Arena batches must have flushed");
+        assert_eq!(row.3[slab_i], 32, "both Slab batches must have flushed");
+        // The Arena arm — one giant spike trimmed to its own low p90 — must
+        // still beat the steady 200ns Slab arm.
+        assert!(
+            row.4[arena_i] > row.4[slab_i],
+            "a mostly-instant Arena arm with a winsorized spike ({}) must \
+             outscore a steady 200ns Slab arm ({})",
+            row.4[arena_i],
+            row.4[slab_i]
+        );
+
+        // Direct unit check of the estimator: a steady arm's p90 sits at its
+        // own bucket (unaffected), and a spike above it is trimmed down.
+        let mut hist = LatencyHist::default();
+        for _ in 0..100 {
+            hist.record(200);
+        }
+        let cfg = crate::tune::TrainingConfig::default();
+        assert_eq!(
+            winsorize_latency(&mut hist, 200, &cfg),
+            200,
+            "a sample at the steady cost is not clamped"
+        );
+        // A 1ms spike into a distribution of ~200ns samples is trimmed to the
+        // steady bucket's upper edge (256), far below 1_000_000.
+        let trimmed = winsorize_latency(&mut hist, 1_000_000, &cfg);
+        assert!(
+            trimmed <= 256,
+            "spike must be trimmed to the arm's p90 bucket edge (got {trimmed})"
+        );
+        // percentile 0 disables winsorization entirely.
+        let cfg_off = crate::tune::TrainingConfig {
+            clamp_percentile: 0,
+            ..cfg
+        };
+        assert_eq!(
+            winsorize_latency(&mut hist, 1_000_000, &cfg_off),
+            1_000_000,
+            "clamp_percentile=0 disables winsorization"
         );
     }
 

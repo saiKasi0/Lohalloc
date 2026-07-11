@@ -123,9 +123,13 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$IP" 'mkdir -p ~/lohalloc'
 # timestamp-driven `make` treat them as up-to-date and skip the Linux
 # rebuild — hyperfine then execs a Mach-O binary on Linux and dies with
 # exit 2. `target`/`.git`/`results`/`node_modules` excluded for size.
+# `.env*` excluded for SECURITY: it holds long-lived AWS credentials used
+# only locally (terraform/rsync/SDK); the remote suite never touches AWS, so
+# there is no reason to ship secrets to the (ephemeral, but still) box.
 rsync -az -e "ssh ${SSH_OPTS[*]}" \
     --exclude target --exclude node_modules --exclude .git --exclude results \
     --exclude 'bench/native/build' --exclude 'shim/build' --exclude 'gui/dist' \
+    --exclude '.env' --exclude '.env.*' \
     --exclude '*.o' \
     ./ "ubuntu@$IP:~/lohalloc/"
 

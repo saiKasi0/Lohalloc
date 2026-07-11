@@ -442,6 +442,27 @@ run_lohalloc_triple() {
     # every raw JSON's stored hyperfine command.
     [ -n "${LOHALLOC_STRIPES:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_STRIPES=$LOHALLOC_STRIPES"
     [ -n "${LOHALLOC_DEMOTE_FRACTION:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_DEMOTE_FRACTION=$LOHALLOC_DEMOTE_FRACTION"
+    # Task B per-arm spike-winsorization ablation knob (LOHALLOC_CLAMP_PERCENTILE,
+    # replaces the retired LOHALLOC_LATENCY_CLAMP_NS): a reward-shaping key, so
+    # it must ride the train + train/export legs to change the learned model.
+    # Honored by BOTH the C/C++ cabi rows (full config in the bootstrap guard)
+    # and the Rust rows (native_workload calls tune::load_from_env at startup —
+    # see its main()). `0` disables winsorization; range 0..=100.
+    [ -n "${LOHALLOC_CLAMP_PERCENTILE:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_CLAMP_PERCENTILE=$LOHALLOC_CLAMP_PERCENTILE"
+    # Phase 1.6 default-on training-headerless off-switch
+    # (LOHALLOC_TRAIN_HEADERLESS=0): a reward-fidelity knob read on the
+    # instance's first alloc, so it rides the train + train/export legs (it
+    # changes the learned model, hence inference routing). NOT a tune key — a
+    # getenv off-switch — but forwarded the same way so the A/B control cell can
+    # force the header-based path. Unset = default ON (headerless training).
+    [ -n "${LOHALLOC_TRAIN_HEADERLESS:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_TRAIN_HEADERLESS=$LOHALLOC_TRAIN_HEADERLESS"
+    # Part 2 bilateral-reward recovery opt-in (LOHALLOC_REWARD_TRACK=1): a
+    # reward-fidelity knob read on the headerless training path, so it rides the
+    # train + train/export legs (it changes the learned model). NOT a tune key —
+    # a getenv opt-in — forwarded for diagnostics. Unset = default OFF (the
+    # certified rt A/B, results/20260711T183928: the ring re-broke the mt-mixed
+    # rows the size-aware context register had fixed).
+    [ -n "${LOHALLOC_REWARD_TRACK:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_REWARD_TRACK=$LOHALLOC_REWARD_TRACK"
     run_one "$lang" "$binary" "$workload" "lohalloc" "$preload" "training" "$tune_env"
     local model="$MODEL_DIR/model-${lang}-${workload}.lohalloc"
     echo "==> [train+export] $lang/$workload -> $model (train ops=$TRAIN_OPS)"
