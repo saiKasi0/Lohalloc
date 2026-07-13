@@ -66,6 +66,14 @@ pub struct SegmentRegistry {
     /// (real mmap addresses are never 0) and `SEGMENT_SIZE`-aligned.
     keys: [AtomicUsize; SEGMENT_CAPACITY],
     vals: [AtomicU8; SEGMENT_CAPACITY],
+    /// Owning `[Mutex<Slab>]` stripe index — the stripe that carved this
+    /// segment, so its blocks' free-list linkage lives in `slab[stripe]`.
+    /// A cross-thread headerless free resolves this to return the block to
+    /// its owning stripe instead of the freeing thread's (mirrors
+    /// [`RegionRegistry`]'s stripe field — without it, cross-thread slab
+    /// frees migrate blocks across stripes and thrash the central lists;
+    /// see `lib.rs::slab_dealloc_headerless`).
+    stripes: [AtomicU8; SEGMENT_CAPACITY],
 }
 
 impl Default for SegmentRegistry {
@@ -79,6 +87,7 @@ impl SegmentRegistry {
         Self {
             keys: [EMPTY_KEY; SEGMENT_CAPACITY],
             vals: [EMPTY_VAL; SEGMENT_CAPACITY],
+            stripes: [EMPTY_VAL; SEGMENT_CAPACITY],
         }
     }
 
@@ -123,7 +132,7 @@ impl SegmentRegistry {
     /// list (see `slab_block_headerless_via_magazine`'s doc, which unmaps
     /// the segment instead when this returns `false`).
     #[must_use]
-    pub fn insert(&self, base: usize, class: u8) -> bool {
+    pub fn insert(&self, base: usize, class: u8, stripe: u8) -> bool {
         debug_assert!(base != 0, "segment base must be nonzero");
         let mut idx = Self::slot_for(base, SEGMENT_CAPACITY);
         for _ in 0..PROBE_MAX {
@@ -135,8 +144,10 @@ impl SegmentRegistry {
                 // Payload before publish (see the ordering note above) —
                 // single-writer per the module doc, so no other writer can
                 // claim this slot with a different key between here and
-                // the CAS below.
+                // the CAS below. Both payloads (class AND stripe) are
+                // written before the key's `Release` store flushes them.
                 self.vals[idx].store(class, Ordering::Relaxed);
+                self.stripes[idx].store(stripe, Ordering::Relaxed);
                 match self.keys[idx].compare_exchange(0, base, Ordering::Release, Ordering::Relaxed)
                 {
                     Ok(_) => return true,
@@ -155,6 +166,14 @@ impl SegmentRegistry {
     /// or a saturation-skipped segment) — the miss path.
     #[inline]
     pub fn lookup(&self, base: usize) -> Option<u8> {
+        self.lookup_full(base).map(|(class, _)| class)
+    }
+
+    /// Look up `base`, returning `(class, owning_stripe)`, or `None` on a
+    /// miss. The free fast path only needs the class ([`lookup`]); the
+    /// cross-thread flush path also needs the stripe.
+    #[inline]
+    pub fn lookup_full(&self, base: usize) -> Option<(u8, u8)> {
         let mut idx = Self::slot_for(base, SEGMENT_CAPACITY);
         for _ in 0..PROBE_MAX {
             let k = self.keys[idx].load(Ordering::Acquire);
@@ -162,7 +181,10 @@ impl SegmentRegistry {
                 return None;
             }
             if k == base {
-                return Some(self.vals[idx].load(Ordering::Acquire));
+                return Some((
+                    self.vals[idx].load(Ordering::Acquire),
+                    self.stripes[idx].load(Ordering::Acquire),
+                ));
             }
             idx = (idx + 1) & (SEGMENT_CAPACITY - 1);
         }
@@ -420,14 +442,18 @@ mod tests {
     #[test]
     fn insert_then_lookup_hits() {
         let r = SegmentRegistry::new();
-        assert!(r.insert(0x1_0000, 3));
+        assert!(r.insert(0x1_0000, 3, 5));
         assert_eq!(r.lookup(0x1_0000), Some(3));
+        // The owning stripe round-trips alongside the class (the field that
+        // lets a cross-thread free return the block to its home stripe).
+        assert_eq!(r.lookup_full(0x1_0000), Some((3, 5)));
+        assert_eq!(r.lookup_full(0x2_0000), None);
     }
 
     #[test]
     fn lookup_miss_returns_none() {
         let r = SegmentRegistry::new();
-        assert!(r.insert(0x1_0000, 3));
+        assert!(r.insert(0x1_0000, 3, 0));
         assert_eq!(r.lookup(0x2_0000), None);
     }
 
@@ -441,9 +467,10 @@ mod tests {
     #[test]
     fn duplicate_insert_is_a_noop() {
         let r = SegmentRegistry::new();
-        assert!(r.insert(0x1_0000, 3));
-        assert!(r.insert(0x1_0000, 7)); // must not overwrite, still succeeds
+        assert!(r.insert(0x1_0000, 3, 2));
+        assert!(r.insert(0x1_0000, 7, 6)); // must not overwrite, still succeeds
         assert_eq!(r.lookup(0x1_0000), Some(3));
+        assert_eq!(r.lookup_full(0x1_0000), Some((3, 2))); // stripe unchanged too
     }
 
     #[test]
@@ -453,11 +480,16 @@ mod tests {
         // SEGMENT_SIZE (64 KiB) as real segments would be.
         for i in 0..500usize {
             let base = 0x1000_0000 + i * 0x1_0000;
-            assert!(r.insert(base, (i % 12) as u8));
+            assert!(r.insert(base, (i % 12) as u8, (i % 8) as u8));
         }
         for i in 0..500usize {
             let base = 0x1000_0000 + i * 0x1_0000;
             assert_eq!(r.lookup(base), Some((i % 12) as u8), "segment {i}");
+            assert_eq!(
+                r.lookup_full(base),
+                Some(((i % 12) as u8, (i % 8) as u8)),
+                "segment {i} stripe"
+            );
         }
     }
 
@@ -474,7 +506,7 @@ mod tests {
         let mut saturated = false;
         for i in 0..2 * SEGMENT_CAPACITY {
             let base = 0x1000_0000 + i * 0x1_0000;
-            if r.insert(base, (i % 12) as u8) {
+            if r.insert(base, (i % 12) as u8, 0) {
                 inserted.push((base, (i % 12) as u8));
             } else {
                 saturated = true;
@@ -531,7 +563,7 @@ mod tests {
 
         for i in 0..N {
             let base = 0x2000_0000 + i * 0x1_0000;
-            assert!(registry.insert(base, (i % 251) as u8));
+            assert!(registry.insert(base, (i % 251) as u8, (i % 8) as u8));
         }
         done.store(true, Ordering::Relaxed);
         for r in readers {

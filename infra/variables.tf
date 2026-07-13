@@ -32,3 +32,9 @@ variable "enable_x86" {
   type        = bool
   default     = true
 }
+
+variable "self_terminate_minutes" {
+  description = "Self-terminate safety net: cloud-init schedules `shutdown -h +N` at boot and the instance is set to terminate on shutdown, so a run whose local orchestrator dies (killed poller, dropped session) can never leak a billable instance indefinitely — it self-destructs after N minutes no matter what. Sized to cover the full suite + collection margin; a normal run's `terraform destroy` kills the box long before this fires. 0 disables the net (not recommended)."
+  type        = number
+  default     = 180
+}

@@ -676,7 +676,7 @@ impl AllocatorState {
                         .collect();
                 let distilled = PerfectHashTable::from_entries(distilled_entries);
                 *self = Self::Inference {
-                    routing: FrozenRouting { main, distilled },
+                    routing: FrozenRouting::new(main, distilled),
                 };
             }
             Self::Inference { .. } => {

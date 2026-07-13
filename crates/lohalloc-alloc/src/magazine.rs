@@ -16,13 +16,20 @@
 //! (Slab vs Arena vs …); a cache in front of routing would bypass that
 //! decision and break per-site semantics.
 //!
+//! # Storage (J6 Phase A)
+//!
+//! The magazine's state (owner, counts, slots) lives in the merged
+//! [`crate::hot::HotTls`] block, not a private `thread_local!` — one TLS
+//! variable for the whole hot path instead of one per concern. This module
+//! keeps the operation API and its invariants.
+//!
 //! # TLS discipline (load-bearing)
 //!
-//! Everything here is a dtor-free `Cell` in a `const`-initialized
-//! `thread_local!`. The crate invariant (see `lohalloc-cabi`'s module doc)
-//! is that alloc-path TLS must have **no destructors**: a TLS dtor could
-//! run during thread teardown and re-enter the allocator or deallocate,
-//! deadlocking or corrupting state.
+//! Everything is a dtor-free `Cell` in a `const`-initialized
+//! `thread_local!` (see `hot.rs`). The crate invariant (see
+//! `lohalloc-cabi`'s module doc) is that alloc-path TLS must have **no
+//! destructors**: a TLS dtor could run during thread teardown and re-enter
+//! the allocator or deallocate, deadlocking or corrupting state.
 //!
 //! # Thread exit = bounded strand, by design
 //!
@@ -34,21 +41,23 @@
 //! TLS-dtor hazard the invariant above forbids. Revisit only if long-lived
 //! processes with heavy thread churn become a target.
 
-use core::cell::Cell;
-
 use lohalloc_core::SLAB_SIZE_CLASSES;
 
-/// One magazine per slab size class.
-pub const NUM_CLASSES: usize = SLAB_SIZE_CLASSES.len();
+use crate::hot::{self, HotTls};
+
+/// One magazine per slab size class. (`MAG_`-prefixed so `hot.rs` can use
+/// it for the merged block's array dimensions without clashing with
+/// `slab.rs`'s private `NUM_CLASSES`.)
+pub(crate) const MAG_CLASSES: usize = SLAB_SIZE_CLASSES.len();
 
 /// Slot-array dimension (the largest per-class cap).
-const MAX_CAP: usize = 32;
+pub(crate) const MAG_MAX_CAP: usize = 32;
 
 /// Per-class capacity: generous for small classes, shrinking with block
 /// size so the worst-case strandable bytes per thread stay bounded:
 /// 32×(8+16+32+64+128+256) + 16×(512+1024) + 8×(2048+4096) + 4×(8192+16384)
 /// ≈ 210 KiB.
-const CLASS_CAPS: [u8; NUM_CLASSES] = [32, 32, 32, 32, 32, 32, 16, 16, 8, 8, 4, 4];
+const CLASS_CAPS: [u8; MAG_CLASSES] = [32, 32, 32, 32, 32, 32, 16, 16, 8, 8, 4, 4];
 
 /// How many blocks a refill asks the central slab for (half the cap), and
 /// how many a flush returns. Half-full hysteresis avoids ping-ponging a
@@ -57,67 +66,35 @@ pub fn refill_count(class: usize) -> usize {
     (CLASS_CAPS[class] as usize / 2).max(1)
 }
 
-// `[CONST_ITEM; N]` array-repeat works for non-Copy types (promoted
-// constants) — this is what keeps the whole struct const-constructible on
-// the workspace MSRV without inline-const blocks. The
-// `declare_interior_mutable_const` lint exists to catch consts mistaken
-// for shared state; here each use-site deliberately *instantiates a fresh
-// Cell* (that's what array-repeat init needs), so the lint is a false
-// positive by construction.
-#[allow(clippy::declare_interior_mutable_const)]
-const NULL_SLOT: Cell<*mut u8> = Cell::new(core::ptr::null_mut());
-#[allow(clippy::declare_interior_mutable_const)]
-const EMPTY_ROW: [Cell<*mut u8>; MAX_CAP] = [NULL_SLOT; MAX_CAP];
-#[allow(clippy::declare_interior_mutable_const)]
-const ZERO_COUNT: Cell<u8> = Cell::new(0);
-
-/// The per-thread magazine set: a fixed stack of ready block pointers per
-/// slab class. All plain `Cell`s — no `Drop`, no interior heap.
+/// Ensure this thread's magazine belongs to `owner`, discarding stale
+/// contents from a previous instance if not. `owner` ids are unique and
+/// never reused (monotonic counter), so a stale match is impossible.
 ///
 /// # Ownership (load-bearing — a SIGSEGV taught us this)
 ///
-/// This TLS is process-wide, but the crate deliberately supports **multiple
-/// `Lohalloc` instances** (the replay engine and the forced-routing tests
-/// create private ones). A magazine holding instance A's blocks must never
-/// serve instance B: B's central slab doesn't own those regions, and once A
-/// is dropped its regions are unmapped — popping A's block from B and
-/// writing a header into it is a use-after-munmap (reproduced as a SIGSEGV
-/// in `routing_validation`). Every operation therefore carries the calling
-/// instance's unique `owner` id; on mismatch the magazine **discards** its
-/// stale contents (counts zeroed, pointers never dereferenced) and adopts
-/// the new owner. Discarding strands at most ~200 KiB of the old instance's
-/// blocks per (thread × instance switch) — a bounded leak, never
-/// corruption; the production configuration (one static allocator) never
-/// switches at all.
-struct Magazine {
-    owner: Cell<u64>,
-    counts: [Cell<u8>; NUM_CLASSES],
-    slots: [[Cell<*mut u8>; MAX_CAP]; NUM_CLASSES],
-}
-
-std::thread_local! {
-    static MAG: Magazine = const {
-        Magazine {
-            owner: Cell::new(0),
-            counts: [ZERO_COUNT; NUM_CLASSES],
-            slots: [EMPTY_ROW; NUM_CLASSES],
+/// The magazine TLS is process-wide, but the crate deliberately supports
+/// **multiple `Lohalloc` instances** (the replay engine and the
+/// forced-routing tests create private ones). A magazine holding instance
+/// A's blocks must never serve instance B: B's central slab doesn't own
+/// those regions, and once A is dropped its regions are unmapped — popping
+/// A's block from B and writing a header into it is a use-after-munmap
+/// (reproduced as a SIGSEGV in `routing_validation`). Every operation
+/// therefore carries the calling instance's unique `owner` id; on mismatch
+/// the magazine **discards** its stale contents (counts zeroed, pointers
+/// never dereferenced) and adopts the new owner. Discarding strands at most
+/// ~200 KiB of the old instance's blocks per (thread × instance switch) — a
+/// bounded leak, never corruption; the production configuration (one static
+/// allocator) never switches at all. The same mechanism is what makes
+/// `Lohalloc::invalidate_magazines` (the J4-A training→headerless
+/// transition) work.
+#[inline]
+fn ensure_owner(h: &HotTls, owner: u64) {
+    debug_assert!(owner != 0, "owner id 0 is reserved for 'unassigned'");
+    if h.mag_owner.get() != owner {
+        for c in &h.mag_counts {
+            c.set(0);
         }
-    };
-}
-
-impl Magazine {
-    /// Ensure this magazine belongs to `owner`, discarding stale contents
-    /// from a previous instance if not. `owner` ids are unique and never
-    /// reused (monotonic counter), so a stale match is impossible.
-    #[inline]
-    fn ensure_owner(&self, owner: u64) {
-        debug_assert!(owner != 0, "owner id 0 is reserved for 'unassigned'");
-        if self.owner.get() != owner {
-            for c in &self.counts {
-                c.set(0);
-            }
-            self.owner.set(owner);
-        }
+        h.mag_owner.set(owner);
     }
 }
 
@@ -125,16 +102,16 @@ impl Magazine {
 /// `owner`). Returns `None` only when the magazine is empty for this owner.
 #[inline]
 pub fn pop(owner: u64, class: usize) -> Option<*mut u8> {
-    debug_assert!(class < NUM_CLASSES);
-    MAG.with(|m| {
-        m.ensure_owner(owner);
-        let n = m.counts[class].get();
+    debug_assert!(class < MAG_CLASSES);
+    hot::with(|h| {
+        ensure_owner(h, owner);
+        let n = h.mag_counts[class].get();
         if n == 0 {
             return None;
         }
         let n = n - 1;
-        m.counts[class].set(n);
-        Some(m.slots[class][n as usize].get())
+        h.mag_counts[class].set(n);
+        Some(h.mag_slots[class][n as usize].get())
     })
 }
 
@@ -143,16 +120,16 @@ pub fn pop(owner: u64, class: usize) -> Option<*mut u8> {
 /// cap — the caller must flush to the central slab.
 #[inline]
 pub fn push(owner: u64, class: usize, block: *mut u8) -> bool {
-    debug_assert!(class < NUM_CLASSES);
+    debug_assert!(class < MAG_CLASSES);
     debug_assert!(!block.is_null());
-    MAG.with(|m| {
-        m.ensure_owner(owner);
-        let n = m.counts[class].get();
+    hot::with(|h| {
+        ensure_owner(h, owner);
+        let n = h.mag_counts[class].get();
         if n >= CLASS_CAPS[class] {
             return false;
         }
-        m.slots[class][n as usize].set(block);
-        m.counts[class].set(n + 1);
+        h.mag_slots[class][n as usize].set(block);
+        h.mag_counts[class].set(n + 1);
         true
     })
 }
@@ -162,15 +139,15 @@ pub fn push(owner: u64, class: usize, block: *mut u8) -> bool {
 /// slab in one locked batch). Returns how many were written to `out`.
 #[inline]
 pub fn take(owner: u64, class: usize, out: &mut [*mut u8]) -> usize {
-    debug_assert!(class < NUM_CLASSES);
-    MAG.with(|m| {
-        m.ensure_owner(owner);
-        let have = m.counts[class].get() as usize;
+    debug_assert!(class < MAG_CLASSES);
+    hot::with(|h| {
+        ensure_owner(h, owner);
+        let have = h.mag_counts[class].get() as usize;
         let take = have.min(out.len());
         for (i, slot) in out.iter_mut().enumerate().take(take) {
-            *slot = m.slots[class][have - 1 - i].get();
+            *slot = h.mag_slots[class][have - 1 - i].get();
         }
-        m.counts[class].set((have - take) as u8);
+        h.mag_counts[class].set((have - take) as u8);
         take
     })
 }

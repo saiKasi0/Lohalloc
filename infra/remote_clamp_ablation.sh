@@ -109,11 +109,49 @@ fi
 #   LOHALLOC_SERVABLE_TRAINING=1 opts in (deep-callgraph/recursion apps):
 #   CELLS=( "sv-on:LOHALLOC_SERVABLE_TRAINING=1" "sv-off:LOHALLOC_SERVABLE_TRAINING=0" )
 #
-# ACTIVE: the certified defaults, single sanity cell (edit CELLS per the
-# historical configs above for the next ablation).
+#   Phase-1 slab-diet item A (unanimous-size-class shortcut) — NOT CERTIFIED,
+#   default-off opt-in. The /investigate root cause (2026-07-12): the slab-row
+#   loss is DISTRIBUTED per-op cost (routing preamble + headerless registry
+#   lookup on every free + owner-checked magazine), ~2x glibc's data accesses,
+#   NOT the stack walk (register-cheap). Item A was built to shortcut the walk
+#   for unanimous size classes, but the local route-metrics measurement proved
+#   it INERT on the suite: real workloads have incidental multi-site traffic at
+#   shared classes (VecDeque backing buffers → Arena while the payload site →
+#   Slab), so whole-class unanimity never holds and the hot slab site takes the
+#   full walk regardless (it is unpinnable, pin_negative=19999/20000). ON vs
+#   OFF were byte-identical locally → no c9g A/B run (nothing to certify).
+#   Shipped default-off (LOHALLOC_SC_SHORTCUT=1 opts in) for clean-unanimity
+#   production workloads. The deeper slab gap remains architectural.
+#
+#   mt-xfree owning-stripe slab remote-free A/B (2026-07-12): return
+#   cross-thread slab frees to the OWNING stripe (default on) vs the freeing
+#   thread's stripe (=0, pre-fix). Root-caused: slab cross-thread frees migrate
+#   blocks across stripes (mt-xfree-t4 measured 15,291 central refills + 15,148
+#   sibling steals vs 44/0 same-thread); the fix ports buddy's already-shipped
+#   region→stripe return to slab.
+#   RUN 1 (results/20260712T184105): NET WIN — mt-xfree 8/9 rows faster (mean
+#   0.945, c/cpp t4 now BEAT jemalloc 0.91/0.96), adv-mixed/mt-mixed-t4 big
+#   wins, mt-slab unaffected (0.998). BUT arena regressed ~15% uniformly
+#   (rust 1.18/c 1.16/cpp 1.15) — diagnosed as the per-stripe grouping loop
+#   running on same-thread flushes (arena routes to Slab, 3111 flushes,
+#   all_same). FIX: same-stripe fast path (one batch, skip the 16-stripe loop
+#   when all blocks share a stripe). rust/mt-xfree-t8 also regressed 1.148
+#   (inherent same-stripe contention at max threads — one row).
+#   RUN 2 (this): re-cert with the fast path — expect arena recovered,
+#   mt-xfree wins preserved.
+# ACTIVE — the on/off A/B:
 CELLS=(
-    "defaults:"
+    "on:LOHALLOC_SLAB_OWNER_FREE=1"
+    "off:LOHALLOC_SLAB_OWNER_FREE=0"
 )
+
+# RUN 2 scope: the arena-recovery + mt-xfree-hold decision rows plus the
+# collateral winners and controls, to keep the poll window short (~15 min vs
+# ~50) after run 1's ~50-min run was killed at the midnight rollover. The
+# fast-path change is surgical (only the same-thread slab flush), so a full
+# suite isn't needed to catch new collateral. run_native.sh honors WORKLOADS
+# for every lang (C/C++/rust); MT names ride through unchanged.
+export WORKLOADS="arena slab mt-slab-t4 mt-xfree-t1 mt-xfree-t4 mt-xfree-t8 adv-mixed mt-mixed-t4 buddy"
 
 BASE="results/$(date +%Y%m%dT%H%M%S)-clamp-sweep"
 echo "== clamp_percentile sweep (headerless on): ${#CELLS[@]} cells under $BASE =="

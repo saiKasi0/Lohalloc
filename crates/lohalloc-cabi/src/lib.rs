@@ -116,11 +116,11 @@ static MALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 /// RMW on every single malloc long after the freeze had fired.
 static FREEZE_FIRED: AtomicBool = AtomicBool::new(false);
 
-std::thread_local! {
-    /// Re-entrancy depth for this thread's exported allocation calls. See
-    /// `with_freeze_check` for why this exists.
-    static IN_ALLOC_FN: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
-}
+// Re-entrancy depth for this thread's exported allocation calls (see
+// `with_freeze_check` for why this exists) lives in `lohalloc-alloc`'s
+// merged hot TLS block (`hot::export_depth_get`/`_set`, J6 Phase A) — a
+// separate `thread_local!` here was one more `__tls_get_addr` per exported
+// call under the general-dynamic TLS model this cdylib is compiled with.
 
 fn freeze_after_threshold() -> Option<u64> {
     static CELL: OnceLock<Option<u64>> = OnceLock::new();
@@ -178,7 +178,8 @@ fn maybe_auto_freeze() {
 /// model. Failures warn on stderr and continue; the benchmark script is the
 /// layer that treats a missing model file as fatal.
 ///
-/// Must only be called with `IN_ALLOC_FN` depth > 0 (i.e. from inside
+/// Must only be called with the export depth (`hot::export_depth`) > 0
+/// (i.e. from inside
 /// `with_freeze_check` or another depth bump): `std::env::var`, `format!`,
 /// and `std::fs` all allocate, and those nested mallocs must skip the
 /// top-level init/freeze layer (see `with_freeze_check`'s doc).
@@ -207,7 +208,7 @@ fn maybe_export_model() {
 /// set so the `LOHALLOC_FREEZE_AFTER` counter is never touched). On any
 /// failure: warn once on stderr and stay in Training.
 ///
-/// Re-entrancy: only ever called at `IN_ALLOC_FN` depth 0, from
+/// Re-entrancy: only ever called at export depth (`hot::export_depth`) 0, from
 /// `with_freeze_check`, *after* the depth bump — so the nested allocations
 /// its own body triggers (env read, `fs::read`'s Vec, the deserialized
 /// table) re-enter `malloc` at depth > 0 and can never re-enter this
@@ -352,18 +353,18 @@ fn with_freeze_check(f: impl FnOnce() -> *mut c_void) -> *mut c_void {
     // every call (the cost C6 removed), which is the accepted price of a
     // hash that's actually stable across the training→inference
     // transition. Do not reintroduce any post-call branch on freeze state.
-    let depth = IN_ALLOC_FN.with(|c| {
-        let d = c.get();
-        c.set(d + 1);
+    let depth = {
+        let d = lohalloc_alloc::hot::export_depth_get();
+        lohalloc_alloc::hot::export_depth_set(d + 1);
         d
-    });
+    };
     // A call is only truly top-level if BOTH depth counters agree: this
-    // library's export depth (`IN_ALLOC_FN`) *and* the allocator's
+    // library's export depth (`hot::export_depth`) *and* the allocator's
     // internal guard (`Lohalloc::thread_inside_allocator`). The second
     // check is deadlock #4's defense-in-depth: a nested malloc triggered
     // by allocator *internals* (e.g. training's `record_latency`
     // inserting a `BTreeMap` node while the `state` Mutex is held) can
-    // arrive through an entry point that never bumped `IN_ALLOC_FN` —
+    // arrive through an entry point that never bumped the export depth —
     // `free` was exactly that — and freezing from such a context re-locks
     // a Mutex this same thread already holds. `top_level` is about
     // re-entrancy depth, not freeze state, so guarding these two calls on
@@ -379,7 +380,7 @@ fn with_freeze_check(f: impl FnOnce() -> *mut c_void) -> *mut c_void {
     if !ptr.is_null() && top_level {
         maybe_auto_freeze();
     }
-    IN_ALLOC_FN.with(|c| c.set(depth));
+    lohalloc_alloc::hot::export_depth_set(depth);
     ptr
 }
 
@@ -424,13 +425,13 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
     let owned = if FREEZE_FIRED.load(Ordering::Relaxed) {
         unsafe { ALLOC.try_dealloc_raw(p) }
     } else {
-        let depth = IN_ALLOC_FN.with(|c| {
-            let d = c.get();
-            c.set(d + 1);
+        let depth = {
+            let d = lohalloc_alloc::hot::export_depth_get();
+            lohalloc_alloc::hot::export_depth_set(d + 1);
             d
-        });
+        };
         let owned = unsafe { ALLOC.try_dealloc_raw(p) };
-        IN_ALLOC_FN.with(|c| c.set(depth));
+        lohalloc_alloc::hot::export_depth_set(depth);
         owned
     };
     if !owned {
@@ -644,11 +645,11 @@ pub extern "C" fn lohalloc_freeze() {
     // reads env vars and does file I/O, whose nested allocations must not
     // look like fresh top-level mallocs (they'd re-enter the non-reentrant
     // init `OnceLock`s on this same thread).
-    let depth = IN_ALLOC_FN.with(|c| c.get());
-    IN_ALLOC_FN.with(|c| c.set(depth + 1));
+    let depth = lohalloc_alloc::hot::export_depth_get();
+    lohalloc_alloc::hot::export_depth_set(depth + 1);
     ALLOC.freeze();
     maybe_export_model();
-    IN_ALLOC_FN.with(|c| c.set(depth));
+    lohalloc_alloc::hot::export_depth_set(depth);
 }
 
 /// True (`1`) if the process-wide allocator is currently in Inference mode.

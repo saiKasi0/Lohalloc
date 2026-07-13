@@ -109,6 +109,149 @@ NOINLINE void workload_adversarial_mixed(size_t ops) {
     free(live);
 }
 
+// ---- Realistic application patterns ----------------------------------
+// Dependency-free, deterministic (seeded LCG, same mixer as
+// `workload_adversarial_mixed`) allocation SHAPES that mirror how real
+// software allocates — the paper-vs-product benchmarks. Mirrored in
+// `crates/lohalloc-bench/src/workloads.rs` so the C/C++/Rust sequences match.
+
+// W-REQUEST-LOOP: N "requests", each allocating a burst of small request
+// structs (16-256 B) + a couple medium response buffers (4-64 KiB), touched
+// then freed ALL AT ONCE at request end — the per-request-arena pattern (HTTP
+// handler / RPC dispatch). `ops` = total small allocations (~20 per request).
+NOINLINE void workload_request_loop(size_t ops) {
+    enum { SMALL_PER_REQ = 20, MED_PER_REQ = 2 };
+    void *req[SMALL_PER_REQ + MED_PER_REQ];
+    uint64_t state = 0xD1B54A32D192ED03ULL;
+    size_t num_requests = ops / SMALL_PER_REQ;
+    if (num_requests == 0) num_requests = 1;
+    for (size_t r = 0; r < num_requests; r++) {
+        size_t n = 0;
+        for (size_t i = 0; i < SMALL_PER_REQ; i++) {
+            state = state * 6364136223846793005ULL + 1ULL;
+            size_t size = 16 + ((state >> 33) % (256 - 16)); /* 16..256 */
+            void *p = malloc(size);
+            if (p) ((volatile char *)p)[0] = (char)r;
+            req[n++] = p;
+        }
+        for (size_t i = 0; i < MED_PER_REQ; i++) {
+            state = state * 6364136223846793005ULL + 1ULL;
+            size_t size = 4 * 1024 + ((state >> 33) % (60 * 1024)); /* 4K..64K */
+            void *p = malloc(size);
+            if (p) ((volatile char *)p)[0] = (char)r;
+            req[n++] = p;
+        }
+        for (size_t i = 0; i < n; i++) {
+            free(req[i]);
+        }
+    }
+}
+
+struct json_node {
+    char *key;
+    struct json_node **kids;
+    size_t nkids;
+    size_t cap;
+};
+
+// W-JSON-TREE: build a nested document tree of `ops` node structs, each with a
+// variable-length string key (4-64 B) and a growable child-pointer array
+// (realloc), linked under an earlier node; walk it, then free the whole tree.
+// Mixed small+variable sizes + realloc growth + whole-tree burst free.
+NOINLINE void workload_json_tree(size_t ops) {
+    size_t n = ops;
+    if (n == 0) n = 1;
+    struct json_node **nodes = malloc(n * sizeof(struct json_node *));
+    uint64_t state = 0x2545F4914F6CDD1DULL;
+    for (size_t i = 0; i < n; i++) {
+        struct json_node *node = malloc(sizeof(struct json_node));
+        node->kids = NULL;
+        node->nkids = 0;
+        node->cap = 0;
+        state = state * 6364136223846793005ULL + 1ULL;
+        size_t klen = 4 + ((state >> 33) % 60); /* 4..64 */
+        node->key = malloc(klen);
+        if (node->key) ((volatile char *)node->key)[0] = (char)i;
+        nodes[i] = node;
+        if (i > 0) {
+            state = state * 6364136223846793005ULL + 1ULL;
+            size_t parent = (size_t)(state >> 1) % i;
+            struct json_node *pp = nodes[parent];
+            if (pp->nkids == pp->cap) {
+                size_t ncap = pp->cap == 0 ? 4 : pp->cap * 2;
+                pp->kids = realloc(pp->kids, ncap * sizeof(struct json_node *));
+                pp->cap = ncap;
+            }
+            pp->kids[pp->nkids++] = node;
+        }
+    }
+    volatile char sink = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (nodes[i]->key) sink = (char)(sink + nodes[i]->key[0]);
+    }
+    (void)sink;
+    for (size_t i = 0; i < n; i++) {
+        free(nodes[i]->key);
+        free(nodes[i]->kids);
+        free(nodes[i]);
+    }
+    free(nodes);
+}
+
+struct kv_entry {
+    int used;
+    uint64_t key;
+    void *val;
+};
+
+// W-KV-STORE: open-addressing hash table (fixed capacity, linear probe) with
+// variable-size values (8-512 B). Random insert/overwrite/delete/lookup churn
+// over `ops` operations — long-lived allocations + steady-state churn (the
+// cache/store pattern). Evict-on-collision keeps it leak-free so RSS is a fair
+// fragmentation signal.
+NOINLINE void workload_kv_store(size_t ops) {
+    const size_t CAP = 1u << 14; /* 16384 slots */
+    struct kv_entry *tab = calloc(CAP, sizeof(struct kv_entry));
+    uint64_t state = 0x9E6C63D0676A9A99ULL;
+    for (size_t i = 0; i < ops; i++) {
+        state = state * 6364136223846793005ULL + 1ULL;
+        uint64_t key = state >> 12;
+        size_t slot = (size_t)((key * 0x9E3779B97F4A7C15ULL) >> 50) & (CAP - 1);
+        size_t probes = 0;
+        while (tab[slot].used && tab[slot].key != key && probes < 32) {
+            slot = (slot + 1) & (CAP - 1);
+            probes++;
+        }
+        state = state * 6364136223846793005ULL + 1ULL;
+        int op = (int)((state >> 40) % 3); /* 0=insert/update 1=delete 2=lookup */
+        if (op == 0) {
+            state = state * 6364136223846793005ULL + 1ULL;
+            size_t vlen = 8 + ((state >> 33) % (512 - 8));
+            if (tab[slot].used) free(tab[slot].val); /* overwrite or evict */
+            void *v = malloc(vlen);
+            if (v) ((volatile char *)v)[0] = (char)i;
+            tab[slot].used = 1;
+            tab[slot].key = key;
+            tab[slot].val = v;
+        } else if (op == 1) {
+            if (tab[slot].used && tab[slot].key == key) {
+                free(tab[slot].val);
+                tab[slot].used = 0;
+                tab[slot].val = NULL;
+            }
+        } else {
+            if (tab[slot].used && tab[slot].key == key && tab[slot].val) {
+                volatile char c = ((char *)tab[slot].val)[0];
+                (void)c;
+            }
+        }
+    }
+    for (size_t i = 0; i < CAP; i++) {
+        if (tab[i].used) free(tab[i].val);
+    }
+    free(tab);
+}
+
 // ---- Multithreaded workloads -----------------------------------------
 
 struct mt_ops_arg {
@@ -384,6 +527,12 @@ int dispatch_workload(const char *workload, size_t ops) {
         workload_system_large(ops / 20 > 0 ? ops / 20 : 1);
     } else if (strcmp(workload, "adv-mixed") == 0) {
         workload_adversarial_mixed(ops);
+    } else if (strcmp(workload, "request-loop") == 0) {
+        workload_request_loop(ops);
+    } else if (strcmp(workload, "json-tree") == 0) {
+        workload_json_tree(ops);
+    } else if (strcmp(workload, "kv-store") == 0) {
+        workload_kv_store(ops);
     } else {
         return 0;
     }

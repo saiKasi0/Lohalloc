@@ -87,6 +87,32 @@ pub trait AllocDriver {
     /// `ptr` must have been returned by a prior `alloc` call on this driver
     /// with a matching `layout`.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout, hash: u64);
+    /// Grow/shrink an allocation, matching C's `realloc` (used by
+    /// `workload_json_tree`'s growing child arrays). Default = alloc-new +
+    /// copy(min) + dealloc-old; `GlobalDriver` overrides it to the real global
+    /// `realloc` so the native matrix measures each allocator's own realloc
+    /// path, mirroring the C harness. `ptr` must be non-null (the workloads
+    /// never realloc a null — they `alloc` the first block, matching C's
+    /// `realloc(NULL,…) == malloc`, without std's null-ptr UB).
+    /// # Safety
+    /// `ptr`/`old_layout` must be a live pairing from a prior call on this
+    /// driver; `new_size > 0`.
+    unsafe fn realloc(
+        &self,
+        ptr: *mut u8,
+        old_layout: Layout,
+        new_size: usize,
+        hash: u64,
+    ) -> *mut u8 {
+        let new_layout = Layout::from_size_align(new_size, old_layout.align()).unwrap();
+        let new_ptr = unsafe { self.alloc(new_layout, hash) };
+        if !new_ptr.is_null() {
+            let copy = old_layout.size().min(new_size);
+            unsafe { core::ptr::copy_nonoverlapping(ptr, new_ptr, copy) };
+            unsafe { self.dealloc(ptr, old_layout, hash) };
+        }
+        new_ptr
+    }
     /// Called between bursts in workloads that model a cluster lifetime
     /// ending (e.g. W-ARENA). No-op for drivers with no such concept.
     fn phase_end(&self) {}
@@ -162,6 +188,17 @@ impl AllocDriver for GlobalDriver {
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout, _hash: u64) {
         unsafe { std::alloc::dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(
+        &self,
+        ptr: *mut u8,
+        old_layout: Layout,
+        new_size: usize,
+        _h: u64,
+    ) -> *mut u8 {
+        // The real global realloc — the allocator under test's own path
+        // (matches the C harness's `realloc`).
+        unsafe { std::alloc::realloc(ptr, old_layout, new_size) }
     }
 }
 
@@ -275,6 +312,202 @@ pub fn workload_adversarial_mixed<D: AllocDriver>(driver: &D, hash: u64, ops: us
     }
     for (p, l) in live {
         unsafe { driver.dealloc(p, l, hash) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Realistic application patterns (the paper-vs-product benchmarks). Mirror
+// `bench/native/workloads.c`'s request-loop/json-tree/kv-store byte-for-byte
+// (same seeds, same size distributions, same alloc/realloc/free order) so the
+// C/C++/Rust rows are the same shape. Only the payload allocations route
+// through the driver; bookkeeping (Vecs) is pre-sized so it doesn't add growth.
+// ---------------------------------------------------------------------------
+
+/// W-REQUEST-LOOP: N requests, each a burst of small structs (16-256 B) + a
+/// couple medium buffers (4-64 KiB), freed all at once at request end — the
+/// per-request-arena pattern. `ops` = total small allocations.
+#[inline(never)]
+pub fn workload_request_loop<D: AllocDriver>(driver: &D, hash: u64, ops: usize) {
+    const SMALL_PER_REQ: usize = 20;
+    const MED_PER_REQ: usize = 2;
+    let unit = Layout::from_size_align(1, 16).unwrap();
+    let mut req = [(core::ptr::null_mut::<u8>(), unit); SMALL_PER_REQ + MED_PER_REQ];
+    let mut state: u64 = 0xD1B5_4A32_D192_ED03;
+    let num_requests = (ops / SMALL_PER_REQ).max(1);
+    for r in 0..num_requests {
+        let mut n = 0;
+        for _ in 0..SMALL_PER_REQ {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let size = 16 + ((state >> 33) as usize % (256 - 16));
+            let layout = Layout::from_size_align(size, 16).unwrap();
+            let p = unsafe { driver.alloc(layout, hash) };
+            if !p.is_null() {
+                unsafe { p.write_volatile(r as u8) };
+            }
+            req[n] = (p, layout);
+            n += 1;
+        }
+        for _ in 0..MED_PER_REQ {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let size = 4 * 1024 + ((state >> 33) as usize % (60 * 1024));
+            let layout = Layout::from_size_align(size, 16).unwrap();
+            let p = unsafe { driver.alloc(layout, hash) };
+            if !p.is_null() {
+                unsafe { p.write_volatile(r as u8) };
+            }
+            req[n] = (p, layout);
+            n += 1;
+        }
+        for &(p, l) in req.iter().take(n) {
+            unsafe { driver.dealloc(p, l, hash) };
+        }
+    }
+}
+
+/// W-JSON-TREE: build a nested document tree of `ops` nodes — a node struct
+/// (32 B, matching the C layout), a variable string key (4-64 B), and a
+/// realloc-grown child-pointer array — linked under an earlier node; walk it,
+/// then free the whole tree. Mixed small+variable + realloc + burst free.
+#[inline(never)]
+pub fn workload_json_tree<D: AllocDriver>(driver: &D, hash: u64, ops: usize) {
+    const NODE_SIZE: usize = 32; // sizeof(struct json_node) on 64-bit
+    struct Node {
+        node: (*mut u8, Layout),
+        key: (*mut u8, Layout),
+        kids: *mut u8,
+        kids_layout: Layout,
+        nkids: usize,
+        cap: usize,
+    }
+    let n = ops.max(1);
+    let unit = Layout::from_size_align(1, 16).unwrap();
+    let node_layout = Layout::from_size_align(NODE_SIZE, 16).unwrap();
+    let mut nodes: Vec<Node> = Vec::with_capacity(n);
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    for i in 0..n {
+        let node = unsafe { driver.alloc(node_layout, hash) };
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        let klen = 4 + ((state >> 33) as usize % 60);
+        let key_layout = Layout::from_size_align(klen, 16).unwrap();
+        let key = unsafe { driver.alloc(key_layout, hash) };
+        if !key.is_null() {
+            unsafe { key.write_volatile(i as u8) };
+        }
+        nodes.push(Node {
+            node: (node, node_layout),
+            key: (key, key_layout),
+            kids: core::ptr::null_mut(),
+            kids_layout: unit,
+            nkids: 0,
+            cap: 0,
+        });
+        if i > 0 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let parent = (state >> 1) as usize % i;
+            let pp = &mut nodes[parent];
+            if pp.nkids == pp.cap {
+                // First growth = alloc (C's realloc(NULL,…) == malloc, without
+                // std's null-ptr UB); later growths = real realloc.
+                if pp.cap == 0 {
+                    let l = Layout::from_size_align(4 * 8, 16).unwrap();
+                    pp.kids = unsafe { driver.alloc(l, hash) };
+                    pp.kids_layout = l;
+                    pp.cap = 4;
+                } else {
+                    let ncap = pp.cap * 2;
+                    let l = Layout::from_size_align(ncap * 8, 16).unwrap();
+                    pp.kids = unsafe { driver.realloc(pp.kids, pp.kids_layout, ncap * 8, hash) };
+                    pp.kids_layout = l;
+                    pp.cap = ncap;
+                }
+            }
+            pp.nkids += 1;
+        }
+    }
+    let mut sink: u8 = 0;
+    for node in &nodes {
+        if !node.key.0.is_null() {
+            sink = sink.wrapping_add(unsafe { node.key.0.read_volatile() });
+        }
+    }
+    core::hint::black_box(sink);
+    for node in nodes {
+        unsafe {
+            driver.dealloc(node.key.0, node.key.1, hash);
+            if !node.kids.is_null() {
+                driver.dealloc(node.kids, node.kids_layout, hash);
+            }
+            driver.dealloc(node.node.0, node.node.1, hash);
+        }
+    }
+}
+
+/// W-KV-STORE: open-addressing hash table (linear probe, fixed cap) with
+/// variable-size values (8-512 B). `ops` random insert/overwrite/delete/lookup
+/// operations — long-lived allocations + steady-state churn. Evict-on-collision
+/// keeps it leak-free so RSS is a fair fragmentation signal.
+#[inline(never)]
+pub fn workload_kv_store<D: AllocDriver>(driver: &D, hash: u64, ops: usize) {
+    const CAP: usize = 1 << 14;
+    let mut tab: Vec<Option<(u64, *mut u8, Layout)>> = vec![None; CAP];
+    let mut state: u64 = 0x9E6C_63D0_676A_9A99;
+    for i in 0..ops {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        let key = state >> 12;
+        let mut slot = ((key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 50) as usize) & (CAP - 1);
+        let mut probes = 0;
+        while probes < 32 {
+            match tab[slot] {
+                Some((k, _, _)) if k != key => {
+                    slot = (slot + 1) & (CAP - 1);
+                    probes += 1;
+                }
+                _ => break,
+            }
+        }
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        let op = (state >> 40) % 3;
+        if op == 0 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let vlen = 8 + ((state >> 33) as usize % (512 - 8));
+            if let Some((_, vp, vl)) = tab[slot].take() {
+                unsafe { driver.dealloc(vp, vl, hash) };
+            }
+            let layout = Layout::from_size_align(vlen, 16).unwrap();
+            let v = unsafe { driver.alloc(layout, hash) };
+            if !v.is_null() {
+                unsafe { v.write_volatile(i as u8) };
+            }
+            tab[slot] = Some((key, v, layout));
+        } else if op == 1 {
+            if let Some((k, vp, vl)) = tab[slot] {
+                if k == key {
+                    unsafe { driver.dealloc(vp, vl, hash) };
+                    tab[slot] = None;
+                }
+            }
+        } else if let Some((k, vp, _)) = tab[slot] {
+            if k == key && !vp.is_null() {
+                core::hint::black_box(unsafe { vp.read_volatile() });
+            }
+        }
+    }
+    for (_, vp, vl) in tab.into_iter().flatten() {
+        unsafe { driver.dealloc(vp, vl, hash) };
     }
 }
 
@@ -745,6 +978,67 @@ mod tests {
         }
         // And the full oracle workload completes on that model.
         workload_phase_lifetime(&h, hashes::W_PHASE_A, hashes::W_PHASE_B, 2000);
+    }
+
+    /// Counts alloc/dealloc and folds the requested-size sequence into a
+    /// fingerprint, over the real system allocator. Uses the trait's default
+    /// `realloc` (alloc+copy+dealloc) so a realloc is one counted alloc + one
+    /// counted dealloc.
+    #[derive(Default)]
+    struct CountingDriver {
+        allocs: Cell<usize>,
+        deallocs: Cell<usize>,
+        fp: Cell<u64>,
+    }
+    impl AllocDriver for CountingDriver {
+        unsafe fn alloc(&self, layout: Layout, _hash: u64) -> *mut u8 {
+            self.allocs.set(self.allocs.get() + 1);
+            self.fp.set(
+                self.fp
+                    .get()
+                    .wrapping_mul(1_099_511_628_211)
+                    .wrapping_add(layout.size() as u64),
+            );
+            unsafe { std::alloc::alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout, _hash: u64) {
+            self.deallocs.set(self.deallocs.get() + 1);
+            unsafe { std::alloc::dealloc(ptr, layout) }
+        }
+    }
+
+    fn run_counted(wl: &str) -> (usize, usize, u64) {
+        let d = CountingDriver::default();
+        match wl {
+            "request-loop" => workload_request_loop(&d, 0, 50_000),
+            "json-tree" => workload_json_tree(&d, 0, 20_000),
+            "kv-store" => workload_kv_store(&d, 0, 50_000),
+            _ => unreachable!(),
+        }
+        (d.allocs.get(), d.deallocs.get(), d.fp.get())
+    }
+
+    /// The realistic workloads must be (a) DETERMINISTIC — same seed → same
+    /// alloc count + same size-sequence fingerprint, the foundation of the
+    /// C/Rust cross-language identity invariant — and (b) LEAK-FREE — every
+    /// allocation is freed, so peak RSS is a fair fragmentation signal and not
+    /// polluted by a leak. A drift in either is a real bug (a changed sequence
+    /// invalidates cross-language comparison; a leak invalidates RSS).
+    #[test]
+    fn real_workloads_deterministic_and_leak_free() {
+        for wl in ["request-loop", "json-tree", "kv-store"] {
+            let a = run_counted(wl);
+            let b = run_counted(wl);
+            assert_eq!(
+                a, b,
+                "{wl}: must be deterministic (allocs/deallocs/fingerprint)"
+            );
+            assert_eq!(
+                a.0, a.1,
+                "{wl}: every allocation must be freed (allocs == deallocs)"
+            );
+            assert!(a.0 > 100, "{wl}: should do real allocation work");
+        }
     }
 }
 

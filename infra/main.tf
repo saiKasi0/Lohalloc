@@ -33,10 +33,22 @@ provider "aws" {
 # most_recent to avoid an ambiguous/untrusted AMI match.
 locals {
   ubuntu_owner = "099720109477"
-  cloud_init   = <<-EOT
+  # Self-terminate safety net: schedule a poweroff at boot (paired with
+  # `instance_initiated_shutdown_behavior = "terminate"` below, an OS poweroff
+  # TERMINATES the instance). This bounds any leak — a killed local poller or a
+  # dropped session can never leave a billable box running past
+  # `self_terminate_minutes`. A normal run's `terraform destroy` kills the box
+  # long before this fires; this only catches abandonment. `|| true` so a
+  # zero/disabled value never breaks cloud-init. We also disable the apt auto
+  # timers here (cloud_bench.sh did this over SSH; doing it at boot too closes
+  # the race where an unattended-upgrade reboots the box before SSH lands).
+  cloud_init = <<-EOT
     #cloud-config
     ssh_authorized_keys:
       - ${var.ssh_public_key}
+    runcmd:
+      - systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+      - test ${var.self_terminate_minutes} -gt 0 && shutdown -h +${var.self_terminate_minutes} "lohalloc-bench self-terminate net" || true
   EOT
 }
 
@@ -110,6 +122,9 @@ resource "aws_instance" "bench_x86" {
   instance_type          = var.x86_instance_type
   vpc_security_group_ids = [aws_security_group.bench.id]
   user_data              = local.cloud_init
+  # The self-terminate net's `shutdown -h` must TERMINATE (not just stop) the
+  # instance, so it fully deprovisions and stops billing.
+  instance_initiated_shutdown_behavior = "terminate"
 
   root_block_device {
     volume_size = 40
@@ -129,6 +144,8 @@ resource "aws_instance" "bench_arm64" {
   instance_type          = var.arm_instance_type
   vpc_security_group_ids = [aws_security_group.bench.id]
   user_data              = local.cloud_init
+  # See bench_x86: OS poweroff terminates rather than stops.
+  instance_initiated_shutdown_behavior = "terminate"
 
   root_block_device {
     volume_size = 40

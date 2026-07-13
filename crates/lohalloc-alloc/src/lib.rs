@@ -41,6 +41,7 @@ pub mod bandit;
 pub mod buddy;
 mod buddy_mag;
 mod clock;
+pub mod hot;
 mod magazine;
 #[cfg(feature = "telemetry-observer")]
 pub mod observer;
@@ -310,6 +311,15 @@ pub struct Lohalloc {
     /// TLS traffic. Read-hot, written once per mode transition — padded
     /// like the other read gates (J5-B1).
     ahr_on: CachePadded<AtomicBool>,
+    /// Item-A unanimous-size-class shortcut enable (Phase-1 slab diet).
+    /// Decided once at `publish_frozen_table` from the
+    /// `LOHALLOC_SC_SHORTCUT` env latch (**default off** — inert on the
+    /// benchmark suite, see [`sc_shortcut_enabled`]), then read on the hot
+    /// path — a per-instance flag rather than a global read, so tests set it
+    /// per instance without racing and inference pays one relaxed load. Only
+    /// meaningful once a frozen table is published (the null-table check
+    /// gates it either way).
+    sc_shortcut_on: CachePadded<AtomicBool>,
     /// Retention cache for large System-backend mappings (see
     /// `system::SystemCache`): freed 1 MiB+ mappings are kept populated and
     /// reused instead of munmap'd, matching (and beating) glibc's
@@ -506,6 +516,21 @@ fn record_fallthrough() {
     FALLTHROUGH_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Item-A unanimous-size-class shortcut hit count. Gated like the pin-hit
+/// counter (a hot-path RMW would false-share on ~100% of shortcut allocs) —
+/// it exists only to verify the shortcut actually fires in tests / under
+/// `route-metrics`.
+#[cfg(any(feature = "route-metrics", test))]
+static SC_SHORTCUT_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Record an Item-A shortcut hit (class served without a stack walk). No-op
+/// unless `route-metrics`/`test`.
+#[inline(always)]
+fn record_sc_shortcut() {
+    #[cfg(any(feature = "route-metrics", test))]
+    SC_SHORTCUT_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Ladder 6 pin-cache observability. `PIN_MISSES` is ungated like
 /// `PHT_MISSES` (a true miss happens roughly once per (site, size_class)
 /// per cache residency — cold by construction, and it's the counter that
@@ -694,10 +719,8 @@ fn ahr_alloc_code(size_class: u8) -> u64 {
     }
 }
 
-thread_local! {
-    /// The allocation-history register: 2-bit event codes, LSB = most recent.
-    static AHR: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
-}
+// The allocation-history register (2-bit event codes, LSB = most recent)
+// lives in the merged hot TLS block — `hot::HotTls::ahr` (J6 Phase A).
 
 /// Read this thread's raw history (low 16 bits = 8 events), then push the
 /// current alloc's 2-bit size-aware event code. Read-before-push is
@@ -707,9 +730,10 @@ thread_local! {
 /// context depths (Roadmap-D).
 #[inline(always)]
 fn ahr_ctx_and_push_alloc(size_class: u8) -> u16 {
-    AHR.with(|a| {
-        let v = a.get();
-        a.set((v << CTX_EVENT_BITS) | ahr_alloc_code(size_class));
+    hot::with(|h| {
+        let v = h.ahr.get();
+        h.ahr
+            .set((v << CTX_EVENT_BITS) | ahr_alloc_code(size_class));
         (v & 0xFFFF) as u16
     })
 }
@@ -743,13 +767,16 @@ fn ahr_deep(raw: u16) -> u8 {
 /// still part of every other site's history).
 #[inline(always)]
 fn ahr_push_alloc(size_class: u8) {
-    AHR.with(|a| a.set((a.get() << CTX_EVENT_BITS) | ahr_alloc_code(size_class)));
+    hot::with(|h| {
+        h.ahr
+            .set((h.ahr.get() << CTX_EVENT_BITS) | ahr_alloc_code(size_class))
+    });
 }
 
 /// Push a dealloc event (code `0`).
 #[inline(always)]
 fn ahr_push_dealloc() {
-    AHR.with(|a| a.set(a.get() << CTX_EVENT_BITS));
+    hot::with(|h| h.ahr.set(h.ahr.get() << CTX_EVENT_BITS));
 }
 
 // ---------------------------------------------------------------------------
@@ -939,6 +966,70 @@ fn servable_training_force(enabled: bool) {
     SERVABLE_TRAINING_STATE.store(if enabled { 1 } else { 2 }, Ordering::Relaxed);
 }
 
+/// Unanimous-size-class shortcut enable latch (Phase-1 slab diet, item A):
+/// `0` = uninit, `1` = on, `2` = off. **Default OFF** — `LOHALLOC_SC_SHORTCUT=1`
+/// opts in. The shortcut serves a size class whose model routing is unanimous
+/// (see [`perfect_hash::FrozenRouting::sc_verdict`]) from one indexed load,
+/// skipping the stack walk + pin probe + PHT lookup, outcome-preserving by
+/// construction. It is default-off because the /investigate measurement
+/// (2026-07-12) found it **inert on the benchmark suite**: real workloads have
+/// incidental multi-site traffic at shared size classes (a VecDeque's backing
+/// buffer routing to Arena while the payload site routes to Slab, etc.), so
+/// whole-class unanimity almost never holds — the slab-row hot site takes the
+/// full walk regardless (it is unpinnable, `pin_negative`). The shortcut still
+/// helps a genuinely clean-unanimity workload (one backend per size class, no
+/// cross-site traffic), hence kept as an opt-in rather than removed. Default
+/// off means the hot path pays only one short-circuiting relaxed bool load.
+static SC_SHORTCUT_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// Whether the unanimous-size-class inference shortcut is active (default
+/// **off**; `LOHALLOC_SC_SHORTCUT=1` opts in). One relaxed load after the
+/// first call — same allocation-free getenv discipline as the latches above.
+#[inline]
+fn sc_shortcut_enabled() -> bool {
+    let s = SC_SHORTCUT_STATE.load(Ordering::Relaxed);
+    if s != 0 {
+        return s == 1;
+    }
+    // SAFETY: NUL-terminated literal; getenv returns NULL or a pointer into
+    // the C environment (no setenv on the allocator hot path). Only an exact
+    // "1" enables — every other value (unset included) keeps the default off.
+    let p = unsafe { libc::getenv(b"LOHALLOC_SC_SHORTCUT\0".as_ptr().cast()) };
+    let on = !p.is_null() && unsafe { *p == b'1' as libc::c_char && *p.offset(1) == 0 };
+    SC_SHORTCUT_STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+    on
+}
+
+/// Owning-stripe slab remote-free enable latch (mt-xfree fix): `0` = uninit,
+/// `1` = on, `2` = off. **Default ON.** When on, a cross-thread headerless
+/// slab free returns each flushed block to the stripe that carved its segment
+/// (recorded in `SegmentRegistry`) instead of the freeing thread's stripe —
+/// the port of buddy's already-shipped region→stripe return
+/// (`buddy_dealloc_via_magazine`). Without it, cross-thread slab frees migrate
+/// blocks across stripes and thrash the central lists (mt-xfree-t4 measured
+/// 15,291 central refills + 15,148 sibling steals vs 44/0 for same-thread
+/// free). `LOHALLOC_SLAB_OWNER_FREE=0` reverts to the freeing-thread-stripe
+/// flush for a clean paired A/B.
+static SLAB_OWNER_FREE_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// Whether cross-thread slab frees return to the owning stripe (default
+/// **on**; `LOHALLOC_SLAB_OWNER_FREE=0` disables). One relaxed load after the
+/// first call.
+#[inline]
+fn slab_owner_free_enabled() -> bool {
+    let s = SLAB_OWNER_FREE_STATE.load(Ordering::Relaxed);
+    if s != 0 {
+        return s == 1;
+    }
+    // SAFETY: NUL-terminated literal; getenv returns NULL or a pointer into
+    // the C environment (no setenv on the allocator hot path). Only an exact
+    // "0" disables; every other value (unset included) keeps the default on.
+    let p = unsafe { libc::getenv(b"LOHALLOC_SLAB_OWNER_FREE\0".as_ptr().cast()) };
+    let off = !p.is_null() && unsafe { *p == b'0' as libc::c_char && *p.offset(1) == 0 };
+    SLAB_OWNER_FREE_STATE.store(if off { 2 } else { 1 }, Ordering::Relaxed);
+    !off
+}
+
 impl Default for Lohalloc {
     fn default() -> Self {
         Self::new()
@@ -1086,6 +1177,8 @@ impl Lohalloc {
             frozen: CachePadded::new(AtomicBool::new(false)),
             // Training maintains the history register from the first alloc.
             ahr_on: CachePadded::new(AtomicBool::new(true)),
+            // Off until a frozen table is published (training never shortcuts).
+            sc_shortcut_on: CachePadded::new(AtomicBool::new(false)),
             system_cache: core::cell::UnsafeCell::new(system::SystemCache::new()),
             system_cache_lock: CachePadded::new(AtomicBool::new(false)),
             system_cache_hits: CachePadded::new(AtomicU64::new(0)),
@@ -1266,109 +1359,26 @@ unsafe impl Send for Lohalloc {}
 unsafe impl Sync for Lohalloc {}
 
 thread_local! {
-    /// Re-entrancy depth. >0 means we are already inside `alloc`/`dealloc` on
-    /// this thread — any further allocation must bypass to `mmap` directly.
-    static IN_ALLOC: Cell<usize> = const { Cell::new(0) };
     /// Capture the start time of the allocation for latency measurement.
     /// Set at entry to alloc(), read in emit_alloc() to compute elapsed time.
+    /// Deliberately NOT part of the merged `hot::HotTls` block: it is only
+    /// touched under the `telemetry-observer` feature with a sink installed.
     static ALLOC_START_NS: Cell<u64> = const { Cell::new(0) };
-    /// This thread's central-backend stripe (Ladder 4 C3/C4), assigned
-    /// round-robin on first use so concurrent threads spread evenly across
-    /// the active stripes (`stripe_mask() + 1`, CPU-scaled — J5-B2)
-    /// regardless of thread-id numbering.
-    /// `usize::MAX` = unassigned. Plain dtor-free `Cell`, same TLS
-    /// discipline as the magazines. Process-wide (not per-instance):
-    /// a stripe index is just a load-spreading hint on the alloc side —
-    /// frees always resolve ownership through the per-instance registry,
-    /// so instance mixing is harmless here.
-    static THREAD_STRIPE: Cell<usize> = const { Cell::new(usize::MAX) };
-    /// This thread's private arena bump window (Ladder 5 span carve — see
-    /// `Lohalloc::arena_alloc_fast`). All dtor-free `Cell`s, same TLS
-    /// discipline as the magazines; validity is (owner, epoch)-checked on
-    /// every use, so instance mixing and `reset_arena()` both simply
-    /// discard the span.
-    static ARENA_SPAN: ArenaSpan = const {
-        ArenaSpan {
-            owner: Cell::new(0),
-            epoch: Cell::new(0),
-            cursor: Cell::new(0),
-            end: Cell::new(0),
-        }
-    };
 }
 
-/// See `ARENA_SPAN`/`Lohalloc::arena_alloc_fast`.
-struct ArenaSpan {
-    owner: Cell<u64>,
-    epoch: Cell<u64>,
-    cursor: Cell<usize>,
-    end: Cell<usize>,
-}
+// The re-entrancy depth (`in_alloc`), thread stripe, arena span, magazine,
+// and pin cache all live in the single merged TLS block — `hot::HotTls`
+// (J6 Phase A). One TLS variable for the whole hot path instead of one per
+// concern; see `hot.rs`'s module doc for the measured motivation.
 
 // ---------------------------------------------------------------------------
 // Ladder 6: Inference pin cache — serve freeze-proven-unambiguous call sites
 // from the raw leaf return address alone (no frames-1-2 walk, no memo, no
-// normalize/mix, no main-table lookup). See `route_alloc`.
+// normalize/mix, no main-table lookup). See `route_alloc`. Storage +
+// constants live in `hot.rs`; the probe/store logic stays here.
 // ---------------------------------------------------------------------------
 
-/// Slots in the per-thread direct-mapped pin cache. Indexed by the raw leaf
-/// return address ALONE — one slot serves *every* size class of a site via
-/// the per-sc verdict array below. 64 × 32 B = 2 KiB.
-///
-/// The first cut keyed slots on `(ret0, size_class)`; a mixed workload
-/// spraying ~15 size classes from one site then held ~15 colliding keys
-/// that ping-pong-evicted each other, so *every* allocation took the miss
-/// path (one-frame derivation + cold distilled lookup + a shared-cacheline
-/// miss-counter bump) — measured +24-41% on the adv-mixed/mt-mixed rows.
-/// Per-site slots make a site's verdicts coreside: adv-mixed occupies 1-2
-/// slots total and the miss path is genuinely once per (site, sc).
-const PIN_ENTRIES: usize = 64;
-
-/// Per-slot verdict-array width. `state::size_class_for` yields 0..=14
-/// (12 Slab classes, 2 Buddy, 1 System), so 16 covers every class; an
-/// out-of-range sc (impossible today) bypasses the cache entirely.
-const PIN_SC_SLOTS: usize = 16;
-
-/// Verdict byte: this size class has not been probed against the distilled
-/// table yet.
-const PIN_UNKNOWN: u8 = 0xFE;
-
-/// Verdict byte: probed, and the (site, size_class) is NOT pinnable — the
-/// negative cache that keeps non-distilled sites from re-paying the
-/// one-frame derivation + distilled lookup on every allocation. Values 0–3
-/// are `Backend as u8`.
-const PIN_NOT_PINNED: u8 = 0xFF;
-
-/// One pin-cache slot: a call site (raw leaf return address) plus one
-/// verdict byte per size class. `ret0 == 0` marks an empty slot
-/// (`walk_leaf` rejects zero return addresses before the cache is ever
-/// probed). `table` tags the `FrozenRouting` snapshot the verdicts were
-/// derived from: a probe under a different published pointer is a miss,
-/// which makes `reset_to_training()` / re-`load()` invalidation and
-/// multi-instance isolation automatic — no flush protocol, entries from a
-/// stale table or another `Lohalloc` instance simply never match. (Pointer
-/// equality after a free-reuse of the same address is impossible here:
-/// frozen tables are deliberately leaked, never freed — see
-/// `frozen_table`'s doc.)
-struct PinEntry {
-    table: Cell<*const perfect_hash::FrozenRouting>,
-    ret0: Cell<usize>,
-    states: [Cell<u8>; PIN_SC_SLOTS],
-}
-
-thread_local! {
-    /// Direct-mapped, dtor-free (plain `Cell`s, per the crate's TLS
-    /// invariant), const-initialized so first touch never allocates.
-    static PIN_CACHE: [PinEntry; PIN_ENTRIES] = const {
-        [const {
-            PinEntry {
-                table: Cell::new(core::ptr::null()),
-                ret0: Cell::new(0),
-                states: [const { Cell::new(PIN_UNKNOWN) }; PIN_SC_SLOTS],
-            }
-        }; PIN_ENTRIES]
-    };
-}
+use hot::{PIN_ENTRIES, PIN_NOT_PINNED, PIN_SC_SLOTS, PIN_UNKNOWN};
 
 /// Slot index for a raw leaf return address — same multiply-fold pattern
 /// as `topology`'s memo index.
@@ -1391,8 +1401,8 @@ fn pin_probe(table: *const perfect_hash::FrozenRouting, ret0: usize, size_class:
     if size_class as usize >= PIN_SC_SLOTS {
         return PinProbe::NotPinned; // out-of-range sc: bypass, never store
     }
-    PIN_CACHE.with(|cache| {
-        let e = &cache[pin_index(ret0)];
+    hot::with(|h| {
+        let e = &h.pin[pin_index(ret0)];
         if e.ret0.get() != ret0 || e.table.get() != table {
             return PinProbe::Miss;
         }
@@ -1430,8 +1440,8 @@ fn pin_store(
     if size_class as usize >= PIN_SC_SLOTS {
         return;
     }
-    PIN_CACHE.with(|cache| {
-        let e = &cache[pin_index(ret0)];
+    hot::with(|h| {
+        let e = &h.pin[pin_index(ret0)];
         if e.ret0.get() != ret0 || e.table.get() != table {
             e.table.set(table);
             e.ret0.set(ret0);
@@ -1458,13 +1468,13 @@ static NEXT_STRIPE: AtomicU64 = AtomicU64::new(0);
 /// The calling thread's stripe index in `[0, stripe_mask()]`.
 #[inline]
 fn thread_stripe() -> usize {
-    THREAD_STRIPE.with(|c| {
-        let v = c.get();
+    hot::with(|h| {
+        let v = h.thread_stripe.get();
         if v != usize::MAX {
             return v;
         }
         let v = (NEXT_STRIPE.fetch_add(1, Ordering::Relaxed) as usize) & stripe_mask();
-        c.set(v);
+        h.thread_stripe.set(v);
         v
     })
 }
@@ -1497,10 +1507,10 @@ impl Lohalloc {
     /// is wasteful (a whole page per nested allocation) but these are rare,
     /// off-hot-path calls, so it's the right trade.
     fn with_realloc_guard<T>(f: impl FnOnce() -> T) -> T {
-        let depth = IN_ALLOC.get();
-        IN_ALLOC.set(depth + 1);
+        let depth = hot::in_alloc_get();
+        hot::in_alloc_set(depth + 1);
         let result = f();
-        IN_ALLOC.set(depth);
+        hot::in_alloc_set(depth);
         result
     }
 
@@ -1535,7 +1545,7 @@ impl Lohalloc {
     /// which re-locked the already-held `state` Mutex. One TLS read.
     #[inline]
     pub fn thread_inside_allocator() -> bool {
-        IN_ALLOC.get() > 0
+        hot::in_alloc_get() > 0
     }
 }
 
@@ -1566,7 +1576,7 @@ unsafe impl GlobalAlloc for Lohalloc {
 
         // Re-entrancy guard: if we're already inside the allocator on this
         // thread (e.g. a backend's `Vec` growing), serve directly from mmap.
-        let depth = IN_ALLOC.get();
+        let depth = hot::in_alloc_get();
         if depth > 0 {
             return self.system_alloc_with_header(
                 total,
@@ -1577,9 +1587,9 @@ unsafe impl GlobalAlloc for Lohalloc {
             );
         }
 
-        IN_ALLOC.set(depth + 1);
+        hot::in_alloc_set(depth + 1);
         let ptr = self.route_alloc(size, align, pad, total);
-        IN_ALLOC.set(depth);
+        hot::in_alloc_set(depth);
         ptr
     }
 
@@ -1881,6 +1891,55 @@ impl Lohalloc {
     /// elsewhere. Inference mode is a pure lookup with no reward
     /// bookkeeping, so it never pays the `now_ns()` cost.
     fn route_alloc(&self, size: usize, align: usize, pad: usize, total: usize) -> *mut u8 {
+        // Load the frozen pointer ONCE up front (Item A): the unanimous-size-
+        // class shortcut and the pin cache below both consume it, so training
+        // (null pointer) short-circuits before any env read or walk, and
+        // inference pays a single Acquire load for both fast paths.
+        let table = self.frozen_table.load(Ordering::Acquire);
+
+        // Item A — unanimous-size-class shortcut (Phase-1 slab diet). When
+        // every model entry at this size class agrees on one context-free
+        // backend equal to the size-default (see
+        // `FrozenRouting::sc_verdict`), serve it from that indexed load alone:
+        // no stack walk, no pin probe, no PHT lookup. The served backend is
+        // exactly what the full path would pick (the header-boundary edge
+        // self-corrects through the same fallthrough chain), so this is
+        // outcome-preserving by construction — verified by the paired
+        // `LOHALLOC_SC_SHORTCUT=0` A/B. The `!table.is_null()` guard makes
+        // training pay nothing (the env latch is never read there).
+        if !table.is_null() && self.sc_shortcut_on.load(Ordering::Relaxed) {
+            let size_class = state::size_class_for(size);
+            // SAFETY: `table` is non-null, immutable, and never freed while
+            // published (leaked on reset — see `frozen_table`'s doc).
+            if let Some(backend) = unsafe { (*table).sc_verdict(size_class) } {
+                // A shortcut site never READS history (no context flag by
+                // construction), but its alloc is still part of every
+                // context-using site's history — push when the model has any
+                // such site (`ahr_needed`), otherwise skip the TLS traffic
+                // entirely.
+                if unsafe { (*table).ahr_needed() } && self.ahr_on.load(Ordering::Relaxed) {
+                    ahr_push_alloc(size_class);
+                }
+                if let Some(ptr) =
+                    self.try_backend(backend, total, align, pad, 0, size_class, CTX_UNTRACKED)
+                {
+                    record_route(backend);
+                    record_sc_shortcut();
+                    return ptr;
+                }
+                record_fallthrough();
+                return self.route_by_size(
+                    total,
+                    align,
+                    pad,
+                    0,
+                    size_class,
+                    CTX_UNTRACKED,
+                    Some(backend),
+                );
+            }
+        }
+
         // Ladder 6 walk split: read the leaf frame once; the raw ret0 feeds
         // the Inference pin cache and the training-side 1-frame retention,
         // the continuation completes the classic 3-frame hash.
@@ -1899,7 +1958,6 @@ impl Lohalloc {
                 // header/registry regardless of which backend served the
                 // alloc. C6 discipline: this branch is entirely inside the
                 // allocator, after the cabi call site.
-                let table = self.frozen_table.load(Ordering::Acquire);
                 if !table.is_null() {
                     let size_class = state::size_class_for(size);
                     match pin_probe(table, ret0, size_class) {
@@ -2248,7 +2306,14 @@ impl Lohalloc {
             return 0;
         };
         if headerless {
-            let mut try_register = |base: usize| self.segment_registry.insert(base, class as u8);
+            // Record the OWNING stripe (`stripe`, the carving stripe in scope
+            // since line ~2330) alongside the class, so a cross-thread free
+            // can return the block here instead of the freeing thread's
+            // stripe (see `slab_dealloc_headerless`).
+            let mut try_register = |base: usize| {
+                self.segment_registry
+                    .insert(base, class as u8, stripe as u8)
+            };
             slab.alloc_batch_headerless(class, buf, &mut try_register)
         } else {
             slab.alloc_batch(class, buf)
@@ -2302,15 +2367,82 @@ impl Lohalloc {
         if magazine::push(owner, class, block) {
             return;
         }
-        let mut buf = [core::ptr::null_mut::<u8>(); 16];
-        let flush = magazine::refill_count(class).min(buf.len());
+        // Magazine full: flush half of it plus this block to the central Slab.
+        // Buf holds the taken blocks + the trigger block (refill_count maxes at
+        // 16, +1 = 17).
+        let mut buf = [core::ptr::null_mut::<u8>(); 17];
+        let flush = magazine::refill_count(class).min(buf.len() - 1);
         let n = magazine::take(owner, class, &mut buf[..flush]);
-        if let Ok(mut slab) = self.slab[thread_stripe()].lock() {
-            unsafe {
-                slab.dealloc_batch_headerless(class, &buf[..n]);
-                slab.dealloc_headerless(block, class);
+        buf[n] = block;
+        let total = n + 1;
+
+        // Owning-stripe return (mt-xfree fix): a thread's magazine mixes blocks
+        // carved by every stripe (a cross-thread free pushed foreign blocks
+        // here), so — exactly like buddy's `buddy_dealloc_via_magazine` —
+        // resolve each block's owning stripe and free per-stripe batches,
+        // locking one stripe at a time (no lock-order deadlock). Without this,
+        // cross-thread frees migrate blocks to the freeing thread's stripe,
+        // starving the producer's stripe into a central-lock + sibling-scan
+        // thrash. `unwrap_or(fallback)` and the disabled path both revert to
+        // the freeing thread's stripe — functionally correct, just migrating.
+        if !slab_owner_free_enabled() {
+            if let Ok(mut slab) = self.slab[thread_stripe()].lock() {
+                unsafe { slab.dealloc_batch_headerless(class, &buf[..total]) };
+            }
+            return;
+        }
+        let fallback = thread_stripe();
+        let first = self.slab_stripe_of(buf[0]).unwrap_or(fallback);
+        let mut stripes = [first; 17];
+        let mut all_same = true;
+        for i in 1..total {
+            let s = self.slab_stripe_of(buf[i]).unwrap_or(fallback);
+            stripes[i] = s;
+            all_same &= s == first;
+        }
+        // Same-stripe fast path (the same-thread common case, e.g. arena/
+        // mt-slab where a thread frees only blocks its own stripe carved):
+        // one lock + one batch, skipping the O(stripes × blocks) grouping
+        // loop below. Without this the grouping loop rescans every block for
+        // all 16 stripes on every flush — a measured ~15% regression on the
+        // slab-routed arena rows, which are single-threaded so `all_same`
+        // always holds. The per-stripe grouping is reserved for a genuine
+        // cross-thread flush (foreign blocks spanning stripes).
+        if all_same {
+            if let Ok(mut slab) = self.slab[first].lock() {
+                unsafe { slab.dealloc_batch_headerless(class, &buf[..total]) };
+            }
+            return;
+        }
+        let mut grouped = [core::ptr::null_mut::<u8>(); 17];
+        for stripe in 0..=stripe_mask() {
+            let mut g = 0;
+            for i in 0..total {
+                if stripes[i] == stripe {
+                    grouped[g] = buf[i];
+                    g += 1;
+                }
+            }
+            if g == 0 {
+                continue;
+            }
+            if let Ok(mut slab) = self.slab[stripe].lock() {
+                unsafe { slab.dealloc_batch_headerless(class, &grouped[..g]) };
             }
         }
+    }
+
+    /// The stripe that carved `ptr`'s segment (recorded in
+    /// `SegmentRegistry`), masked to the stripe array — mirrors
+    /// [`buddy_stripe_of`](Self::buddy_stripe_of). `None` for a pointer in no
+    /// registered headerless segment (the caller falls back to the freeing
+    /// thread's stripe).
+    #[inline]
+    fn slab_stripe_of(&self, ptr: *mut u8) -> Option<usize> {
+        let base = (ptr as usize) & !(slab::SEGMENT_SIZE - 1);
+        self.segment_registry
+            .lookup_full(base)
+            .map(|(_, s)| s as usize & (MAX_STRIPES - 1))
     }
 
     /// If `ptr` falls within a segment registered by the header-free Slab
@@ -2366,7 +2498,8 @@ impl Lohalloc {
         let align = align.max(MIN_ALIGN);
         let owner = self.magazine_owner();
         let epoch = self.arena_epoch.load(Ordering::Relaxed);
-        ARENA_SPAN.with(|span| {
+        hot::with(|h| {
+            let span = &h.span;
             if span.owner.get() == owner && span.epoch.get() == epoch {
                 let aligned = align_up(span.cursor.get(), align);
                 if let Some(new_cur) = aligned.checked_add(size) {
@@ -3206,9 +3339,24 @@ impl Lohalloc {
             // can observe a flagged table with the register disabled.
             self.ahr_on
                 .store(routing.has_context_entries(), Ordering::Relaxed);
+            // Item A: read the env latch ONCE here (not per alloc) and cache
+            // the shortcut enable per instance. Decided before publishing so
+            // no alloc can observe the table with a stale shortcut flag.
+            self.sc_shortcut_on
+                .store(sc_shortcut_enabled(), Ordering::Relaxed);
             let leaked: *mut perfect_hash::FrozenRouting = Box::leak(Box::new(routing.clone()));
             self.frozen_table.store(leaked, Ordering::Release);
         }
+    }
+
+    /// Test-only: override the Item-A shortcut enable on THIS instance (call
+    /// after `load()`/`freeze()` published the table). Per-instance, so it
+    /// never races the process-global env latch the way a forced global would
+    /// — the pin-cache tests use it to reach the pin path the shortcut
+    /// otherwise supersedes.
+    #[cfg(test)]
+    fn set_sc_shortcut(&self, on: bool) {
+        self.sc_shortcut_on.store(on, Ordering::Relaxed);
     }
 
     /// Diagnostic snapshot of the Phase-1 shadow fine map (see
@@ -3464,6 +3612,20 @@ impl Lohalloc {
         }
     }
 
+    /// Process-wide count of Item-A unanimous-size-class shortcut hits (class
+    /// served without a stack walk / pin probe / PHT lookup). Always `0`
+    /// unless built with `route-metrics` (or under test).
+    pub fn sc_shortcut_count() -> u64 {
+        #[cfg(any(feature = "route-metrics", test))]
+        {
+            SC_SHORTCUT_HITS.load(Ordering::Relaxed)
+        }
+        #[cfg(not(any(feature = "route-metrics", test)))]
+        {
+            0
+        }
+    }
+
     /// Process-wide `(central_refills, sibling_steps, sibling_hits)` for the
     /// slab magazine-miss path (see `SLAB_CENTRAL_REFILLS`'s doc — the
     /// J5-bisect sibling-scan instrumentation). All `0` unless built with
@@ -3579,7 +3741,7 @@ impl Lohalloc {
         let pad = header_pad(align);
         let total = size + pad;
 
-        let depth = IN_ALLOC.get();
+        let depth = hot::in_alloc_get();
         if depth > 0 {
             return self.system_alloc_with_header(
                 total,
@@ -3590,9 +3752,9 @@ impl Lohalloc {
             );
         }
 
-        IN_ALLOC.set(depth + 1);
+        hot::in_alloc_set(depth + 1);
         let ptr = self.route_alloc_with_hash(size, align, pad, total, hash);
-        IN_ALLOC.set(depth);
+        hot::in_alloc_set(depth);
         ptr
     }
 
@@ -3642,7 +3804,7 @@ impl Lohalloc {
         let pad = header_pad(align);
         let total = size + pad;
 
-        let depth = IN_ALLOC.get();
+        let depth = hot::in_alloc_get();
         if depth > 0 {
             return self.system_alloc_with_header(
                 total,
@@ -3658,7 +3820,7 @@ impl Lohalloc {
         // pull to attribute a Layer 2 reward to — tag `SIZE_CLASS_UNTRACKED`
         // so `dealloc` skips reward bookkeeping for this allocation.
         if let Some(preferred) = strategy.preferred_backend(size) {
-            IN_ALLOC.set(depth + 1);
+            hot::in_alloc_set(depth + 1);
             if let Some(ptr) = self.try_backend(
                 preferred,
                 total,
@@ -3668,16 +3830,16 @@ impl Lohalloc {
                 SIZE_CLASS_UNTRACKED,
                 CTX_UNTRACKED,
             ) {
-                IN_ALLOC.set(depth);
+                hot::in_alloc_set(depth);
                 return ptr;
             }
             // Preferred backend failed — fall through to MAB / size routing.
-            IN_ALLOC.set(depth);
+            hot::in_alloc_set(depth);
         }
 
-        IN_ALLOC.set(depth + 1);
+        hot::in_alloc_set(depth + 1);
         let ptr = self.route_alloc_with_hash(size, align, pad, total, hash);
-        IN_ALLOC.set(depth);
+        hot::in_alloc_set(depth);
         ptr
     }
 
@@ -4090,6 +4252,46 @@ mod integration_tests {
     }
 
     #[test]
+    fn slab_carve_records_owning_stripe_resolvable_by_slab_stripe_of() {
+        // mt-xfree fix: a headerless slab block must resolve to the stripe that
+        // carved its segment (so a cross-thread free can return it home). In a
+        // single-threaded test the carving stripe IS this thread's stripe, so
+        // slab_stripe_of(block) must equal thread_stripe(). A pre-fix build
+        // (stripe never recorded) would resolve to 0 regardless of the thread.
+        let layout = Layout::from_size_align(256, 16).unwrap();
+        let bytes = {
+            let trainer = Lohalloc::new();
+            train_and_export(&trainer, pin_site_a, layout, 512)
+        };
+        let a = Lohalloc::new();
+        assert!(a.load(&bytes));
+        assert!(
+            a.is_slab_headerless(),
+            "loaded instance serves slab headerless"
+        );
+        // Allocate several so at least one forces a fresh segment carve (which
+        // is what registers the owning stripe).
+        let mut ptrs = Vec::new();
+        for _ in 0..64 {
+            let p = unsafe { a.alloc(layout) };
+            assert!(!p.is_null());
+            ptrs.push(p);
+        }
+        let want = thread_stripe();
+        // Every headerless slab block resolves, and to THIS thread's stripe.
+        for &p in &ptrs {
+            assert_eq!(
+                a.slab_stripe_of(p),
+                Some(want),
+                "slab block must resolve to its carving (this thread's) stripe"
+            );
+        }
+        for p in ptrs {
+            unsafe { a.dealloc(p, layout) };
+        }
+    }
+
+    #[test]
     fn pin_cache_hit_serves_distilled_backend_without_walk() {
         let layout = Layout::from_size_align(256, 16).unwrap();
         let trainer = Lohalloc::new();
@@ -4107,6 +4309,10 @@ mod integration_tests {
 
         let loaded = Lohalloc::new();
         assert!(loaded.load(&bytes));
+        // Reach the pin path: the Item-A shortcut would otherwise serve this
+        // single-site (== unanimous class) model without ever probing the pin
+        // cache. Per-instance, so it doesn't race concurrent tests.
+        loaded.set_sc_shortcut(false);
 
         let hits_before = Lohalloc::pin_hit_count();
         let misses_before = Lohalloc::pin_miss_count();
@@ -4189,6 +4395,9 @@ mod integration_tests {
 
         let loaded = Lohalloc::new();
         assert!(loaded.load(&bytes));
+        // Reach the pin path (see the sibling pin test): the Item-A shortcut
+        // supersedes it for this unanimous single-site model.
+        loaded.set_sc_shortcut(false);
 
         // Populate the slot under the first published table.
         let m0 = Lohalloc::pin_miss_count();
@@ -4205,6 +4414,9 @@ mod integration_tests {
         // again) — no explicit flush anywhere.
         loaded.reset_to_training();
         assert!(loaded.load(&bytes), "reload after reset");
+        // The republish re-read the env latch → shortcut back on; disable
+        // again so the reload's pin-cache re-miss is what we measure.
+        loaded.set_sc_shortcut(false);
         let m1 = Lohalloc::pin_miss_count();
         let p3 = pin_site_c(&loaded, layout);
         assert!(
@@ -4220,6 +4432,73 @@ mod integration_tests {
         unsafe {
             loaded.dealloc(p3, layout);
             loaded.dealloc(p4, layout);
+        }
+    }
+
+    // Item-A shortcut inference leaf: a DIFFERENT call site than the trainer,
+    // to prove the shortcut is size-class-based (not site-based) — an unknown
+    // site at a unanimous class must still be served without a walk. Post-call
+    // assert defeats tail-call frame elision, same as the pin leaves.
+    #[inline(never)]
+    fn sc_leaf(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = unsafe { a.alloc(layout) };
+        assert!(!p.is_null(), "sc leaf alloc failed");
+        p
+    }
+
+    #[test]
+    fn sc_shortcut_serves_unanimous_class_without_walk_and_is_outcome_equivalent() {
+        let layout = Layout::from_size_align(256, 16).unwrap();
+        // Each `Lohalloc` embeds fixed-capacity registries and is large on the
+        // stack (see `registry.rs`'s stack-overflow note), so keep at most one
+        // live at a time by scoping each instance.
+        let bytes = {
+            let trainer = Lohalloc::new();
+            // Single slab site → class 5 is unanimously Slab (== its
+            // size-default), so the loaded model's sc_verdict(5) is Some(Slab).
+            train_and_export(&trainer, pin_site_a, layout, 512)
+        };
+
+        // Backend served with the shortcut OFF (full walk path). `sc_leaf` is
+        // a site the model never trained — the shortcut routes it by size
+        // class regardless, which is the property under test.
+        let backend_off = {
+            let off = Lohalloc::new();
+            assert!(off.load(&bytes));
+            off.set_sc_shortcut(false);
+            let p_off = sc_leaf(&off, layout);
+            let b = unsafe { off.backend_for_ptr(p_off) };
+            unsafe { off.dealloc(p_off, layout) };
+            b
+        };
+
+        // Backend served with the shortcut ON must equal it — and must fire.
+        let on = Lohalloc::new();
+        assert!(on.load(&bytes));
+        on.set_sc_shortcut(true);
+        let shortcuts_before = Lohalloc::sc_shortcut_count();
+        let mut ptrs = Vec::new();
+        for _ in 0..64 {
+            ptrs.push(sc_leaf(&on, layout));
+        }
+        // The shortcut must have fired for these allocations (lower bound —
+        // the counter is process-wide and other tests run concurrently).
+        assert!(
+            Lohalloc::sc_shortcut_count() >= shortcuts_before + 64,
+            "unanimous class must be served via the size-class shortcut"
+        );
+        let backend_on = unsafe { on.backend_for_ptr(*ptrs.last().unwrap()) };
+        assert_eq!(
+            backend_on, backend_off,
+            "shortcut must serve the same backend the full walk path does"
+        );
+        assert_eq!(
+            backend_on,
+            Some(lohalloc_core::Backend::Slab),
+            "class 5 is unanimously Slab"
+        );
+        for p in ptrs {
+            unsafe { on.dealloc(p, layout) };
         }
     }
 

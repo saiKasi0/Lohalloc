@@ -21,3 +21,5 @@ crash.log
 # tracked template (negated so it stays in the repo).
 .env
 !.env.example
+# Transient state for the decoupled cloud_provision/cloud_collect flow
+.cloud_run.env

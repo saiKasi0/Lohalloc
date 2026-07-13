@@ -59,24 +59,7 @@ struct LatencyReport {
     quantized: bool,
 }
 
-/// Peak RSS in bytes, cross-platform (`ru_maxrss` is KiB on Linux, bytes
-/// on macOS). 0 if the syscall fails — the report stays usable.
-fn peak_rss_bytes() -> u64 {
-    // SAFETY: getrusage writes into the zeroed struct we hand it; no
-    // pointers retained.
-    unsafe {
-        let mut ru: libc::rusage = std::mem::zeroed();
-        if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0 {
-            return 0;
-        }
-        let raw = ru.ru_maxrss.max(0) as u64;
-        if cfg!(target_os = "macos") {
-            raw
-        } else {
-            raw * 1024
-        }
-    }
-}
+use lohalloc_bench::peak_rss_bytes;
 
 struct Args {
     workload: String,

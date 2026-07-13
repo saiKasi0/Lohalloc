@@ -12,9 +12,11 @@ set -euo pipefail
 
 CACHEGRIND=0
 PERFMODE=0
+RSSMODE=0
 case "${1:-}" in
     --cachegrind) CACHEGRIND=1; shift ;;
     --perf)       PERFMODE=1; shift ;;
+    --rss)        RSSMODE=1; shift ;;
 esac
 
 if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
@@ -142,8 +144,8 @@ if [ "$PERFMODE" = 1 ] && [ -z "${WORKLOADS:-}" ]; then
     WORKLOADS="${MT_WORKLOADS[*]}"
 fi
 
-C_WORKLOADS=(slab arena buddy system adv-mixed "${MT_WORKLOADS[@]}")
-CPP_WORKLOADS=(slab arena buddy system adv-mixed cpp-vector cpp-string "${MT_WORKLOADS[@]}")
+C_WORKLOADS=(slab arena buddy system adv-mixed request-loop json-tree kv-store "${MT_WORKLOADS[@]}")
+CPP_WORKLOADS=(slab arena buddy system adv-mixed cpp-vector cpp-string request-loop json-tree kv-store "${MT_WORKLOADS[@]}")
 
 # ---- Targeted-subset overrides (diagnosis / sweep drivers) -------------------
 # WORKLOADS="buddy adv-mixed"   replaces every language's workload list
@@ -246,6 +248,23 @@ run_timing() {
         ${prepare_args[@]+"${prepare_args[@]}"} \
         --export-json "$out" \
         "env $extra_env $PRELOAD_VAR=$preload ${pin}$binary $workload $OPS" >/dev/null
+    # ops=1 timing-calibration companion (the same `-cal` pattern the
+    # cachegrind/perf passes have used since Step 7.5, now for wall time):
+    # measures each mode's FIXED process cost — exec + dynamic linking +
+    # model load/PHT build + eager pool mmaps — so the aggregator can
+    # publish a startup-immune per-op wall view (`mean_ns_net`). Short rows
+    # (W-SYSTEM runs ops/20 iterations in a ~1 ms process) are otherwise
+    # dominated by this fixed cost. Fewer warmups than the main pass: the
+    # ops=1 process never triggers the buddy-pattern VM warm-up described
+    # above. TIMING_CAL=0 skips it.
+    if [ "${TIMING_CAL:-1}" = 1 ]; then
+        hyperfine \
+            --warmup 3 \
+            --min-runs 10 \
+            ${prepare_args[@]+"${prepare_args[@]}"} \
+            --export-json "${out%.json}-cal.json" \
+            "env $extra_env $PRELOAD_VAR=$preload ${pin}$binary $workload 1" >/dev/null
+    fi
 }
 
 # Runs `binary` under `valgrind --tool=cachegrind`, parses its stderr
@@ -342,7 +361,13 @@ perf_pass() {
     # prints "<not supported>"/"<not counted>" in the value field, normalized
     # to 0 below. The event set is the arch-portable generic-name set that
     # bench/probe_perf.sh validates.
-    local events="cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses"
+    # page-faults (software event, always countable) prices the kernel-side
+    # touch cost cachegrind's user-space sim cannot see — the arena-row
+    # signature is near-parity drefs with a large wall gap, and this counter
+    # attributes that gap to fresh-page faults. instructions/cycles give the
+    # retired-work view where the PMU exposes them (Nitro virtualized
+    # instances often don't; they normalize to 0 exactly like LLC).
+    local events="cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses,page-faults,instructions,cycles"
     local raw
     raw="$(env $extra_env "$PRELOAD_VAR"="$preload" ${pin}perf stat -x, -e "$events" \
         -- "$binary" "$workload" "$ops" 2>&1 >/dev/null || true)"
@@ -360,12 +385,16 @@ perf_pass() {
     }
 
     local cache_references cache_misses l1d_loads l1d_load_misses llc_loads llc_load_misses
+    local page_faults instructions cycles
     cache_references="$(pev cache-references)"
     cache_misses="$(pev cache-misses)"
     l1d_loads="$(pev L1-dcache-loads)"
     l1d_load_misses="$(pev L1-dcache-load-misses)"
     llc_loads="$(pev LLC-loads)"
     llc_load_misses="$(pev LLC-load-misses)"
+    page_faults="$(pev page-faults)"
+    instructions="$(pev instructions)"
+    cycles="$(pev cycles)"
 
     local calibration=false
     [ -n "$suffix" ] && calibration=true
@@ -383,7 +412,39 @@ perf_pass() {
   "l1d_load_misses": $l1d_load_misses,
   "llc_loads": $llc_loads,
   "llc_load_misses": $llc_load_misses,
+  "page_faults": $page_faults,
+  "instructions": $instructions,
+  "cycles": $cycles,
   "source": "pmu"
+}
+EOF
+}
+
+# Peak-RSS pass: run the binary ONCE with LOHALLOC_BENCH_RSS=1 (the binary
+# prints `RSS_KIB <n>` to stderr at exit, from getrusage) and record it — the
+# memory-footprint axis of the real-workload benchmarks. Not a timing pass, so
+# a single run is enough (peak RSS is deterministic-ish; the workloads are
+# leak-free by construction, so it's a clean fragmentation signal). Same
+# command-string env discipline as the timing/perf passes.
+run_rss() {
+    local lang="$1" binary="$2" workload="$3" allocator="$4" preload="$5" mode="$6" extra_env="$7"
+    local out="$RAW_DIR/rss-${lang}-${allocator}-${workload}-${mode}.json"
+    echo "==> [rss] $lang/$allocator/$workload ($mode)"
+    local pin
+    pin="$(taskset_prefix_for "$workload")"
+    local rss
+    rss="$(env $extra_env LOHALLOC_BENCH_RSS=1 "$PRELOAD_VAR"="$preload" \
+        ${pin}"$binary" "$workload" "$OPS" 2>&1 >/dev/null |
+        awk '/^RSS_KIB/{print $2; exit}')"
+    case "$rss" in '' | *[!0-9]*) rss=0 ;; esac
+    cat >"$out" <<EOF
+{
+  "lang": "$lang",
+  "allocator": "$allocator",
+  "workload": "$workload",
+  "mode": "$mode",
+  "rss_kib": $rss,
+  "source": "rss"
 }
 EOF
 }
@@ -393,6 +454,8 @@ run_one() {
         run_cachegrind "$@"
     elif [ "$PERFMODE" = 1 ]; then
         run_perf "$@"
+    elif [ "$RSSMODE" = 1 ]; then
+        run_rss "$@"
     else
         run_timing "$@"
     fi
@@ -473,6 +536,19 @@ run_lohalloc_triple() {
     # train/export legs. Unset = default OFF (certified 231127: masking costs
     # the suite more than the free-rider trap does).
     [ -n "${LOHALLOC_SERVABLE_TRAINING:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_SERVABLE_TRAINING=$LOHALLOC_SERVABLE_TRAINING"
+    # Phase-1 slab-diet item A off-switch (LOHALLOC_SC_SHORTCUT=0): the
+    # unanimous-size-class inference shortcut, read ONCE at model-publish time
+    # (inference leg only — training has a null frozen table, so the gate never
+    # fires there and forwarding it to the train legs is a self-documenting
+    # no-op). Outcome-preserving, so this A/B measures pure per-op speed. Unset
+    # = default ON.
+    [ -n "${LOHALLOC_SC_SHORTCUT:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_SC_SHORTCUT=$LOHALLOC_SC_SHORTCUT"
+    # mt-xfree fix off-switch (LOHALLOC_SLAB_OWNER_FREE=0): return cross-thread
+    # slab frees to the owning stripe (default on) vs the freeing thread's stripe
+    # (=0). A runtime free-path behavior read on both training and inference (it
+    # bites whenever a headerless-slab magazine flush spans stripes), so forward
+    # it to every leg. Unset = default ON.
+    [ -n "${LOHALLOC_SLAB_OWNER_FREE:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_SLAB_OWNER_FREE=$LOHALLOC_SLAB_OWNER_FREE"
     run_one "$lang" "$binary" "$workload" "lohalloc" "$preload" "training" "$tune_env"
     local model="$MODEL_DIR/model-${lang}-${workload}.lohalloc"
     echo "==> [train+export] $lang/$workload -> $model (train ops=$TRAIN_OPS)"
@@ -504,7 +580,7 @@ done
 # ---- Rust: allocator chosen at build time, no preload -----------------------
 # One binary per allocator (native_workload_<alloc>), so these rows run
 # meaningfully on macOS too — nothing here depends on LD_PRELOAD.
-RUST_WORKLOADS=(slab arena buddy system adv-mixed "${MT_WORKLOADS[@]}")
+RUST_WORKLOADS=(slab arena buddy system adv-mixed request-loop json-tree kv-store "${MT_WORKLOADS[@]}")
 if [ -n "${WORKLOADS:-}" ]; then
     read -r -a RUST_WORKLOADS <<<"$WORKLOADS"
 fi

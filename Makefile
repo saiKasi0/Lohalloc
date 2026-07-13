@@ -36,7 +36,7 @@ endif
 .PHONY: help all shim example-sink demo-sink binaries \
         server server-debug gui dev test e2e lint fmt clean \
         bench-all bench-all-host bench-mac bench-image bench-latency bench bench-tune bench-tune-native graphs \
-        bench-native bench-cache bench-native-host bench-cache-host bench-perf bench-rust-bins bench-report
+        bench-native bench-cache bench-native-host bench-cache-host bench-perf bench-rss bench-rss-host bench-rust-bins bench-report
 
 help:
 	@echo "Lohalloc — available targets:"
@@ -163,6 +163,7 @@ bench-all-host:
 	@mkdir -p $(RUN_DIR)/raw
 	@$(MAKE) --no-print-directory bench-latency RUN_DIR=$(RUN_DIR)
 	@$(MAKE) --no-print-directory bench-native-host RUN_DIR=$(RUN_DIR)
+	@$(MAKE) --no-print-directory bench-rss-host RUN_DIR=$(RUN_DIR)
 	@$(MAKE) --no-print-directory bench-cache-host RUN_DIR=$(RUN_DIR)
 	@$(MAKE) --no-print-directory bench-report RUN_DIR=$(RUN_DIR)
 	@echo "==> Done. Report + graphs in $(RUN_DIR)"
@@ -305,6 +306,23 @@ bench-cache-host: bench-rust-bins
 	make -C bench/native
 	@mkdir -p $(RUN_DIR)/raw
 	RAW_DIR="$(CURDIR)/$(RUN_DIR)/raw" bash bench/run_native.sh --cachegrind
+
+# Peak-RSS pass (memory-footprint axis of the real-workload benchmarks) — one
+# untimed getrusage-capturing run per (lang, allocator, workload, mode). Works
+# on any host (getrusage is portable); the Docker variant runs it in the Linux
+# image alongside the interposed C/C++ rows.
+bench-rss: bench-image
+	@mkdir -p $(RUN_DIR)/raw
+	docker run --rm -e RAW_DIR=/lohalloc/$(RUN_DIR)/raw \
+		-v "$(CURDIR)/$(RESULTS_DIR):/lohalloc/$(RESULTS_DIR)" \
+		--entrypoint bash lohalloc-bench bench/run_native.sh --rss
+	@echo "Raw in $(RUN_DIR)/raw — build the report with: make bench-report RUN_DIR=$(RUN_DIR)"
+
+bench-rss-host: bench-rust-bins
+	cargo build -p lohalloc-cabi --release
+	make -C bench/native
+	@mkdir -p $(RUN_DIR)/raw
+	RAW_DIR="$(CURDIR)/$(RUN_DIR)/raw" bash bench/run_native.sh --rss
 
 # Real-PMU MT diagnostics (perf) for the MT rows only — the only view that
 # sees cross-core coherence / false sharing (cachegrind is a single-thread

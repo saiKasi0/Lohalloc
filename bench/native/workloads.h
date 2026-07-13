@@ -72,6 +72,22 @@ void workload_mt_xfree(size_t ops, int threads);
 // other's.
 void workload_mt_interfere(size_t ops, int threads);
 
+// ---- Realistic application patterns (the paper-vs-product benchmarks) ----
+
+// W-REQUEST-LOOP: N "requests", each a burst of small structs (16-256 B) + a
+// couple medium response buffers (4-64 KiB), touched then freed all at once
+// at request end. The per-request-arena pattern. `ops` = total small allocs.
+void workload_request_loop(size_t ops);
+
+// W-JSON-TREE: build a nested document tree of `ops` nodes (struct + variable
+// string key + realloc-grown child array), walk it, free the whole tree.
+// Mixed small+variable sizes + realloc growth + whole-tree burst free.
+void workload_json_tree(size_t ops);
+
+// W-KV-STORE: open-addressing hash table with variable-size values (8-512 B);
+// `ops` random insert/overwrite/delete/lookup ops. Long-lived + churn.
+void workload_kv_store(size_t ops);
+
 // Dispatches any workload name this file knows about, including the
 // "mt-<kind>-t<N>" multithreaded names (kind is "slab", "mixed", "xfree",
 // or "interfere"; N is the thread count) -- shared by the C and C++ drivers

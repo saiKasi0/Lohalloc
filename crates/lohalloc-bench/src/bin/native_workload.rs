@@ -66,6 +66,9 @@ fn run<D: AllocDriver + Sync>(driver: &D, workload: &str, ops: usize) -> bool {
         "buddy" => workloads::workload_buddy_interleaved(driver, 0, ops),
         "system" => workloads::workload_system_large(driver, 0, (ops / 20).max(1)),
         "adv-mixed" => workloads::workload_adversarial_mixed(driver, 0, ops),
+        "request-loop" => workloads::workload_request_loop(driver, 0, ops),
+        "json-tree" => workloads::workload_json_tree(driver, 0, ops),
+        "kv-store" => workloads::workload_kv_store(driver, 0, ops),
         _ => return false,
     }
     true
@@ -290,6 +293,13 @@ fn main() -> ExitCode {
     let ok = run_lohalloc(workload, ops);
     #[cfg(not(feature = "alloc-lohalloc"))]
     let ok = run(&GlobalDriver, workload, ops);
+
+    // RSS pass: print peak RSS (high-water) as one `RSS_KIB <n>` line for EVERY
+    // allocator build (matching bench_main.c), so the --rss pass captures each
+    // one. Off the timing path (the env is only set by run_native.sh --rss).
+    if ok && std::env::var("LOHALLOC_BENCH_RSS").is_ok() {
+        eprintln!("RSS_KIB {}", lohalloc_bench::peak_rss_bytes() / 1024);
+    }
 
     if ok {
         ExitCode::SUCCESS

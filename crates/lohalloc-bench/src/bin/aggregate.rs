@@ -81,6 +81,21 @@ struct Row {
     /// which is fine for cross-allocator comparison: every allocator runs
     /// the identical binary at the identical op count.
     throughput_mops: Option<f64>,
+    /// Mean wall of the ops=1 timing-calibration companion, nanoseconds
+    /// (native-timing only; requires a `native-…-cal.json` from
+    /// `run_native.sh`'s TIMING_CAL pass). This is the mode's FIXED process
+    /// cost: exec + linking + model load + eager pool mmaps.
+    startup_ns: Option<f64>,
+    /// `mean_ns` with the mode's fixed startup subtracted (clamped at 0) —
+    /// the startup-immune wall view. Informational: the regression gate
+    /// keeps judging the raw `mean_ns` (its historical meaning).
+    mean_ns_net: Option<f64>,
+    /// Page faults per workload op, startup-subtracted (perf only; the
+    /// kernel-side touch cost neither cachegrind nor drefs can see).
+    page_faults_per_op_net: Option<f64>,
+    /// Retired instructions per workload op, startup-subtracted (perf
+    /// only; 0/absent where the virtualized PMU hides the counter).
+    instructions_per_op_net: Option<f64>,
     /// D1 (L1 data cache) miss rate, 0.0-1.0 (cachegrind only).
     d1_miss_rate: Option<f64>,
     /// Last-level cache miss rate, 0.0-1.0 (cachegrind only).
@@ -118,6 +133,10 @@ struct Row {
     /// tick floor — those values are quantization buckets, not latencies,
     /// and are annotated (`*`) rather than compared in the report.
     quantized: Option<bool>,
+    /// Peak RSS in KiB (rss pass only — from `run_native.sh --rss`, the
+    /// process high-water resident set). The memory-footprint axis of the
+    /// real-workload benchmarks; `None` for every other source.
+    rss_kib: Option<u64>,
 }
 
 /// A `Row` with every metric `None` — each loader branch fills in only its
@@ -138,6 +157,10 @@ fn empty_row(
         mean_ns: None,
         stddev_ns: None,
         throughput_mops: None,
+        startup_ns: None,
+        mean_ns_net: None,
+        page_faults_per_op_net: None,
+        instructions_per_op_net: None,
         d1_miss_rate: None,
         ll_miss_rate: None,
         d1_misses_per_op: None,
@@ -151,6 +174,7 @@ fn empty_row(
         rust_throughput_mops: None,
         clock_tick_ns: None,
         quantized: None,
+        rss_kib: None,
     }
 }
 
@@ -232,6 +256,24 @@ struct PerfResult {
     l1d_load_misses: u64,
     llc_loads: u64,
     llc_load_misses: u64,
+    /// Software page-fault count (kernel-side touch cost). `default` so
+    /// raw files from before the counter was collected keep parsing.
+    #[serde(default)]
+    page_faults: u64,
+    /// Retired instructions (0 where the virtualized PMU hides it).
+    #[serde(default)]
+    instructions: u64,
+}
+
+/// Peak-RSS pass row (`rss-*.json` from `run_native.sh --rss`) — the
+/// memory-footprint axis of the real-workload benchmarks.
+#[derive(Deserialize)]
+struct RssResult {
+    lang: String,
+    allocator: String,
+    workload: String,
+    mode: String,
+    rss_kib: u64,
 }
 
 #[derive(Deserialize)]
@@ -307,6 +349,11 @@ fn parse_native_filename(stem: &str) -> Option<(String, String, String, String)>
 /// in-process hypothesis tests need.
 type SampleMap = BTreeMap<(String, String, String, String), Vec<f64>>;
 
+/// ops=1 perf calibration counts keyed by (lang, allocator, workload, mode):
+/// `(l1d_load_misses, llc_load_misses, page_faults, instructions)`, subtracted
+/// from the main row for the startup-immune `_net` view.
+type PerfCalMap = BTreeMap<(String, String, String, String), (u64, u64, u64, u64)>;
+
 fn load_rows(dir: &Path) -> (Vec<Row>, SampleMap) {
     let mut samples: SampleMap = BTreeMap::new();
     let mut rows = Vec::new();
@@ -317,8 +364,13 @@ fn load_rows(dir: &Path) -> (Vec<Row>, SampleMap) {
     let mut cg_cal: BTreeMap<(String, String, String, String), (u64, u64)> = BTreeMap::new();
     // perf (real-PMU) rows are two-phase exactly like cachegrind: main rows and
     // their ops=1 `-cal` companions, paired after the scan for the `_net` view.
+    // Cal tuple: (l1d_load_misses, llc_load_misses, page_faults, instructions).
     let mut perf_main: Vec<PerfResult> = Vec::new();
-    let mut perf_cal: BTreeMap<(String, String, String, String), (u64, u64)> = BTreeMap::new();
+    let mut perf_cal: PerfCalMap = BTreeMap::new();
+    // Timing rows are two-phase the same way: `native-…-cal.json` (ops=1
+    // hyperfine companion) carries each mode's fixed startup wall, paired
+    // after the scan into `startup_ns`/`mean_ns_net`.
+    let mut timing_cal: BTreeMap<(String, String, String, String), f64> = BTreeMap::new();
     let Ok(entries) = fs::read_dir(dir) else {
         eprintln!("results directory {dir:?} not found or unreadable");
         return (rows, samples);
@@ -335,10 +387,28 @@ fn load_rows(dir: &Path) -> (Vec<Row>, SampleMap) {
         };
 
         if stem.starts_with("native-") {
-            let Some((lang, allocator, workload, mode)) = parse_native_filename(stem) else {
+            // `-cal` companions reuse the main filename with a suffix; strip
+            // it BEFORE the segment parse (the bare stem's trailing segment
+            // would otherwise land in the mode slot and be rejected).
+            let (core_stem, is_cal) = match stem.strip_suffix("-cal") {
+                Some(core) => (core, true),
+                None => (stem, false),
+            };
+            let Some((lang, allocator, workload, mode)) = parse_native_filename(core_stem) else {
                 eprintln!("skipping unparseable native result filename: {stem}");
                 continue;
             };
+            if is_cal {
+                match serde_json::from_str::<HyperfineExport>(&text) {
+                    Ok(export) => {
+                        if let Some(r) = export.results.first() {
+                            timing_cal.insert((lang, allocator, workload, mode), r.mean * 1e9);
+                        }
+                    }
+                    Err(e) => eprintln!("failed to parse {path:?} as hyperfine export: {e}"),
+                }
+                continue;
+            }
             match serde_json::from_str::<HyperfineExport>(&text) {
                 Ok(export) => {
                     if let Some(r) = export.results.first() {
@@ -381,11 +451,25 @@ fn load_rows(dir: &Path) -> (Vec<Row>, SampleMap) {
                 Ok(p) if p.calibration => {
                     perf_cal.insert(
                         (p.lang, p.allocator, p.workload, p.mode),
-                        (p.l1d_load_misses, p.llc_load_misses),
+                        (
+                            p.l1d_load_misses,
+                            p.llc_load_misses,
+                            p.page_faults,
+                            p.instructions,
+                        ),
                     );
                 }
                 Ok(p) => perf_main.push(p),
                 Err(e) => eprintln!("failed to parse {path:?} as perf result: {e}"),
+            }
+        } else if stem.starts_with("rss-") {
+            match serde_json::from_str::<RssResult>(&text) {
+                Ok(r) => {
+                    let mut row = empty_row("rss", r.lang, r.allocator, r.workload, r.mode);
+                    row.rss_kib = Some(r.rss_kib);
+                    rows.push(row);
+                }
+                Err(e) => eprintln!("failed to parse {path:?} as rss result: {e}"),
             }
         } else if stem.starts_with("rust_") || stem.starts_with("rust-") {
             match serde_json::from_str::<RustLatencyResult>(&text) {
@@ -435,6 +519,22 @@ fn load_rows(dir: &Path) -> (Vec<Row>, SampleMap) {
             ))
             .copied();
         rows.push(perf_row(p, cal));
+    }
+    // Pair each timing row with its ops=1 companion for the startup-immune
+    // wall view. A missing companion (TIMING_CAL=0, or pre-calibration raw
+    // dirs) just leaves the new fields None — nothing downstream requires
+    // them.
+    for row in rows.iter_mut().filter(|r| r.source == "native-timing") {
+        let key = (
+            row.lang.clone(),
+            row.allocator.clone(),
+            row.workload.clone(),
+            row.mode.clone(),
+        );
+        if let (Some(mean), Some(&startup)) = (row.mean_ns, timing_cal.get(&key)) {
+            row.startup_ns = Some(startup);
+            row.mean_ns_net = Some((mean - startup).max(0.0));
+        }
     }
     (rows, samples)
 }
@@ -561,7 +661,7 @@ fn cachegrind_row(cg: CachegrindResult, cal: Option<(u64, u64)>) -> Row {
 /// own load count as the denominator (L1d misses / L1d loads; LLC misses /
 /// LLC loads). Net per-op subtracts the mode's ops=1 startup cost, clamped at
 /// 0, identical to `cachegrind_row`.
-fn perf_row(p: PerfResult, cal: Option<(u64, u64)>) -> Row {
+fn perf_row(p: PerfResult, cal: Option<(u64, u64, u64, u64)>) -> Row {
     let mut row = empty_row("perf", p.lang, p.allocator, p.workload, p.mode);
     if p.l1d_loads > 0 {
         row.d1_miss_rate = Some(p.l1d_load_misses as f64 / p.l1d_loads as f64);
@@ -572,11 +672,19 @@ fn perf_row(p: PerfResult, cal: Option<(u64, u64)>) -> Row {
     if let Some(ops) = p.ops.filter(|&o| o > 0) {
         row.d1_misses_per_op = Some(p.l1d_load_misses as f64 / ops as f64);
         row.ll_misses_per_op = Some(p.llc_load_misses as f64 / ops as f64);
-        if let Some((cal_l1d, cal_llc)) = cal {
+        if let Some((cal_l1d, cal_llc, cal_pf, cal_insn)) = cal {
             row.d1_misses_per_op_net =
                 Some(p.l1d_load_misses.saturating_sub(cal_l1d) as f64 / ops as f64);
             row.ll_misses_per_op_net =
                 Some(p.llc_load_misses.saturating_sub(cal_llc) as f64 / ops as f64);
+            row.page_faults_per_op_net =
+                Some(p.page_faults.saturating_sub(cal_pf) as f64 / ops as f64);
+            // instructions=0 means the virtualized PMU hid the counter — leave
+            // the net field None rather than publish a spurious 0/op.
+            if p.instructions > 0 {
+                row.instructions_per_op_net =
+                    Some(p.instructions.saturating_sub(cal_insn) as f64 / ops as f64);
+            }
         }
     }
     row
@@ -1004,6 +1112,65 @@ fn write_markdown(
                 "| {} | {} | {:.0} | {:.0} | {ratio:.3} | {verdict} |\n",
                 c.lang, c.workload, c.train_mean_ns, c.inf_mean_ns,
             ));
+        }
+    }
+
+    // Peak RSS (memory footprint) — the second axis of the real-workload
+    // benchmarks. For each (lang, workload): lohalloc-inference peak RSS vs
+    // each baseline allocator, ratio <1 = lohalloc uses less memory (the
+    // self-resetting-arena win the timing axis can't show).
+    {
+        let mut rss: BTreeMap<(String, String, String), u64> = BTreeMap::new();
+        for row in rows.iter().filter(|r| r.source == "rss") {
+            let Some(kib) = row.rss_kib else { continue };
+            let alloc = if row.allocator == "lohalloc" {
+                if row.mode == "inference" {
+                    "lohalloc"
+                } else {
+                    continue; // training/other lohalloc rows: skip
+                }
+            } else {
+                row.allocator.as_str()
+            };
+            rss.insert(
+                (row.lang.clone(), row.workload.clone(), alloc.to_string()),
+                kib,
+            );
+        }
+        if !rss.is_empty() {
+            out.push_str("\n## Peak RSS (memory footprint, KiB — lower is better)\n\n");
+            out.push_str(
+                "Ratio = lohalloc-inference / competitor; **<1 means lohalloc uses less \
+                 memory** (the self-resetting-arena advantage the timing axis can't show).\n\n",
+            );
+            out.push_str(
+                "| lang | workload | lohalloc | system | jemalloc | mimalloc | vs-sys | vs-je | vs-mi |\n\
+                 |---|---|---|---|---|---|---|---|---|\n",
+            );
+            let mut seen: std::collections::BTreeSet<(String, String)> =
+                std::collections::BTreeSet::new();
+            for (l, w, _) in rss.keys() {
+                seen.insert((l.clone(), w.clone()));
+            }
+            for (l, w) in seen {
+                let get = |a: &str| rss.get(&(l.clone(), w.clone(), a.to_string())).copied();
+                let lo = get("lohalloc");
+                let cell = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |x| x.to_string());
+                let ratio = |b: Option<u64>| match (lo, b) {
+                    (Some(a), Some(c)) if c > 0 => format!("{:.2}", a as f64 / c as f64),
+                    _ => "-".to_string(),
+                };
+                out.push_str(&format!(
+                    "| {l} | {w} | {} | {} | {} | {} | {} | {} | {} |\n",
+                    cell(lo),
+                    cell(get("system")),
+                    cell(get("jemalloc")),
+                    cell(get("mimalloc")),
+                    ratio(get("system")),
+                    ratio(get("jemalloc")),
+                    ratio(get("mimalloc")),
+                ));
+            }
         }
     }
 
@@ -1688,6 +1855,16 @@ mod tests {
     }
 
     fn perf(ops: u64, l1d_m: u64, llc_m: u64) -> PerfResult {
+        perf_full(ops, l1d_m, llc_m, 0, 0)
+    }
+
+    fn perf_full(
+        ops: u64,
+        l1d_m: u64,
+        llc_m: u64,
+        page_faults: u64,
+        instructions: u64,
+    ) -> PerfResult {
         PerfResult {
             lang: "rust".into(),
             allocator: "lohalloc".into(),
@@ -1699,6 +1876,8 @@ mod tests {
             l1d_load_misses: l1d_m,
             llc_loads: 100_000,
             llc_load_misses: llc_m,
+            page_faults,
+            instructions,
         }
     }
 
@@ -1708,7 +1887,7 @@ mod tests {
         // one-time startup (thread spawn + model load) -> net 5.0/op. Mirrors
         // the cachegrind net test but on the real-PMU path, reusing the shared
         // d1/ll Row fields (L1-dcache -> D1 view, LLC -> LL view).
-        let row = perf_row(perf(2000, 4_000, 16_000), Some((1_000, 6_000)));
+        let row = perf_row(perf(2000, 4_000, 16_000), Some((1_000, 6_000, 0, 0)));
         assert_eq!(row.source, "perf");
         assert_eq!(row.d1_miss_rate, Some(4_000.0 / 1_000_000.0));
         assert_eq!(row.ll_miss_rate, Some(16_000.0 / 100_000.0));
@@ -1720,7 +1899,7 @@ mod tests {
     #[test]
     fn perf_row_clamps_net_and_survives_missing_calibration() {
         // main < cal (noisy real counters) clamps at 0, never negative.
-        let clamped = perf_row(perf(100, 50, 500), Some((80, 600)));
+        let clamped = perf_row(perf(100, 50, 500), Some((80, 600, 0, 0)));
         assert_eq!(clamped.ll_misses_per_op_net, Some(0.0));
         // No calibration companion -> gross only, no net (informational rows
         // from a pre-calibration or partial run still render).
@@ -1730,9 +1909,35 @@ mod tests {
     }
 
     #[test]
+    fn perf_row_nets_page_faults_and_instructions() {
+        // 12_000 gross faults over 2000 ops = 6.0/op, 2_000 one-time startup
+        // -> net 5.0/op. Instructions likewise (60_000 gross, 20_000 startup).
+        let row = perf_row(
+            perf_full(2000, 4_000, 16_000, 12_000, 60_000),
+            Some((1_000, 6_000, 2_000, 20_000)),
+        );
+        assert_eq!(row.page_faults_per_op_net, Some(5.0));
+        assert_eq!(row.instructions_per_op_net, Some(20.0));
+    }
+
+    #[test]
+    fn perf_row_hides_instructions_when_pmu_reports_zero() {
+        // Virtualized Nitro hosts often expose 0 for instructions/cycles —
+        // publish None, not a spurious 0/op. Page faults (a software event)
+        // still net normally.
+        let row = perf_row(
+            perf_full(2000, 4_000, 16_000, 12_000, 0),
+            Some((1_000, 6_000, 2_000, 0)),
+        );
+        assert_eq!(row.instructions_per_op_net, None);
+        assert_eq!(row.page_faults_per_op_net, Some(5.0));
+    }
+
+    #[test]
     fn perf_result_parses_source_pmu_shape() {
         // The exact JSON perf_pass writes (extra fields like cache_references
-        // are ignored by serde), calibration defaults false.
+        // are ignored by serde), calibration defaults false. page_faults /
+        // instructions default 0 for raw files from before those counters.
         let json = r#"{"lang":"rust","allocator":"lohalloc","workload":"mt-xfree-t4",
             "mode":"inference","ops":50000,"calibration":false,
             "cache_references":9,"cache_misses":3,
@@ -1741,5 +1946,72 @@ mod tests {
         let p: PerfResult = serde_json::from_str(json).unwrap();
         assert!(!p.calibration);
         assert_eq!(p.llc_load_misses, 2);
+        assert_eq!(p.page_faults, 0);
+        assert_eq!(p.instructions, 0);
+    }
+
+    fn hyperfine_json(mean_s: f64, ops: u64) -> String {
+        format!(
+            r#"{{"results":[{{"mean":{mean_s},"stddev":0.0,
+                "command":"env BIN slab {ops}",
+                "times":[{mean_s},{mean_s},{mean_s},{mean_s},{mean_s},{mean_s},{mean_s},{mean_s},{mean_s},{mean_s}]}}]}}"#
+        )
+    }
+
+    #[test]
+    fn timing_cal_companion_populates_startup_and_net() {
+        // A `native-…-cal.json` (ops=1) pairs with its main row to yield the
+        // startup-immune wall view without becoming a report row itself.
+        let dir = std::env::temp_dir().join(format!("lohalloc-agg-timing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Main: 300 µs for 50000 ops. Companion: 100 µs fixed startup.
+        fs::write(
+            dir.join("native-c-lohalloc-slab-inference.json"),
+            hyperfine_json(300e-6, 50000),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("native-c-lohalloc-slab-inference-cal.json"),
+            hyperfine_json(100e-6, 1),
+        )
+        .unwrap();
+
+        let (rows, _) = load_rows(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        // Exactly one report row — the `-cal` companion is consumed, not
+        // emitted as its own row.
+        let timing: Vec<&Row> = rows
+            .iter()
+            .filter(|r| r.source == "native-timing")
+            .collect();
+        assert_eq!(
+            timing.len(),
+            1,
+            "cal companion must not become a report row"
+        );
+        let row = timing[0];
+        assert_eq!(row.workload, "slab");
+        assert!((row.mean_ns.unwrap() - 300_000.0).abs() < 1.0);
+        assert!((row.startup_ns.unwrap() - 100_000.0).abs() < 1.0);
+        assert!((row.mean_ns_net.unwrap() - 200_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn rss_pass_row_parses_with_kib() {
+        let dir = std::env::temp_dir().join(format!("lohalloc-agg-rss-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("rss-c-lohalloc-request-loop-inference.json"),
+            r#"{"lang":"c","allocator":"lohalloc","workload":"request-loop","mode":"inference","rss_kib":2048,"source":"rss"}"#,
+        )
+        .unwrap();
+        let (rows, _) = load_rows(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        let rss: Vec<&Row> = rows.iter().filter(|r| r.source == "rss").collect();
+        assert_eq!(rss.len(), 1);
+        assert_eq!(rss[0].workload, "request-loop");
+        assert_eq!(rss[0].rss_kib, Some(2048));
     }
 }

@@ -530,11 +530,7 @@ impl PerfectHashTable {
     /// and unit tests, which only ever exercise main-table routing.
     /// Production models are serialized via [`FrozenRouting::serialize`].
     pub fn serialize(&self) -> Vec<u8> {
-        FrozenRouting {
-            main: self.clone(),
-            distilled: PerfectHashTable::from_entries(Vec::new()),
-        }
-        .serialize()
+        FrozenRouting::new(self.clone(), PerfectHashTable::from_entries(Vec::new())).serialize()
     }
 
     /// Deserialize a v3 `.lohalloc` byte slice and keep only the **main**
@@ -560,9 +556,112 @@ pub struct FrozenRouting {
     /// Keys: `combine_hash_size_class(1-frame hash, size_class)`; strict
     /// subset of sites (unambiguous only), possibly empty.
     pub distilled: PerfectHashTable,
+    /// Item-A **unanimous-size-class shortcut** (Phase-1 slab diet). For each
+    /// [`crate::state::size_class_for`] bucket, `Some(backend)` iff EVERY
+    /// model entry at that class (main *and* distilled) routes to that one
+    /// backend, none carry a context flag, and it equals the size-default
+    /// backend for that class. Inference can then serve the whole class from
+    /// this indexed load alone — no stack walk, no pin probe, no PHT lookup
+    /// (glibc's size→bin shape, reached only when the model itself is
+    /// unanimous, so the served backend is what the full path would pick;
+    /// the header-boundary edge self-corrects through the same fallthrough
+    /// chain). Derived at construction, never serialized.
+    sc_verdict: [Option<Backend>; SC_VERDICT_LEN],
+    /// True iff any main entry carries a context flag (identical to
+    /// [`Self::has_context_entries`], cached so inference's AHR push-gate is
+    /// one bool load rather than a table scan). When false, a shortcut-served
+    /// alloc can skip the history-register push entirely — no site reads it.
+    ahr_needed: bool,
 }
 
+/// Size-class verdict array length. Covers [`crate::state::size_class_for`]'s
+/// full output range (0–14); one spare slot keeps it a round 16 and matches
+/// `PIN_SC_SLOTS`. Indices ≥ this are never produced by `size_class_for`.
+const SC_VERDICT_LEN: usize = 16;
+
 impl FrozenRouting {
+    /// Construct a frozen routing plane, deriving the [`Self::sc_verdict`]
+    /// shortcut table and [`Self::ahr_needed`] flag from the entries. The one
+    /// place both fields are computed, so every `main`/`distilled` pairing
+    /// (freeze, deserialize, test convenience) gets a consistent shortcut.
+    pub fn new(main: PerfectHashTable, distilled: PerfectHashTable) -> Self {
+        let ahr_needed = Self::scan_has_context(&main);
+        let sc_verdict = Self::compute_sc_verdict(&main, &distilled);
+        Self {
+            main,
+            distilled,
+            sc_verdict,
+            ahr_needed,
+        }
+    }
+
+    /// The shortcut verdict for a size class, or `None` (walk the normal
+    /// path). Out-of-range classes (never produced by `size_class_for`)
+    /// return `None`.
+    #[inline]
+    pub fn sc_verdict(&self, size_class: u8) -> Option<Backend> {
+        self.sc_verdict.get(size_class as usize).copied().flatten()
+    }
+
+    /// Cached [`Self::has_context_entries`]: does inference still need to
+    /// maintain the per-thread history register?
+    #[inline]
+    pub fn ahr_needed(&self) -> bool {
+        self.ahr_needed
+    }
+
+    /// Single-pass unanimity scan over `main` + `distilled`. A size class is
+    /// shortcuttable only when every entry at that class agrees on one
+    /// context-free backend that also equals the class's size-default (so an
+    /// unknown-site allocation — a PHT miss that would take the size-default —
+    /// lands on the same backend the shortcut serves).
+    fn compute_sc_verdict(
+        main: &PerfectHashTable,
+        distilled: &PerfectHashTable,
+    ) -> [Option<Backend>; SC_VERDICT_LEN] {
+        // Per class: the single backend seen so far (None = none yet), and a
+        // conflict flag set by a disagreeing backend, a context flag, or a
+        // never-seen class (left as "no entry" → not shortcuttable).
+        let mut agreed: [Option<Backend>; SC_VERDICT_LEN] = [None; SC_VERDICT_LEN];
+        let mut conflict = [false; SC_VERDICT_LEN];
+        let mut seen = [false; SC_VERDICT_LEN];
+        for (_, size_class, backend, flags) in main
+            .entries_flagged()
+            .iter()
+            .chain(distilled.entries_flagged().iter())
+        {
+            let i = *size_class as usize;
+            if i >= SC_VERDICT_LEN {
+                continue;
+            }
+            seen[i] = true;
+            if *flags != 0 {
+                conflict[i] = true;
+                continue;
+            }
+            match agreed[i] {
+                None => agreed[i] = Some(*backend),
+                Some(b) if b != *backend => conflict[i] = true,
+                _ => {}
+            }
+        }
+        let mut out: [Option<Backend>; SC_VERDICT_LEN] = [None; SC_VERDICT_LEN];
+        for i in 0..SC_VERDICT_LEN {
+            if seen[i] && !conflict[i] {
+                out[i] = agreed[i]
+                    .filter(|&b| b == crate::state::default_backend_for_size_class(i as u8));
+            }
+        }
+        out
+    }
+
+    /// Allocation-free "any main entry carries a context flag" scan — the
+    /// body of [`Self::has_context_entries`], factored out so the constructor
+    /// can cache the result into [`Self::ahr_needed`].
+    fn scan_has_context(main: &PerfectHashTable) -> bool {
+        (0..main.num_slots).any(|slot| main.buf[main.entry_offset(slot) + 8] >> 2 != 0)
+    }
+
     /// The Phase-1 context-aware main-table probe, shared by the lock-free
     /// inference fast path (`lib.rs::route_alloc_inner`) and any locked
     /// fallback. Coarse lookup first; only an entry carrying
@@ -605,8 +704,7 @@ impl FrozenRouting {
     /// decide whether inference must keep maintaining the history
     /// register).
     pub fn has_context_entries(&self) -> bool {
-        let t = &self.main;
-        (0..t.num_slots).any(|slot| t.buf[t.entry_offset(slot) + 8] >> 2 != 0)
+        Self::scan_has_context(&self.main)
     }
 
     /// Serialize both tables to a v4 `.lohalloc` binary byte vector.
@@ -723,10 +821,10 @@ impl FrozenRouting {
             return None;
         }
 
-        Some(Self {
-            main: PerfectHashTable::rebuild(main_entries),
-            distilled: PerfectHashTable::rebuild(distilled_entries),
-        })
+        Some(Self::new(
+            PerfectHashTable::rebuild(main_entries),
+            PerfectHashTable::rebuild(distilled_entries),
+        ))
     }
 }
 
@@ -1114,17 +1212,17 @@ mod tests {
     fn frozen_routing_roundtrip_preserves_both_sections() {
         // The Ladder-6 production path: main + non-empty distilled must both
         // survive serialize → deserialize bit-exactly (entry-wise).
-        let routing = FrozenRouting {
-            main: PerfectHashTable::from_entries(vec![
+        let routing = FrozenRouting::new(
+            PerfectHashTable::from_entries(vec![
                 (0x1111, 0, Backend::Slab),
                 (0x2222, 3, Backend::Arena),
                 (0x3333, 12, Backend::Buddy),
             ]),
-            distilled: PerfectHashTable::from_entries(vec![
+            PerfectHashTable::from_entries(vec![
                 (0xAAAA, 0, Backend::Slab),
                 (0xBBBB, 3, Backend::Arena),
             ]),
-        };
+        );
         let bytes = routing.serialize();
         let restored = FrozenRouting::deserialize(&bytes).expect("roundtrip");
         assert_eq!(restored.main.entries(), routing.main.entries());
@@ -1150,5 +1248,81 @@ mod tests {
         shuffled.reverse();
         let b = PerfectHashTable::from_entries(shuffled);
         assert_eq!(a.serialize(), b.serialize());
+    }
+
+    fn frozen(main: Vec<(u64, u8, Backend)>, distilled: Vec<(u64, u8, Backend)>) -> FrozenRouting {
+        FrozenRouting::new(
+            PerfectHashTable::from_entries(main),
+            PerfectHashTable::from_entries(distilled),
+        )
+    }
+
+    #[test]
+    fn sc_verdict_shortcuts_a_unanimous_size_default_class() {
+        // Size class 0 (slab, size-default = Slab): two sites, both Slab,
+        // no context — shortcuttable to Slab. A distilled entry at the same
+        // class must agree (it does).
+        let r = frozen(
+            vec![(0x1000, 0, Backend::Slab), (0x2000, 0, Backend::Slab)],
+            vec![(0xA000, 0, Backend::Slab)],
+        );
+        assert_eq!(r.sc_verdict(0), Some(Backend::Slab));
+        // Buddy-range class 12 (size-default = Buddy) unanimous on Buddy.
+        let rb = frozen(vec![(0x3000, 12, Backend::Buddy)], vec![]);
+        assert_eq!(rb.sc_verdict(12), Some(Backend::Buddy));
+    }
+
+    #[test]
+    fn sc_verdict_refuses_conflicting_or_non_default_or_flagged_classes() {
+        // Conflict within a class (Slab vs Arena at class 0) — not unanimous.
+        let conflict = frozen(
+            vec![(0x1000, 0, Backend::Slab), (0x2000, 0, Backend::Arena)],
+            vec![],
+        );
+        assert_eq!(conflict.sc_verdict(0), None);
+        // Unanimous but NOT the size-default (class 0's default is Slab, not
+        // Arena): refused, so an unknown-site miss (→ Slab default) can't
+        // diverge from the shortcut.
+        let non_default = frozen(vec![(0x1000, 0, Backend::Arena)], vec![]);
+        assert_eq!(non_default.sc_verdict(0), None);
+        // A distilled entry disagreeing with the main verdict also blocks it.
+        let distilled_conflict = frozen(
+            vec![(0x1000, 0, Backend::Slab)],
+            vec![(0xA000, 0, Backend::Arena)],
+        );
+        assert_eq!(distilled_conflict.sc_verdict(0), None);
+        // A never-seen class is not shortcuttable (the model has no opinion).
+        assert_eq!(conflict.sc_verdict(5), None);
+    }
+
+    #[test]
+    fn sc_verdict_refuses_context_flagged_class() {
+        // A context flag (FLAG_HAS_CONTEXT) at class 0 means routing depends
+        // on history — never shortcut, even if the coarse backend agrees.
+        let r = FrozenRouting::new(
+            PerfectHashTable::from_entries_flagged(vec![
+                (0x1000, 0, Backend::Slab, FLAG_HAS_CONTEXT),
+                (0x2000, 0, Backend::Slab, 0),
+            ]),
+            PerfectHashTable::from_entries(Vec::new()),
+        );
+        assert_eq!(r.sc_verdict(0), None);
+        assert!(
+            r.ahr_needed(),
+            "a context-flagged model still needs the AHR"
+        );
+    }
+
+    #[test]
+    fn sc_verdict_survives_serialize_roundtrip() {
+        // sc_verdict is derived, not serialized — a reloaded model recomputes
+        // the same shortcut table.
+        let r = frozen(
+            vec![(0x1000, 0, Backend::Slab), (0x2000, 0, Backend::Slab)],
+            vec![],
+        );
+        let restored = FrozenRouting::deserialize(&r.serialize()).expect("roundtrip");
+        assert_eq!(restored.sc_verdict(0), Some(Backend::Slab));
+        assert!(!restored.ahr_needed());
     }
 }

@@ -8,10 +8,25 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <sys/resource.h>
 
 #include "workloads.h"
 
 namespace {
+
+// See bench_main.c's maybe_print_rss: peak RSS to stderr when
+// LOHALLOC_BENCH_RSS is set, for the --rss pass. Never set on timing runs.
+void maybe_print_rss() {
+    if (!std::getenv("LOHALLOC_BENCH_RSS")) return;
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return;
+    long kib = ru.ru_maxrss; // Linux: KiB; macOS: bytes
+#ifdef __APPLE__
+    kib /= 1024;
+#endif
+    fprintf(stderr, "RSS_KIB %ld\n", kib);
+}
+
 
 // C++ container equivalent of W-SLAB: repeated std::vector<char> churn at a
 // fixed small size, bounded live window -- exercises the allocator through
@@ -64,5 +79,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "unknown workload '%s'\n", workload.c_str());
         return 2;
     }
+    maybe_print_rss();
     return 0;
 }
