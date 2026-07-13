@@ -549,6 +549,15 @@ run_lohalloc_triple() {
     # bites whenever a headerless-slab magazine flush spans stripes), so forward
     # it to every leg. Unset = default ON.
     [ -n "${LOHALLOC_SLAB_OWNER_FREE:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_SLAB_OWNER_FREE=$LOHALLOC_SLAB_OWNER_FREE"
+    # J6 fast-lane off-switch (LOHALLOC_FAST_LANE=0): the tcache-shaped
+    # frozen alloc/free lanes (default on; armed at model publish, so it
+    # affects the inference legs and any post-freeze training tail).
+    [ -n "${LOHALLOC_FAST_LANE:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_FAST_LANE=$LOHALLOC_FAST_LANE"
+    # J6-D2 legacy-exclusion switch (LOHALLOC_PIN_EXCLUDE_LEGACY=1): restore
+    # the pre-D2 candidate-based distilled exclusion. Freeze-time behavior,
+    # so it must reach the train+export leg (it does — tune_env reaches all
+    # three legs of the triple).
+    [ -n "${LOHALLOC_PIN_EXCLUDE_LEGACY:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_PIN_EXCLUDE_LEGACY=$LOHALLOC_PIN_EXCLUDE_LEGACY"
     run_one "$lang" "$binary" "$workload" "lohalloc" "$preload" "training" "$tune_env"
     local model="$MODEL_DIR/model-${lang}-${workload}.lohalloc"
     echo "==> [train+export] $lang/$workload -> $model (train ops=$TRAIN_OPS)"

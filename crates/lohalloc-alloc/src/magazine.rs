@@ -57,7 +57,7 @@ pub(crate) const MAG_MAX_CAP: usize = 32;
 /// size so the worst-case strandable bytes per thread stay bounded:
 /// 32×(8+16+32+64+128+256) + 16×(512+1024) + 8×(2048+4096) + 4×(8192+16384)
 /// ≈ 210 KiB.
-const CLASS_CAPS: [u8; MAG_CLASSES] = [32, 32, 32, 32, 32, 32, 16, 16, 8, 8, 4, 4];
+pub(crate) const CLASS_CAPS: [u8; MAG_CLASSES] = [32, 32, 32, 32, 32, 32, 16, 16, 8, 8, 4, 4];
 
 /// How many blocks a refill asks the central slab for (half the cap), and
 /// how many a flush returns. Half-full hysteresis avoids ping-ponging a

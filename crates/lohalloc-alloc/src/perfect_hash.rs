@@ -506,6 +506,15 @@ impl PerfectHashTable {
             .collect()
     }
 
+    /// True if any entry routes to `backend`. Cold-path scan, no allocation
+    /// — used by `publish_frozen_table`'s J6 arm-gate (a fast lane that can
+    /// only serve pinned-SLAB verdicts must not arm — and pay its per-alloc
+    /// prologue — for a model whose distilled table has no Slab entry to
+    /// ever hit).
+    pub fn has_backend(&self, backend: Backend) -> bool {
+        (0..self.num_slots).any(|slot| self.entry_backend_at(slot) == backend)
+    }
+
     /// [`entries`](Self::entries) plus each entry's `flags` byte — the
     /// serialization path and flag-aware diagnostics.
     pub fn entries_flagged(&self) -> Vec<(u64, u8, Backend, u8)> {

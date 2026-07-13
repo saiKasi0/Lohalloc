@@ -221,12 +221,20 @@ pub struct FineFreeze {
     /// Coarse combined keys that received at least one fine entry — their
     /// main-table entries get `FLAG_HAS_CONTEXT`.
     pub flagged: BTreeSet<u64>,
-    /// `(one_frame, size_class)` groups containing a flagged Signature —
-    /// must be EXCLUDED from the distilled table: the pin cache serves
-    /// distilled verdicts with no further checks, so a pinned
-    /// context-routed site would silently bypass the ctx probe (shallow AND
-    /// deep flagged sites both land here).
-    pub flagged_frames: BTreeSet<(u64, u8)>,
+    /// `coarse_key → (one_frame, size_class)` for every Signature that
+    /// received a fine/deep CANDIDATE — the raw material for the distilled
+    /// exclusion set. J6-D2: the caller (`state::freeze`) must exclude only
+    /// the groups whose coarse key actually SURVIVES its collapse filter
+    /// (i.e. whose main entry really carries a context flag at runtime):
+    /// the pin cache serves distilled verdicts with no further checks, so a
+    /// pinned context-routed site would silently bypass the ctx probe — but
+    /// a site whose candidates all collapsed routes coarse-only anyway, and
+    /// excluding it costs pin/lane engagement for zero behavioral
+    /// difference (measured: a ~coin-flip per training roll on the C slab
+    /// row, from noisy free-rider Buddy candidates that always clamp back
+    /// to the parent verdict). Keyed by coarse key so the caller can do
+    /// that survivor filtering; shallow and deep candidates both land here.
+    pub flagged_frames: BTreeMap<u64, (u64, u8)>,
     /// Roadmap-D: `(deep_fine_key, coarse_key, size_class, backend)` —
     /// `deep_fine_key` is `combine_key_ctx_deep(coarse_key, deep_ctx)`.
     /// Emitted only for variance-escalated sites (see `freeze_fine`).
@@ -582,7 +590,7 @@ impl BanditPolicy {
         let mut out = FineFreeze {
             entries: Vec::new(),
             flagged: BTreeSet::new(),
-            flagged_frames: BTreeSet::new(),
+            flagged_frames: BTreeMap::new(),
             deep_entries: Vec::new(),
             deep_flagged: BTreeSet::new(),
         };
@@ -600,7 +608,8 @@ impl BanditPolicy {
             out.flagged.insert(coarse_key);
             if let Some(stats) = self.stats.get(sig) {
                 if stats.one_frame != 0 {
-                    out.flagged_frames.insert((stats.one_frame, sig.size_class));
+                    out.flagged_frames
+                        .insert(coarse_key, (stats.one_frame, sig.size_class));
                 }
             }
         }
@@ -693,7 +702,8 @@ impl BanditPolicy {
                     .push((deep_key, coarse_key, sig.size_class, best_backend));
                 out.deep_flagged.insert(coarse_key);
                 if stats.one_frame != 0 {
-                    out.flagged_frames.insert((stats.one_frame, sig.size_class));
+                    out.flagged_frames
+                        .insert(coarse_key, (stats.one_frame, sig.size_class));
                 }
             }
         }

@@ -278,12 +278,20 @@ extern "C" fn report_pht_misses_at_exit() {
     );
     if Lohalloc::route_metrics_enabled() {
         eprintln!(
-            "lohalloc: routes slab={} buddy={} system={} arena={} fallthrough={}",
+            "lohalloc: routes slab={} buddy={} system={} arena={} fallthrough={} fast_lane={} fast_lane_free={}",
             Lohalloc::route_count(Backend::Slab),
             Lohalloc::route_count(Backend::Buddy),
             Lohalloc::route_count(Backend::System),
             Lohalloc::route_count(Backend::Arena),
             Lohalloc::fallthrough_count(),
+            Lohalloc::fast_lane_count(),
+            Lohalloc::fast_lane_free_count(),
+        );
+        eprintln!(
+            "lohalloc: pin_hits={} pin_misses={} pin_negative={}",
+            Lohalloc::pin_hit_count(),
+            Lohalloc::pin_miss_count(),
+            Lohalloc::pin_negative_count(),
         );
     } else {
         eprintln!(
@@ -665,6 +673,15 @@ pub extern "C" fn lohalloc_is_inference() -> c_int {
 #[no_mangle]
 pub extern "C" fn lohalloc_pht_misses() -> u64 {
     Lohalloc::pht_miss_count()
+}
+
+/// Process-wide count of allocations served by the J6 tcache-shaped fast
+/// lane. Always `0` unless built with `route-metrics` — the verification
+/// counterpart to `lohalloc_pht_misses` for lane-engagement checks (a
+/// healthy model-loaded slab run should show this ≈ the slab alloc count).
+#[no_mangle]
+pub extern "C" fn lohalloc_fast_lane_hits() -> u64 {
+    Lohalloc::fast_lane_count()
 }
 
 /// True (`1`) if the process-wide allocator is currently serving Slab

@@ -124,6 +124,20 @@ pub(crate) struct HotTls {
     /// Magazine owner id (see `magazine.rs`'s ownership doc — a SIGSEGV
     /// taught us this). `0` = unassigned.
     pub(crate) mag_owner: Cell<u64>,
+    /// J6 Phase C last-segment cache: the most recent headerless-slab free's
+    /// segment base and its class, tagged with the owning instance's
+    /// magazine id. Lets the free fast lane skip the shared
+    /// `SegmentRegistry` probe when consecutive frees land in the same
+    /// segment (the common churn case). Filled ONLY from verified registry
+    /// hits (`Lohalloc::seg_cache_fill`), so a hit implies the pointer lies
+    /// inside a registered headerless slab segment of that instance —
+    /// segments are never unmapped, and `seg_owner` (a magazine id) rolls
+    /// on every reload/instance switch, exactly like the magazine itself.
+    pub(crate) seg_base: Cell<usize>,
+    /// Class of `seg_base`'s segment (slab segments are single-class).
+    pub(crate) seg_class: Cell<u8>,
+    /// Instance tag for `seg_base` (0 = empty; magazine ids are never 0).
+    pub(crate) seg_owner: Cell<u64>,
     /// Per-class magazine fill counts (12 bytes — completes the first
     /// cache line together with the scalars above).
     pub(crate) mag_counts: [Cell<u8>; MAG_CLASSES],
@@ -145,6 +159,9 @@ thread_local! {
             ahr: Cell::new(0),
             thread_stripe: Cell::new(usize::MAX),
             mag_owner: Cell::new(0),
+            seg_base: Cell::new(0),
+            seg_class: Cell::new(0),
+            seg_owner: Cell::new(0),
             mag_counts: [const { Cell::new(0) }; MAG_CLASSES],
             span: ArenaSpan {
                 owner: Cell::new(0),

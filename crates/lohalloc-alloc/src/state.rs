@@ -663,10 +663,29 @@ impl AllocatorState {
 
                 // Distilled: exclude context-routed sites — the pin cache
                 // would serve them without the ctx probe.
+                //
+                // J6-D2: "context-routed" means a fine/deep entry SURVIVED
+                // the collapse filters above (only survivors set a flag on
+                // the main entry, so only survivors change runtime
+                // routing). The old behavior excluded every site with a
+                // fine CANDIDATE — but a candidate whose clamped verdict
+                // collapses back to its parent's leaves the site routing
+                // coarse-only, unflagged, and excluding it just loses pin /
+                // fast-lane engagement for zero behavioral difference
+                // (measured as a ~coin-flip per training roll on the C
+                // slab row: noisy unservable-Buddy fine candidates always
+                // clamp back to the parent). `LOHALLOC_PIN_EXCLUDE_LEGACY=1`
+                // restores the old over-exclusion for A/B certification.
+                let legacy = crate::pin_exclude_legacy();
                 let excluded: BTreeSet<u64> = fine
                     .flagged_frames
                     .iter()
-                    .map(|&(one_frame, sc)| combine_hash_size_class(one_frame, sc))
+                    .filter(|(coarse_key, _)| {
+                        legacy
+                            || surviving_parents.contains(coarse_key)
+                            || deep_surviving_parents.contains(coarse_key)
+                    })
+                    .map(|(_, &(one_frame, sc))| combine_hash_size_class(one_frame, sc))
                     .collect();
                 let distilled_entries: Vec<(u64, u8, lohalloc_core::Backend)> =
                     clamp(bandit.distill())
@@ -841,7 +860,11 @@ pub(crate) fn default_backend_for_size_class(size_class: u8) -> Backend {
 ///
 /// Like the System clamp, each is a strict narrowing to what the fallthrough
 /// chain would do anyway, minus the doomed attempt per op.
-fn clamp_backend_for_size_class(size_class: u8, backend: Backend, demote_arena: bool) -> Backend {
+pub(crate) fn clamp_backend_for_size_class(
+    size_class: u8,
+    backend: Backend,
+    demote_arena: bool,
+) -> Backend {
     if backend == Backend::System && size_class <= 13 {
         return default_backend_for_size_class(size_class);
     }
@@ -941,6 +964,86 @@ pub(crate) const ARENA_DEMOTE_VOLUME_FRACTION: f64 = 0.10;
 mod tests {
     use super::*;
     use lohalloc_core::Backend;
+
+    /// J6-D2 fixture: a Training state with ONE signature at `hash`/sc 5
+    /// whose coarse verdict is decisively Slab and whose 1-frame key is
+    /// `one_frame`, plus a significant fine candidate at ctx 3 preferring
+    /// `fine_backend`. Whether that candidate SURVIVES the freeze's
+    /// collapse filter depends on `fine_backend`: Buddy at sc 5 clamps to
+    /// the size default (Slab == parent → collapses, main stays
+    /// unflagged); Arena at sc 5 is servable and ≠ parent (→ survives,
+    /// main gets FLAG_HAS_CONTEXT).
+    fn training_with_fine_candidate(
+        hash: u64,
+        one_frame: u64,
+        fine_backend: Backend,
+    ) -> AllocatorState {
+        let mut bandit = BanditPolicy::new();
+        let sig = lohalloc_core::Signature::new(hash, 5);
+        let cfg = crate::tune::TrainingConfig::default();
+        // One selection with the frame recorded (retention), then shape the
+        // arms so Slab decisively wins the coarse verdict.
+        let _ = bandit.select_with_frame(sig, one_frame, &cfg, 0);
+        bandit.update_weighted(sig, Backend::Slab, 0.9, 100);
+        bandit.update_weighted(sig, Backend::Buddy, 0.1, 10);
+        bandit.update_weighted(sig, Backend::Arena, 0.1, 10);
+        bandit.update_weighted(sig, Backend::System, 0.1, 10);
+        // A significant fine candidate at ctx 3: `fine_backend` clearly
+        // beats the coarse arm within the ctx (both above FINE_MIN_PULLS so
+        // the emission significance test passes).
+        bandit.update_fine(sig, 3, fine_backend, 0.9, crate::bandit::FINE_MIN_PULLS);
+        bandit.update_fine(sig, 3, Backend::Slab, 0.2, crate::bandit::FINE_MIN_PULLS);
+        AllocatorState::Training {
+            bandit,
+            pending: PendingRewards::default(),
+        }
+    }
+
+    #[test]
+    fn collapsed_fine_candidate_must_not_exclude_site_from_distillation() {
+        // J6-D2 regression: a fine candidate whose clamped verdict collapses
+        // back to its parent's (unservable Buddy at sc 5 → size default
+        // Slab) changes runtime routing NOT AT ALL — the main entry stays
+        // unflagged — so the site must still be distilled/pinnable. The
+        // pre-D2 exclusion dropped it anyway (candidate-based, not
+        // survivor-based), which made pin/fast-lane engagement a per-roll
+        // latency-noise coin flip on the C slab row.
+        let mut st = training_with_fine_candidate(0xAAAA, 0xF00D, Backend::Buddy);
+        st.freeze(false, 2.0, 0.01);
+        let routing = st.routing().expect("frozen");
+        let coarse_key = combine_hash_size_class(0xAAAA, 5);
+        let main = routing.main.entries_flagged();
+        let entry = main.iter().find(|(k, _, _, _)| *k == coarse_key).unwrap();
+        assert_eq!(entry.3, 0, "collapsed candidate must leave main unflagged");
+        assert_eq!(
+            routing.distilled.lookup(combine_hash_size_class(0xF00D, 5)),
+            Some(Backend::Slab),
+            "unflagged site must stay distilled (pin/lane eligible)"
+        );
+    }
+
+    #[test]
+    fn surviving_fine_candidate_still_excludes_site_from_distillation() {
+        // The inverse property: a genuinely context-routed site (surviving
+        // fine entry → FLAG_HAS_CONTEXT on main) must stay OUT of the
+        // distilled table — a pin would bypass the ctx probe.
+        let mut st = training_with_fine_candidate(0xBBBB, 0xBEEF, Backend::Arena);
+        st.freeze(false, 2.0, 0.01);
+        let routing = st.routing().expect("frozen");
+        let coarse_key = combine_hash_size_class(0xBBBB, 5);
+        let main = routing.main.entries_flagged();
+        let entry = main.iter().find(|(k, _, _, _)| *k == coarse_key).unwrap();
+        assert_eq!(
+            entry.3,
+            crate::perfect_hash::FLAG_HAS_CONTEXT,
+            "surviving candidate must flag main"
+        );
+        assert_eq!(
+            routing.distilled.lookup(combine_hash_size_class(0xBEEF, 5)),
+            None,
+            "context-routed site must stay excluded from distillation"
+        );
+    }
 
     #[test]
     fn size_class_small_allocs() {

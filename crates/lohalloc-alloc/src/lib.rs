@@ -320,6 +320,15 @@ pub struct Lohalloc {
     /// meaningful once a frozen table is published (the null-table check
     /// gates it either way).
     sc_shortcut_on: CachePadded<AtomicBool>,
+    /// J6 Phase B: the tcache-shaped frozen Slab fast lane. Latched at
+    /// `publish_frozen_table` when the header-free Slab path is active
+    /// (`slab_headerless`), cleared by `reset_to_training`. When set, a
+    /// slab-range allocation at a pin-cache-proven Slab site is served in
+    /// one hot-TLS visit — walk leaf, pin probe, magazine pop — with no
+    /// re-entrancy-guard writes (the lane takes no locks and makes no
+    /// internal allocations; every miss falls through to the classic path,
+    /// which still runs under the full guard). See [`Lohalloc::slab_fast_alloc`].
+    fast_lane_on: CachePadded<AtomicBool>,
     /// Retention cache for large System-backend mappings (see
     /// `system::SystemCache`): freed 1 MiB+ mappings are kept populated and
     /// reused instead of munmap'd, matching (and beating) glibc's
@@ -559,6 +568,32 @@ fn record_pin_hit() {
 fn record_pin_negative() {
     #[cfg(any(feature = "route-metrics", test))]
     PIN_NEGATIVE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// J6 Phase B fast-lane hit count. Gated like the pin-hit counter (a
+/// hot-path RMW would false-share on ~100% of fast-lane allocs) — exists
+/// only to verify the lane actually fires in tests / under `route-metrics`.
+#[cfg(any(feature = "route-metrics", test))]
+static FAST_LANE_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Record a fast-lane hit (pinned Slab site served in one hot-TLS visit).
+/// No-op unless `route-metrics`/`test`.
+#[inline(always)]
+fn record_fast_lane() {
+    #[cfg(any(feature = "route-metrics", test))]
+    FAST_LANE_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// J6 Phase C free-lane hit count (headerless slab free served from the
+/// last-segment cache + magazine push, no registry probe). Same gating.
+#[cfg(any(feature = "route-metrics", test))]
+static FAST_LANE_FREE_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Record a free-lane hit. No-op unless `route-metrics`/`test`.
+#[inline(always)]
+fn record_fast_lane_free() {
+    #[cfg(any(feature = "route-metrics", test))]
+    FAST_LANE_FREE_HITS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// J5-bisect slab central-refill observability (route-metrics/test only —
@@ -1030,6 +1065,55 @@ fn slab_owner_free_enabled() -> bool {
     !off
 }
 
+/// J6 fast-lane enable latch: `0` = uninit, `1` = on, `2` = off. **Default
+/// ON.** Gates both the alloc lane (`slab_fast_alloc`) and the free lane
+/// (`slab_fast_dealloc`) at `publish_frozen_table` time — the A/B kill
+/// switch for certification (`LOHALLOC_FAST_LANE=0` reverts to the classic
+/// pin path exactly, since every lane miss already falls through to it).
+static FAST_LANE_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// Whether the J6 tcache-shaped fast lanes may arm (default **on**;
+/// `LOHALLOC_FAST_LANE=0` disables). One relaxed load after the first call —
+/// read once per `publish_frozen_table`, never on the hot path.
+#[inline]
+fn fast_lane_enabled() -> bool {
+    let s = FAST_LANE_STATE.load(Ordering::Relaxed);
+    if s != 0 {
+        return s == 1;
+    }
+    // SAFETY: NUL-terminated literal; getenv returns NULL or a pointer into
+    // the C environment (no setenv on the allocator hot path). Only an exact
+    // "0" disables; every other value (unset included) keeps the default on.
+    let p = unsafe { libc::getenv(b"LOHALLOC_FAST_LANE\0".as_ptr().cast()) };
+    let off = !p.is_null() && unsafe { *p == b'0' as libc::c_char && *p.offset(1) == 0 };
+    FAST_LANE_STATE.store(if off { 2 } else { 1 }, Ordering::Relaxed);
+    !off
+}
+
+/// J6-D2 legacy-exclusion latch: `0` = uninit, `1` = legacy, `2` = new.
+/// **Default = new behavior** (exclude only surviving fine parents from
+/// distillation); `LOHALLOC_PIN_EXCLUDE_LEGACY=1` restores the pre-D2
+/// over-exclusion (every site with a fine CANDIDATE) for A/B certification.
+static PIN_EXCLUDE_LEGACY_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// Whether `freeze()` should use the legacy (pre-J6-D2) distilled-exclusion
+/// rule. Freeze-time only — never on the hot path.
+#[inline]
+pub(crate) fn pin_exclude_legacy() -> bool {
+    let s = PIN_EXCLUDE_LEGACY_STATE.load(Ordering::Relaxed);
+    if s != 0 {
+        return s == 1;
+    }
+    // SAFETY: NUL-terminated literal; getenv returns NULL or a pointer into
+    // the C environment (no setenv on the allocator hot path). Only an exact
+    // "1" enables legacy; every other value (unset included) keeps the new
+    // survivors-only rule.
+    let p = unsafe { libc::getenv(b"LOHALLOC_PIN_EXCLUDE_LEGACY\0".as_ptr().cast()) };
+    let legacy = !p.is_null() && unsafe { *p == b'1' as libc::c_char && *p.offset(1) == 0 };
+    PIN_EXCLUDE_LEGACY_STATE.store(if legacy { 1 } else { 2 }, Ordering::Relaxed);
+    legacy
+}
+
 impl Default for Lohalloc {
     fn default() -> Self {
         Self::new()
@@ -1179,6 +1263,7 @@ impl Lohalloc {
             ahr_on: CachePadded::new(AtomicBool::new(true)),
             // Off until a frozen table is published (training never shortcuts).
             sc_shortcut_on: CachePadded::new(AtomicBool::new(false)),
+            fast_lane_on: CachePadded::new(AtomicBool::new(false)),
             system_cache: core::cell::UnsafeCell::new(system::SystemCache::new()),
             system_cache_lock: CachePadded::new(AtomicBool::new(false)),
             system_cache_hits: CachePadded::new(AtomicU64::new(0)),
@@ -1556,6 +1641,13 @@ impl Lohalloc {
 //  - No re-entrancy deadlock: the guard short-circuits internal allocations
 //    to the System Fallback.
 unsafe impl GlobalAlloc for Lohalloc {
+    // NOTE: deliberately NOT `#[inline]` — inlining `alloc` into callers
+    // shifts the stack-walk window by one frame (walk_leaf reads machine
+    // frames), which breaks the paradigm capability matrix the P1/P2 probe
+    // tests pin (and would change every trained model's hashes for
+    // in-crate callers). The J6 fast lane relies on `slab_fast_alloc` and
+    // `route_alloc` inlining INTO this body equally, not on this body
+    // inlining outward.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // Bail out on zero-size: the GlobalAlloc contract says callers must not
         // ask for zero, but be defensive — round up to 1 so the header still
@@ -1572,6 +1664,17 @@ unsafe impl GlobalAlloc for Lohalloc {
         #[cfg(feature = "telemetry-observer")]
         if observer::sink_installed() {
             ALLOC_START_NS.set(observer::now_ns());
+        }
+
+        // J6 Phase B: tcache-shaped frozen Slab fast lane. `total <=
+        // SLAB_MAX` mirrors `try_backend`'s Slab arm guard so the lane's
+        // size envelope is bit-identical to what the classic pinned path
+        // would serve (a header-pad-straddling size must keep falling to
+        // Buddy). One relaxed load when disarmed (training / no model).
+        if self.fast_lane_on.load(Ordering::Relaxed) && align <= MIN_ALIGN && total <= SLAB_MAX {
+            if let Some(ptr) = self.slab_fast_alloc(size) {
+                return ptr;
+            }
         }
 
         // Re-entrancy guard: if we're already inside the allocator on this
@@ -1606,6 +1709,13 @@ unsafe impl GlobalAlloc for Lohalloc {
         if self.ahr_on.load(Ordering::Relaxed) {
             ahr_push_dealloc();
         }
+        // J6 Phase C free fast lane: a frozen instance serves a same-segment
+        // headerless slab free in one hot-TLS visit (no registry probe, no
+        // attribution wrapper — a frozen passthrough anyway). Misses fall
+        // through to the classic dispatch below, which refills the cache.
+        if self.fast_lane_on.load(Ordering::Relaxed) && self.slab_fast_dealloc(ptr) {
+            return;
+        }
         // Header-free fast path: must run BEFORE any header read — a
         // headerless block's `ptr - HEADER_SIZE` is not valid header
         // memory (see `headerless_class_for`'s doc). Part 2: each branch's
@@ -1613,6 +1723,7 @@ unsafe impl GlobalAlloc for Lohalloc {
         // routed through `headerless_free_attributed` to recover the
         // dealloc-side reward the headerless path used to drop.
         if let Some(class) = self.headerless_class_for(ptr) {
+            self.seg_cache_fill(ptr, class);
             self.headerless_free_attributed(ptr, Backend::Slab, || {
                 self.slab_dealloc_headerless(ptr, class)
             });
@@ -1890,6 +2001,162 @@ impl Lohalloc {
     /// backend which then fails (e.g. an exhausted Arena) learn to route
     /// elsewhere. Inference mode is a pure lookup with no reward
     /// bookkeeping, so it never pays the `now_ns()` cost.
+    /// J6 Phase B: the tcache-shaped frozen Slab fast lane. One hot-TLS
+    /// visit serves the whole op — re-entrancy check (load only), pin-cache
+    /// probe, magazine pop, history push — mirroring what glibc's tcache
+    /// does inside its single TLS block. `None` = take the classic path
+    /// (which re-resolves TLS and runs under the full guard); every miss
+    /// reason below degrades to exactly the routing the classic path would
+    /// have produced, so the lane is outcome-preserving by construction:
+    ///
+    /// - table not published / training → classic (lane requires Inference).
+    /// - pin miss or non-Slab verdict → classic (walk + full decision plane;
+    ///   the classic path also *populates* the pin cache, which is what arms
+    ///   the lane for the next alloc from this site).
+    /// - magazine empty or foreign owner → classic (batched refill /
+    ///   `ensure_owner` adoption both live there).
+    ///
+    /// # Guard elision (the structural saving)
+    ///
+    /// The hit path takes no locks and makes no internal allocations
+    /// (`walk_leaf` is registers; pin probe, magazine pop, and the history
+    /// push are plain `Cell` ops on this thread's block; `magazine_owner`
+    /// is one shared atomic load), so it does not bump `in_alloc` — the
+    /// two guard *writes* per alloc exist to protect the backend/lock legs,
+    /// which are all behind the `None` fallthrough and still fully guarded.
+    /// The `in_alloc > 0` *read* stays: a re-entrant alloc must keep taking
+    /// the mmap bypass, never a magazine block (training internals assume
+    /// bypass allocations are System-backed).
+    ///
+    /// # History-register identity (C6 class)
+    ///
+    /// The AHR push happens exactly once per alloc on either path: the lane
+    /// pushes only on its success return; every `None` leaves the register
+    /// untouched for the classic path's own push. Pinned sites never *read*
+    /// context (freeze excludes flagged sites from distillation), so
+    /// push-without-read matches the classic pinned arm exactly.
+    ///
+    /// # `#[inline(always)]` is load-bearing (ret0 congruence)
+    ///
+    /// `walk_leaf` reads the frame of whatever function it is inlined into.
+    /// The lane's pin probe only matches entries the classic path stored,
+    /// so the lane's walk and `route_alloc`'s walk must observe the SAME
+    /// machine frame — both must land at `alloc`'s inlining position. The
+    /// classic chain demonstrably fully inlines in release (per-site pin
+    /// hits prove it); `always` removes the one remaining cost-model bet
+    /// on this small body. If the walks ever diverged anyway the lane
+    /// would miss into the classic path — inert, never incorrect.
+    #[inline(always)]
+    fn slab_fast_alloc(&self, size: usize) -> Option<*mut u8> {
+        // Live-telemetry runs must see every allocation event — the lane
+        // bypasses the observer hooks, so decline and let the classic path
+        // emit. One relaxed load, only compiled under the observer feature.
+        #[cfg(feature = "telemetry-observer")]
+        if observer::sink_installed() {
+            return None;
+        }
+        let class = lohalloc_core::slab_class_for(size)?;
+        let table = self.frozen_table.load(Ordering::Acquire);
+        if table.is_null() {
+            return None;
+        }
+        let (ret0, _cont_fp, _sp) = topology::walk_leaf()?;
+        let owner = self.magazine_owner();
+        hot::with(|h| {
+            if h.in_alloc.get() > 0 {
+                return None; // re-entrant: classic path routes it to mmap
+            }
+            let e = &h.pin[pin_index(ret0)];
+            if e.ret0.get() != ret0 || e.table.get() != table {
+                return None; // pin miss: classic path probes + populates
+            }
+            let size_class = state::size_class_for(size);
+            debug_assert!((size_class as usize) < PIN_SC_SLOTS);
+            if e.states[size_class as usize].get() != lohalloc_core::Backend::Slab as u8 {
+                return None; // unknown / not-pinned / non-Slab verdict
+            }
+            if h.mag_owner.get() != owner {
+                return None; // foreign magazine: classic path adopts it
+            }
+            let n = h.mag_counts[class].get();
+            if n == 0 {
+                return None; // empty: classic path batch-refills
+            }
+            let n = n - 1;
+            h.mag_counts[class].set(n);
+            let ptr = h.mag_slots[class][n as usize].get();
+            // Pinned sites push (never read) their event into this thread's
+            // history — same as the classic pinned arm.
+            if self.ahr_on.load(Ordering::Relaxed) {
+                h.ahr
+                    .set((h.ahr.get() << CTX_EVENT_BITS) | ahr_alloc_code(size_class));
+            }
+            record_pin_hit();
+            record_route(lohalloc_core::Backend::Slab);
+            record_fast_lane();
+            Some(ptr)
+        })
+    }
+
+    /// J6 Phase C: the tcache-shaped free fast lane. Serves a headerless
+    /// slab free in one hot-TLS visit — last-segment-cache probe + magazine
+    /// push — skipping the shared `SegmentRegistry` lookup and the
+    /// (frozen-mode passthrough) attribution wrapper. `false` = classic
+    /// path, which re-resolves everything and also REFILLS the cache
+    /// ([`Self::seg_cache_fill`]) from its verified registry hit.
+    ///
+    /// Soundness of the cache hit: `seg_base` is only ever written from a
+    /// registry hit on the instance whose magazine id tags it, slab
+    /// segments are single-class and never unmapped, and a pointer whose
+    /// masked base equals a registered segment base necessarily lies inside
+    /// that segment (mappings are disjoint) — so base+owner match ⇒ this is
+    /// OUR headerless slab block of `seg_class`, exactly what the registry
+    /// would have answered. Reloads/instance switches roll the magazine id,
+    /// which invalidates the tag the same way it invalidates the magazine.
+    ///
+    /// The magazine-full case falls back to the classic path (flush needs
+    /// the per-stripe grouping + central locks). Only callable when
+    /// `fast_lane_on` (frozen): training frees must keep their reward
+    /// attribution and reward-track bookkeeping.
+    #[inline(always)]
+    fn slab_fast_dealloc(&self, ptr: *mut u8) -> bool {
+        let owner = self.magazine_owner();
+        hot::with(|h| {
+            let base = (ptr as usize) & !(slab::SEGMENT_SIZE - 1);
+            if h.seg_base.get() != base || h.seg_owner.get() != owner {
+                return false;
+            }
+            if h.mag_owner.get() != owner {
+                return false; // foreign magazine: classic path adopts it
+            }
+            let class = h.seg_class.get() as usize;
+            let n = h.mag_counts[class].get();
+            if n >= magazine::CLASS_CAPS[class] {
+                return false; // full: classic path flushes to the stripes
+            }
+            h.mag_slots[class][n as usize].set(ptr);
+            h.mag_counts[class].set(n + 1);
+            record_fast_lane_free();
+            true
+        })
+    }
+
+    /// Refill the free lane's last-segment cache from a VERIFIED registry
+    /// hit (the classic headerless-slab dispatch). One TLS visit; gated on
+    /// the lane being armed so training pays one relaxed load.
+    #[inline(always)]
+    fn seg_cache_fill(&self, ptr: *mut u8, class: u8) {
+        if !self.fast_lane_on.load(Ordering::Relaxed) {
+            return;
+        }
+        let owner = self.magazine_owner();
+        hot::with(|h| {
+            h.seg_base.set((ptr as usize) & !(slab::SEGMENT_SIZE - 1));
+            h.seg_class.set(class);
+            h.seg_owner.set(owner);
+        });
+    }
+
     fn route_alloc(&self, size: usize, align: usize, pad: usize, total: usize) -> *mut u8 {
         // Load the frozen pointer ONCE up front (Item A): the unanimous-size-
         // class shortcut and the pin cache below both consume it, so training
@@ -3344,6 +3611,26 @@ impl Lohalloc {
             // no alloc can observe the table with a stale shortcut flag.
             self.sc_shortcut_on
                 .store(sc_shortcut_enabled(), Ordering::Relaxed);
+            // J6 Phase B: arm the tcache-shaped Slab fast lane iff the
+            // header-free Slab path is active — the lane serves raw
+            // headerless magazine blocks, so it must never engage for an
+            // instance whose Slab serves header blocks. Decided before
+            // publishing (same discipline as the flags above); the lane
+            // additionally checks the published table per alloc, so a
+            // pre-publish read of `true` still routes classically.
+            //
+            // J6-D1 arm-gate: also require the distilled table to contain
+            // at least one SLAB entry. The lane can only ever hit a
+            // pinned-Slab verdict; for a model with none (measured: half of
+            // C slab-row training rolls under the legacy exclusion), an
+            // armed lane pays walk + pin probe (+~17 drefs/op) on every
+            // alloc and can never win — so don't arm it.
+            self.fast_lane_on.store(
+                self.slab_headerless.load(Ordering::Relaxed)
+                    && fast_lane_enabled()
+                    && routing.distilled.has_backend(lohalloc_core::Backend::Slab),
+                Ordering::Relaxed,
+            );
             let leaked: *mut perfect_hash::FrozenRouting = Box::leak(Box::new(routing.clone()));
             self.frozen_table.store(leaked, Ordering::Release);
         }
@@ -3418,6 +3705,11 @@ impl Lohalloc {
     /// any frozen routing table or learned bandit weights. Used by the GUI's
     /// "back to training" button.
     pub fn reset_to_training(&self) {
+        // Disarm the J6 fast lane first: training must route every alloc
+        // through the Decision Engine (and the lane's pin probe would only
+        // ever miss against a null table anyway — this just skips its
+        // prologue).
+        self.fast_lane_on.store(false, Ordering::Relaxed);
         // Unpublish the fast-path table *before* resetting the state so no
         // new reader can pick it up mid-reset. The old table is
         // intentionally leaked — a concurrent alloc may still be reading
@@ -3460,12 +3752,18 @@ impl Lohalloc {
             if let Some(s) = new_state {
                 if let Ok(mut state) = self.state.lock() {
                     *state = s;
-                    self.publish_frozen_table(&state);
-                    self.frozen.store(true, Ordering::Release);
                     // Serve the frozen inference path header-free (see
                     // `latch_headerless`'s doc for the per-backend safety
-                    // argument).
+                    // argument). Must run BEFORE `publish_frozen_table`:
+                    // publish latches `fast_lane_on` from `slab_headerless`,
+                    // so the old publish-first order left the J6 fast lane
+                    // permanently disarmed on every model-loaded process
+                    // (the cabi/LD_PRELOAD deployment loads the model before
+                    // the first allocation, so nothing else ever latched it
+                    // — measured as pin_hits=19999, fast_lane=0).
                     self.latch_headerless();
+                    self.publish_frozen_table(&state);
+                    self.frozen.store(true, Ordering::Release);
                     return true;
                 }
             }
@@ -3546,6 +3844,14 @@ impl Lohalloc {
         self.slab_headerless.load(Ordering::Relaxed)
     }
 
+    /// True if this instance's J6 tcache-shaped fast lanes are armed (set at
+    /// `publish_frozen_table` when headerless Slab is active, the
+    /// `LOHALLOC_FAST_LANE` latch allows it, AND the distilled table has at
+    /// least one Slab entry — the D1 arm-gate). Test/introspection only.
+    pub fn is_fast_lane_armed(&self) -> bool {
+        self.fast_lane_on.load(Ordering::Relaxed)
+    }
+
     /// True if serving Buddy allocations header-free (see `buddy_headerless`).
     /// Test/introspection only.
     pub fn is_buddy_headerless(&self) -> bool {
@@ -3591,6 +3897,35 @@ impl Lohalloc {
         #[cfg(any(feature = "route-metrics", test))]
         {
             PIN_HITS.load(Ordering::Relaxed)
+        }
+        #[cfg(not(any(feature = "route-metrics", test)))]
+        {
+            0
+        }
+    }
+
+    /// Process-wide count of allocations served by the J6 tcache-shaped
+    /// fast lane (one hot-TLS visit: pin probe + magazine pop, no guard
+    /// writes). Always `0` unless built with `route-metrics` (or under
+    /// test) — per-op hit counting would false-share like `ROUTE_COUNTS`.
+    pub fn fast_lane_count() -> u64 {
+        #[cfg(any(feature = "route-metrics", test))]
+        {
+            FAST_LANE_HITS.load(Ordering::Relaxed)
+        }
+        #[cfg(not(any(feature = "route-metrics", test)))]
+        {
+            0
+        }
+    }
+
+    /// Process-wide count of frees served by the J6 free fast lane
+    /// (last-segment cache + magazine push, no registry probe). Always `0`
+    /// unless built with `route-metrics` (or under test).
+    pub fn fast_lane_free_count() -> u64 {
+        #[cfg(any(feature = "route-metrics", test))]
+        {
+            FAST_LANE_FREE_HITS.load(Ordering::Relaxed)
         }
         #[cfg(not(any(feature = "route-metrics", test)))]
         {
@@ -3998,10 +4333,16 @@ impl Lohalloc {
         if ptr.is_null() {
             return false;
         }
+        // J6 Phase C free fast lane (see `slab_fast_dealloc`) — the cabi
+        // `free` path's equivalent of `GlobalAlloc::dealloc`'s hook.
+        if self.fast_lane_on.load(Ordering::Relaxed) && self.slab_fast_dealloc(ptr) {
+            return true;
+        }
         // Part 2: attribute the headerless free to the alloc-time arm (the
         // cabi/LD_PRELOAD C/C++ free path — same recovery as GlobalAlloc's
         // `dealloc`). The registry hit names the actual serving backend.
         if let Some(class) = self.headerless_class_for(ptr) {
+            self.seg_cache_fill(ptr, class);
             self.headerless_free_attributed(ptr, Backend::Slab, || {
                 self.slab_dealloc_headerless(ptr, class)
             });
@@ -4247,8 +4588,51 @@ mod integration_tests {
             assert!(!p.is_null());
             unsafe { a.dealloc(p, layout) };
         }
-        a.freeze();
-        a.export().expect("export after freeze")
+        // Build the model DIRECTLY from the bandit's coarse tables instead
+        // of `a.freeze()`: the production freeze also runs the fine-context
+        // (shadow-bandit) layer, and any fine entry that survives its
+        // collapse filter FLAGS the site — which excludes it from
+        // distillation. Whether a fine ctx arm disagrees with its parent is
+        // real-latency noise, so under a loaded parallel suite these tests
+        // flaked with "distill to exactly one entry: []" (the site was
+        // flagged right out of the distilled table). Distill/pin mechanics —
+        // what the tests here assert on — must not depend on timing, so the
+        // fixture freezes coarse-only: main = per-signature best arms,
+        // distilled = the unambiguous 1-frame groups, no flags, no fine
+        // entries, no demotion/servability clamps (irrelevant at these
+        // slab-range layouts).
+        let st = a.state.lock().unwrap();
+        let (main_raw, distilled_raw) = match &*st {
+            state::AllocatorState::Training { bandit, .. } => (bandit.freeze(), bandit.distill()),
+            state::AllocatorState::Inference { .. } => unreachable!("trainer is never frozen here"),
+        };
+        drop(st);
+        // Keep the (deterministic) freeze-time verdict rewrites the tests
+        // assert on: the servability clamp (e.g. Buddy at a headerless-
+        // unservable small class → size default) and BLANKET Arena demotion
+        // (`demote_arena = true`) — the production volume-selective demotion
+        // always demotes a single-site trainer anyway (its one site is 100%
+        // of the volume), so blanket is the deterministic equivalent here.
+        // Whether the bandit's raw winner was Slab or Arena is timing noise;
+        // after these rewrites a slab-range fixture always reads Slab. Only
+        // the timing-dependent fine/flag machinery is omitted.
+        let main = perfect_hash::PerfectHashTable::from_entries(
+            main_raw
+                .into_iter()
+                .map(|(k, sc, b, _)| (k, sc, state::clamp_backend_for_size_class(sc, b, true)))
+                .collect(),
+        );
+        let distilled = perfect_hash::PerfectHashTable::from_entries(
+            distilled_raw
+                .into_iter()
+                .map(|(k, sc, b, _)| (k, sc, state::clamp_backend_for_size_class(sc, b, true)))
+                .collect(),
+        );
+        state::AllocatorState::Inference {
+            routing: perfect_hash::FrozenRouting::new(main, distilled),
+        }
+        .export()
+        .expect("export constructed model")
     }
 
     #[test]
@@ -4303,7 +4687,8 @@ mod integration_tests {
         assert_eq!(
             distilled.len(),
             1,
-            "one site × one size class must distill to exactly one entry: {distilled:?}"
+            "one site × one size class must distill to exactly one entry: {distilled:?}; main={:?}",
+            st.routing().expect("inference").main.entries_flagged()
         );
         let pinned_backend = distilled[0].2;
 
@@ -4432,6 +4817,224 @@ mod integration_tests {
         unsafe {
             loaded.dealloc(p3, layout);
             loaded.dealloc(p4, layout);
+        }
+    }
+
+    // J6 fast-lane inference leaf: its own `#[inline(never)]` site so its
+    // pin slot / trained signature are private to this test. Post-call
+    // assert defeats tail-call frame elision, same as the pin leaves.
+    #[inline(never)]
+    fn lane_site(a: &Lohalloc, layout: Layout) -> *mut u8 {
+        let p = unsafe { a.alloc(layout) };
+        assert!(!p.is_null(), "lane site alloc failed");
+        p
+    }
+
+    /// Train `site` for real (the walked hashes/one-frame keys cannot be
+    /// known statically), export via the deterministic coarse-only fixture
+    /// (`train_and_export`), then force every verdict to Slab: real-latency
+    /// training under parallel test load does not deterministically pick a
+    /// winner, and the lane only serves pinned-SLAB sites. Forced-outcome
+    /// discipline per the repo's testing convention.
+    fn train_and_export_forced_slab(
+        site: fn(&Lohalloc, Layout) -> *mut u8,
+        layout: Layout,
+        n: usize,
+    ) -> Vec<u8> {
+        let trainer = Lohalloc::new();
+        let bytes = train_and_export(&trainer, site, layout, n);
+        let st = state::AllocatorState::load(&bytes).expect("model parses");
+        let routing = st.routing().expect("inference");
+        let distilled_entries: Vec<(u64, u8, lohalloc_core::Backend)> = routing
+            .distilled
+            .entries()
+            .into_iter()
+            .map(|(k, sc, _)| (k, sc, lohalloc_core::Backend::Slab))
+            .collect();
+        assert!(
+            !distilled_entries.is_empty(),
+            "coarse-only freeze must distill the single trained site; main={:?}",
+            routing.main.entries_flagged()
+        );
+        let main = perfect_hash::PerfectHashTable::from_entries(
+            routing
+                .main
+                .entries()
+                .into_iter()
+                .map(|(k, sc, _)| (k, sc, lohalloc_core::Backend::Slab))
+                .collect(),
+        );
+        let distilled = perfect_hash::PerfectHashTable::from_entries(distilled_entries);
+        state::AllocatorState::Inference {
+            routing: perfect_hash::FrozenRouting::new(main, distilled),
+        }
+        .export()
+        .expect("re-serialize forced model")
+    }
+
+    #[test]
+    fn fast_lane_serves_pinned_slab_from_magazine_and_disarms_on_reset() {
+        let layout = Layout::from_size_align(256, 16).unwrap();
+        // Forced-Slab model over the real trained keys (see the helper doc).
+        let bytes = train_and_export_forced_slab(lane_site, layout, 512);
+
+        let loaded = Lohalloc::new();
+
+        // Disarmed before load: training-mode allocs must never enter the
+        // lane (per-instance flag — the process-wide hit counters move
+        // under concurrent sibling lane tests).
+        let warm_train = lane_site(&loaded, layout);
+        unsafe { loaded.dealloc(warm_train, layout) };
+        assert!(
+            !loaded.is_fast_lane_armed(),
+            "lane must not be armed before a model is loaded"
+        );
+
+        assert!(loaded.load(&bytes));
+        assert!(
+            loaded.is_slab_headerless(),
+            "load() on an untouched instance must latch headerless slab (lane precondition)"
+        );
+        // Reach the pin path (the Item-A shortcut would otherwise serve this
+        // unanimous single-site model without ever populating the pin cache).
+        loaded.set_sc_shortcut(false);
+
+        // First alloc: classic path (pin miss → populate + magazine refill).
+        // Everything after must ride the lane except magazine-refill ops.
+        let mut ptrs = vec![lane_site(&loaded, layout)];
+        let lane1 = Lohalloc::fast_lane_count();
+        for _ in 0..64 {
+            ptrs.push(lane_site(&loaded, layout));
+        }
+        assert!(
+            Lohalloc::fast_lane_count() >= lane1 + 32,
+            "pinned-Slab site must be served by the fast lane (got +{})",
+            Lohalloc::fast_lane_count() - lane1
+        );
+        // Lane blocks are real headerless slab memory: writable, resolvable,
+        // and freeable through the ordinary dealloc path.
+        assert_eq!(
+            unsafe { loaded.backend_for_ptr(*ptrs.last().unwrap()) },
+            Some(lohalloc_core::Backend::Slab),
+            "fast-lane block must be a slab block"
+        );
+        for p in &ptrs {
+            unsafe { core::ptr::write_bytes(*p, 0xA5, layout.size()) };
+        }
+        // Phase C: the first free goes classic (registry probe) and fills
+        // the last-segment cache; same-segment frees after it must ride the
+        // free lane. All blocks come from one 64 KiB segment here, and the
+        // magazine (cap 32 at this class) forces periodic classic flushes —
+        // hence a lower bound, not equality.
+        let free0 = Lohalloc::fast_lane_free_count();
+        for p in ptrs {
+            unsafe { loaded.dealloc(p, layout) };
+        }
+        assert!(
+            Lohalloc::fast_lane_free_count() >= free0 + 16,
+            "same-segment frees must ride the free fast lane (got +{})",
+            Lohalloc::fast_lane_free_count() - free0
+        );
+
+        // reset_to_training disarms the lane (per-instance flag — the
+        // process-wide hit counters move under concurrent sibling tests).
+        assert!(loaded.is_fast_lane_armed(), "armed while frozen");
+        loaded.reset_to_training();
+        assert!(
+            !loaded.is_fast_lane_armed(),
+            "reset_to_training must disarm the lane"
+        );
+        let p = lane_site(&loaded, layout);
+        unsafe { loaded.dealloc(p, layout) };
+    }
+
+    #[test]
+    fn fast_lane_stays_disarmed_without_a_distilled_slab_entry() {
+        // J6-D1 arm-gate: a model whose distilled table has no SLAB entry
+        // can never produce a lane hit, so the lane must not arm (an armed
+        // lane pays walk + pin probe per alloc for nothing). Model: real
+        // trained keys, main forced Slab (so routing still serves), but the
+        // distilled section rewritten to Arena-only.
+        let layout = Layout::from_size_align(256, 16).unwrap();
+        let bytes = {
+            let trainer = Lohalloc::new();
+            let trained = train_and_export(&trainer, lane_site, layout, 512);
+            let st = state::AllocatorState::load(&trained).expect("model parses");
+            let routing = st.routing().expect("inference");
+            let main = perfect_hash::PerfectHashTable::from_entries(
+                routing
+                    .main
+                    .entries()
+                    .into_iter()
+                    .map(|(k, sc, _)| (k, sc, lohalloc_core::Backend::Slab))
+                    .collect(),
+            );
+            let distilled = perfect_hash::PerfectHashTable::from_entries(
+                routing
+                    .distilled
+                    .entries()
+                    .into_iter()
+                    .map(|(k, sc, _)| (k, sc, lohalloc_core::Backend::Arena))
+                    .collect(),
+            );
+            state::AllocatorState::Inference {
+                routing: perfect_hash::FrozenRouting::new(main, distilled),
+            }
+            .export()
+            .expect("re-serialize")
+        };
+
+        let loaded = Lohalloc::new();
+        assert!(loaded.load(&bytes));
+        loaded.set_sc_shortcut(false);
+
+        // Per-instance flag (the process-wide hit counters move under the
+        // sibling lane tests running concurrently, so they can't prove a
+        // negative here).
+        assert!(
+            !loaded.is_fast_lane_armed(),
+            "no distilled Slab entry ⇒ the lane must stay disarmed"
+        );
+        // And routing still serves normally through the classic path (which
+        // pin-serves this model's distilled Arena verdict — fine; the
+        // property under test is only that the LANE stayed dark).
+        let mut ptrs = Vec::new();
+        for _ in 0..32 {
+            ptrs.push(lane_site(&loaded, layout));
+        }
+        for p in ptrs {
+            unsafe { loaded.dealloc(p, layout) };
+        }
+    }
+
+    #[test]
+    fn fast_lane_arms_when_load_precedes_first_alloc() {
+        // The cabi/LD_PRELOAD deployment loads the model BEFORE the first
+        // allocation, so nothing has latched `slab_headerless` when `load()`
+        // runs — `load()` itself must latch it before publishing, or the
+        // lane stays disarmed for the whole process. (Regression test for
+        // the publish-before-latch ordering bug: pin_hits=19999 with
+        // fast_lane=0 on every model-loaded C run.)
+        let layout = Layout::from_size_align(256, 16).unwrap();
+        let bytes = train_and_export_forced_slab(lane_site, layout, 512);
+
+        // Fresh instance, load() FIRST — no alloc has touched it.
+        let loaded = Lohalloc::new();
+        assert!(loaded.load(&bytes));
+        loaded.set_sc_shortcut(false);
+
+        let mut ptrs = vec![lane_site(&loaded, layout)]; // classic: pin populate + refill
+        let lane0 = Lohalloc::fast_lane_count();
+        for _ in 0..64 {
+            ptrs.push(lane_site(&loaded, layout));
+        }
+        assert!(
+            Lohalloc::fast_lane_count() >= lane0 + 32,
+            "model-loaded-before-first-alloc instance must arm the lane (got +{})",
+            Lohalloc::fast_lane_count() - lane0
+        );
+        for p in ptrs {
+            unsafe { loaded.dealloc(p, layout) };
         }
     }
 
