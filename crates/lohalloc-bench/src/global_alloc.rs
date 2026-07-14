@@ -112,6 +112,52 @@ pub fn global_lohalloc_active_stripes() -> usize {
     lohalloc_alloc::Lohalloc::active_stripes()
 }
 
+/// J8-B firing-rate probe: `(fast_lane_alloc_hits, fast_lane_free_hits)`
+/// (0 without `route-metrics`).
+#[cfg(feature = "alloc-lohalloc")]
+pub fn global_lohalloc_fast_lane_counts() -> (u64, u64) {
+    (
+        lohalloc_alloc::Lohalloc::fast_lane_count(),
+        lohalloc_alloc::Lohalloc::fast_lane_free_count(),
+    )
+}
+
+/// J8-A diagnostics: per-chunk `(used_bytes, carved, freed, spans)`.
+#[cfg(feature = "alloc-lohalloc")]
+pub fn global_lohalloc_arena_chunk_debug() -> Vec<(usize, usize, usize, usize)> {
+    ALLOC.arena_chunk_debug()
+}
+
+/// J8-A diagnostics: arena recycle-scan outcomes
+/// `(recycles, grows, skip_pinned, skip_unfreed, skip_uncarved)` — the
+/// rotation-breadth probe (why did the arena map fresh chunks instead of
+/// recycling quiescent ones?).
+#[cfg(feature = "alloc-lohalloc")]
+pub fn global_lohalloc_arena_recycle_stats() -> (usize, usize, usize, usize, usize) {
+    let s = ALLOC.arena_recycle_stats();
+    (
+        s.recycles,
+        s.grows,
+        s.skip_pinned,
+        s.skip_unfreed,
+        s.skip_uncarved,
+    )
+}
+
+/// Live mapped-footprint counters `(slab_regions, buddy_regions, arena_used,
+/// arena_capacity)` — the RSS-attribution view (J8 retention diagnostics):
+/// which backend is holding how much backing memory at the point of the call.
+#[cfg(feature = "alloc-lohalloc")]
+pub fn global_lohalloc_backend_counters() -> (usize, usize, usize, usize) {
+    let c = ALLOC.backend_counters();
+    (
+        c.slab_region_count,
+        c.buddy_region_count,
+        c.arena_used,
+        c.arena_capacity,
+    )
+}
+
 /// Whether the global instance latched each backend's header-free fast path
 /// on `load()` `(slab, buddy, arena)`. Diagnostic for the touch-cost story:
 /// these only latch if the backend was untouched at model-load time.

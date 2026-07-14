@@ -563,6 +563,14 @@ run_lohalloc_triple() {
     # every leg (training accounting, freeze predicate, inference recycle),
     # so forward it to the whole triple.
     [ -n "${LOHALLOC_ARENA_RECLAIM:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_ARENA_RECLAIM=$LOHALLOC_ARENA_RECLAIM"
+    # J8-A self-flush off-switch (LOHALLOC_ARENA_SELF_FLUSH=0): slow-path
+    # clearing of the visiting thread's own quiescence blockers (default
+    # on). Runtime behavior on every leg — forward to the whole triple.
+    [ -n "${LOHALLOC_ARENA_SELF_FLUSH:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_ARENA_SELF_FLUSH=$LOHALLOC_ARENA_SELF_FLUSH"
+    # J8-B slab-scan-gate off-switch (LOHALLOC_SLAB_SCAN_GATE=0): the
+    # per-class futile-scan skip (default on). Runtime behavior on every
+    # leg — forward to the whole triple.
+    [ -n "${LOHALLOC_SLAB_SCAN_GATE:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_SLAB_SCAN_GATE=$LOHALLOC_SLAB_SCAN_GATE"
     run_one "$lang" "$binary" "$workload" "lohalloc" "$preload" "training" "$tune_env"
     local model="$MODEL_DIR/model-${lang}-${workload}.lohalloc"
     echo "==> [train+export] $lang/$workload -> $model (train ops=$TRAIN_OPS)"

@@ -294,6 +294,30 @@ pub struct BumpArena {
     /// deployments never reset; GUI/replay instances that do already have
     /// reset as their reclaim mechanism).
     reclaim_enabled: bool,
+    /// J8-A diagnostics: recycle-scan outcomes (see [`RecycleStats`]). Plain
+    /// fields — only ever touched with the arena Mutex held.
+    stats: RecycleStats,
+}
+
+/// J8-A diagnostics: why the recycle scan succeeded or skipped candidates,
+/// and how often the arena grew instead. All updated under the arena Mutex
+/// (never on the per-allocation fast path). The rotation-breadth probe:
+/// `grows` with nonzero `skip_*` explains which quiescence condition was
+/// lagging when the arena mapped a fresh chunk instead of recycling.
+#[derive(Default, Clone, Copy)]
+pub struct RecycleStats {
+    /// Successful rewinds (a chunk was recycled).
+    pub recycles: usize,
+    /// Fresh chunks mapped because no candidate was recyclable.
+    pub grows: usize,
+    /// Candidates skipped because a TLS span pinned them (`spans != 0`).
+    pub skip_pinned: usize,
+    /// Candidates skipped because frees lagged (`freed != carved`).
+    pub skip_unfreed: usize,
+    /// Candidates skipped because nothing was ever carved (`carved == 0`
+    /// with a nonzero cursor — direct Mutex-path blocks before reclaim, or
+    /// a reclaim-off window).
+    pub skip_uncarved: usize,
 }
 
 unsafe impl Send for BumpArena {}
@@ -324,6 +348,7 @@ impl BumpArena {
             chunk_size,
             max_chunks,
             reclaim_enabled: false,
+            stats: RecycleStats::default(),
         })
     }
 
@@ -378,6 +403,7 @@ impl BumpArena {
                 let chunk = Chunk::new(self.chunk_size)?;
                 self.chunks.push(chunk);
                 self.current += 1;
+                self.stats.grows += 1;
             } else {
                 return None; // cap reached, nothing recyclable — falls through
             }
@@ -427,6 +453,13 @@ impl BumpArena {
             let freed = m.freed.load(Ordering::Relaxed);
             if pinned || carved == 0 || freed != carved {
                 m.alloc_side.intent.store(0, Ordering::Release);
+                if pinned {
+                    self.stats.skip_pinned += 1;
+                } else if carved == 0 {
+                    self.stats.skip_uncarved += 1;
+                } else {
+                    self.stats.skip_unfreed += 1;
+                }
                 continue;
             }
             // Quiescent: `spans == 0` under intent means `carved` is exact
@@ -441,9 +474,16 @@ impl BumpArena {
             );
             c.cursor.store(c.base as usize, Ordering::Release);
             m.alloc_side.intent.store(0, Ordering::Release);
+            self.stats.recycles += 1;
             return Some(i);
         }
         None
+    }
+
+    /// J8-A diagnostics snapshot (caller holds the arena Mutex via
+    /// `lib.rs`).
+    pub(crate) fn recycle_stats(&self) -> RecycleStats {
+        self.stats
     }
 
     /// Reset the arena: rewind every chunk's cursor and start bumping from
@@ -515,6 +555,19 @@ impl BumpArena {
         self.chunks
             .iter()
             .map(|c| (c.base as usize, &c.meta as *const ChunkMeta))
+    }
+
+    /// J8-A diagnostics: per-chunk `(used_bytes, carved, freed, spans)` —
+    /// see `Lohalloc::arena_chunk_debug`.
+    pub(crate) fn chunk_debug(&self) -> impl Iterator<Item = (usize, usize, usize, usize)> + '_ {
+        self.chunks.iter().map(|c| {
+            (
+                c.used(),
+                c.meta.alloc_side.carved.load(Ordering::Relaxed),
+                c.meta.freed.load(Ordering::Relaxed),
+                c.meta.alloc_side.spans.load(Ordering::Relaxed),
+            )
+        })
     }
 
     /// Whether every chunk is exactly [`CHUNK_BYTES`] (default-sized) —

@@ -167,6 +167,15 @@ pub(crate) struct HotTls {
     /// Per-class magazine fill counts (12 bytes — completes the first
     /// cache line together with the scalars above).
     pub(crate) mag_counts: [Cell<u8>; MAG_CLASSES],
+    /// J8-B futile-scan gate: per class, the `Lohalloc::slab_gain_epoch`
+    /// value observed when this thread's last central recycled scan (own
+    /// stripe + siblings) came back empty. `0` = never latched empty (the
+    /// shared epoch starts at 1, so 0 never spuriously matches). While the
+    /// live epoch still equals this, no push has landed in any central
+    /// recycled tier for the class, so the scan is provably still empty and
+    /// is skipped straight to carve — killing the sibling-`try_lock` storm
+    /// that carve-bound workloads paid (json-tree: 115k steps / 0 hits).
+    pub(crate) slab_scan_miss_epoch: [Cell<u32>; MAG_CLASSES],
     /// The private arena bump window (owner/epoch-validated).
     pub(crate) span: ArenaSpan,
     /// Magazine block stacks, one per slab class (~3 KiB).
@@ -189,6 +198,7 @@ thread_local! {
             seg_class: Cell::new(0),
             seg_owner: Cell::new(0),
             mag_counts: [const { Cell::new(0) }; MAG_CLASSES],
+            slab_scan_miss_epoch: [const { Cell::new(0) }; MAG_CLASSES],
             span: ArenaSpan {
                 owner: Cell::new(0),
                 epoch: Cell::new(0),

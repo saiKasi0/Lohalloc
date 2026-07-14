@@ -3,6 +3,7 @@ CLAUDE.md
 .vscode
 .claude
 target/
+target-ie/
 .github/copilot-instructions.md
 dist/
 node_modules

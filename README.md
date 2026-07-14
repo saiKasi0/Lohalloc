@@ -42,6 +42,87 @@ collapses it into the inference table and exports a portable
 
 ---
 
+## RESULTS & TRADEOFFS
+
+All numbers below are **certified on bare-metal AWS Graviton (`c9g.4xlarge`)**
+across C, C++, and Rust, against jemalloc / mimalloc / system malloc. The full
+story of how they were earned is in **[STORY.md](./STORY.md)**.
+
+### Lohalloc is a specialist, not a universal winner
+
+Certified standing across the full 62-row workload matrix — synthetic stress
+tests **plus** the realistic request-loop/json-tree/kv-store patterns
+(lohalloc-inference vs each competitor; **<1.0 = Lohalloc faster**):
+
+| vs           | wins | losses | geomean ratio | mean ratio | read                            |
+| ------------ | ---- | ------ | ------------- | ---------- | ------------------------------- |
+| system/glibc | 23   | 39     | **0.863**     | 1.123      | the typical row is now *faster* — wins win bigger than losses lose |
+| mimalloc     | 22   | 40     | 0.980         | 1.210      | dead even on the typical row    |
+| jemalloc     | 18   | 44     | 1.093         | 1.165      | the tough one                   |
+
+The wins and losses are not random — they trace the thesis exactly:
+
+- **Wins — heterogeneous workloads, where no single backend dominates.** Up to
+  **6× faster than mimalloc** on multi-threaded mixed churn, **2.3×** on
+  single-threaded adversarial mixes, plus buddy-range, large allocations, and
+  **cross-thread free — beating both jemalloc and mimalloc**. Those same mixed
+  workloads are also won on **memory**: **4–16× less peak RSS than system
+  malloc** (e.g. 7–15 MB vs ~125 MB). Routing has value precisely when there's
+  a routing decision worth making.
+- **Losses — uniform tiny-fixed churn (the `slab` rows).** ~1.5–1.8× vs system
+  malloc: C 1.76, C++ 1.51, Rust 1.45 — roughly twice glibc's data accesses per
+  op (routing preamble + free-registry lookup + per-thread magazine state),
+  though the Rust row's data references now *beat* glibc's (84.8 vs 90.7 per
+  op). The gap is the price of the decision machinery itself, and only applies
+  where there is no routing decision worth making.
+
+### Realistic application patterns
+
+Beyond the synthetic stress tests, the matrix includes **realistic application
+allocation patterns** — a per-request server loop, a JSON document tree, a
+key-value store — measured on both wall time *and* peak RSS (vs system malloc,
+**<1.0 = Lohalloc faster / leaner**):
+
+| realistic workload | wall vs system      | peak RSS vs system |
+| ------------------ | ------------------- | ------------------ |
+| `request-loop`     | 2.3–2.9× slower     | 2.3–2.5×           |
+| `json-tree`        | 0.9–1.4× (Rust **wins**) | ~parity (0.97–1.0) |
+| `kv-store`         | ~1.0–1.1× (near parity)  | 1.2–1.5×           |
+
+```
+request-loop, C  (lower is better)     wall time        peak RSS
+  system                                1.1 ms   ▏        1.8 MB  ▏
+  jemalloc                              1.6 ms   ▍        2.7 MB  ▎
+  lohalloc         ███████████          3.1 ms   ██       4.1 MB  ← 2.8× / 2.3×
+```
+
+These are small-object-heavy patterns — the `slab`-tax territory above, plus
+slab/buddy retention granularity. Production allocators still win them on speed;
+Lohalloc reaches parity on the steady-churn patterns (`json-tree`, `kv-store`)
+and competes on memory, winning it outright on the mixed workloads.
+
+### The tradeoffs, named
+
+| Tradeoff                        | Lohalloc chooses            | The price                                   |
+| ------------------------------- | --------------------------- | ------------------------------------------- |
+| Bump arena + chunk recycling    | **bump speed, renewable arena** (per-op cost = one thread-local counter bump) | chunk-granular reclaim: one long-lived block pins a whole 1 MiB chunk; recycling pauses after a forced `reset_arena` |
+| Per-call-site routing           | **mixed-size wins (up to 6×)** | ~2× data accesses on small-object churn — which most real workloads are |
+| Headerless slab                 | **cheap alloc** (no header) | a registry lookup on every `free`           |
+| Reload-safe striped magazine    | **multi-instance + hot-reload safe** | cross-thread frees need owning-stripe return |
+| Learning                        | **adapts per workload**     | requires a training phase; static allocators work immediately |
+
+### The verdict
+
+Lohalloc **proves the thesis and prices it honestly**: a learning allocator can
+beat production allocators where routing has real value — mixed sizes and
+lifetimes at stable call sites, where it wins by multiples on speed and by 4–16×
+on memory. But most real software is small-object-heavy, and there production
+allocators still win on speed. What remains between "research result" and
+"drop-in product" is the residual small-object gap and slab/buddy retention
+granularity — measured, and honestly priced.
+
+---
+
 ## QUICK START
 
 ### Prerequisites
@@ -203,10 +284,19 @@ REMOTE_SCRIPT=infra/remote_bisect.sh         bash infra/cloud_bench.sh c9g.4xlar
 REMOTE_SCRIPT=infra/remote_clamp_ablation.sh bash infra/cloud_bench.sh c9g.4xlarge  # Task A+B A/B: new defaults vs all-off
 ```
 
-Ablation knobs are runtime env vars (`crates/lohalloc-alloc/src/tune.rs`),
-forwarded by `bench/run_native.sh` into every lohalloc training leg, so all
-cells share one build and one provisioning. **Billable** (2 EC2 resources
-per run); requires AWS credentials + `~/.ssh/id_ed25519`.
+Ablation knobs are runtime env vars (`crates/lohalloc-alloc/src/tune.rs` +
+the feature kill switches `LOHALLOC_FAST_LANE`, `LOHALLOC_ARENA_RECLAIM`,
+`LOHALLOC_PIN_EXCLUDE_LEGACY`), forwarded by `bench/run_native.sh` into
+every lohalloc leg, so all cells share one build and one provisioning.
+**Billable** (2 EC2 resources per run); requires AWS credentials +
+`~/.ssh/id_ed25519`.
+
+For long A/B suites, the **decoupled flow** survives dropped local
+sessions: `infra/cloud_provision.sh <type>` (short: apply + rsync +
+detached launch) then `infra/cloud_collect.sh` (re-runnable bounded poll;
+pulls results + destroys). A terraform **self-terminate net**
+(`self_terminate_minutes`, default 180) guarantees no run can leak an
+instance even if everything local dies.
 
 ---
 
@@ -244,8 +334,11 @@ per run); requires AWS credentials + `~/.ssh/id_ed25519`.
   `lohalloc-alloc`.
 - The hot path (stack walk -> hash -> route) makes zero heap
   allocations and is `#![no_std]` compatible.
-- `GlobalAlloc::dealloc` receives only `Layout`, so a 48-byte `Header`
-  is prepended to every allocation to record the owning backend.
+- `GlobalAlloc::dealloc` receives only `Layout`, so ownership must be
+  recoverable from the pointer alone: hot-path allocations are served
+  **headerless** and resolved on free via lock-free registries
+  (slab-segment / buddy-region / arena-chunk mask probes); the remaining
+  paths prepend a 48-byte `Header` recording the owning backend.
 - A thread-local recursion guard breaks `Vec`-style re-entrancy
   deadlock when backends allocate through `std`.
 - Frame pointers are enforced at build time via
@@ -299,7 +392,7 @@ instances via Terraform.
 |       |-- hooks/            # useTelemetry (WS), useApi (REST)
 |       `-- types/            # TS types mirroring Rust telemetry schema
 |-- docker/                   # Dockerfile.linux-{x86,arm}, Dockerfile.bench (native harness image)
-|-- infra/                    # Terraform + cloud_bench.sh; remote_{bench,bisect,clamp_ablation}.sh
+|-- infra/                    # Terraform + cloud_{provision,collect,bench}.sh; remote_*.sh A/B suites
 |-- results/                  # make bench-all output: raw JSON + bench-report.{json,md} + graphs/
 |-- .github/workflows/        # bench.yml: manual-dispatch AWS x86+arm bench run
 ```
@@ -308,12 +401,14 @@ instances via Terraform.
 
 ## TESTING
 
-- **345+ Rust tests** across the workspace, including `lohalloc-core`,
-  `lohalloc-alloc` (182 lib tests incl. observer-hook + reward-batching
-  tests), `lohalloc-server` (unit + `replay_tests` + `server_tests`),
-  `lohalloc-bench` (forced-routing, tune e2e, aggregate/Mann-Whitney U,
-  decision-plane `#[ignore]`d timing tests), and `lohalloc-demo`;
-  `lohalloc-example` is a smoke binary with no unit tests.
+- **430+ Rust tests** across the workspace, including `lohalloc-core`,
+  `lohalloc-alloc` (263 lib tests incl. observer-hook, fast-lane,
+  arena-recycling and MT-race canary tests — the lib suite is
+  **ThreadSanitizer-clean end to end**), `lohalloc-server` (unit +
+  `replay_tests` + `server_tests`), `lohalloc-bench` (forced-routing,
+  tune e2e, aggregate/Mann-Whitney U, decision-plane `#[ignore]`d timing
+  tests), and `lohalloc-demo`; `lohalloc-example` is a smoke binary with
+  no unit tests.
 - **9 shim C tests** via `make -C shim test` (ring buffer, JSON
   encoding, record size pin, emit-no-crash).
 - **144 GUI tests** under `gui/src/{components,hooks}/__tests__/` via
@@ -335,6 +430,9 @@ target/debug/deps/lohalloc_alloc-<hash> <test_name> --nocapture
 
 ## DOCUMENTATION
 
+- **[STORY.md](./STORY.md)** -- the narrative: how Lohalloc was built as a
+  sequence of measured tradeoffs, what worked, what didn't, and why. Start here
+  for the "why," then read `COPILOT.md` for the "what."
 - **[COPILOT.md](./COPILOT.md)** -- full project state, current
   architecture, known issues, and testing requirements. Treated as
   ground truth by future AI sessions.

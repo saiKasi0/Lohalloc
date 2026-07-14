@@ -253,6 +253,15 @@ fn run_lohalloc(workload: &str, ops: usize) -> bool {
             ga::global_lohalloc_route_count(lohalloc_core::Backend::Arena),
             ga::global_lohalloc_fallthroughs(),
         );
+        // J8-B firing-rate probe: fast-lane engagement (0 without
+        // route-metrics). hits/served-slab ≈ the magazine hit rate; the
+        // complement is the slow-path (refill/carve) fraction a carve lane
+        // could target.
+        eprintln!(
+            "native_workload: fast_lane={} fast_lane_free={}",
+            ga::global_lohalloc_fast_lane_counts().0,
+            ga::global_lohalloc_fast_lane_counts().1,
+        );
         // Touch-cost diagnostic (J4): did the header-free fast path latch on?
         // It only does if the backend was untouched at model-load time — and
         // as the global allocator, process startup may have touched it first.
@@ -262,6 +271,28 @@ fn run_lohalloc(workload: &str, ops: usize) -> bool {
         // (LOHALLOC_STRIPES override visible here) + the sibling-scan
         // mechanism counters (0 without route-metrics). steps/refill near
         // stripe_count-1 with hits≈0 = pure scan waste.
+        // RSS-attribution view (J8 retention diagnostics): mapped footprint
+        // still held by each backend at exit.
+        let (slab_regions, buddy_regions, arena_used, arena_cap) =
+            ga::global_lohalloc_backend_counters();
+        eprintln!(
+            "native_workload: slab_regions={slab_regions} buddy_regions={buddy_regions} \
+             arena_used={arena_used} arena_capacity={arena_cap}"
+        );
+        let (recycles, grows, skip_pinned, skip_unfreed, skip_uncarved) =
+            ga::global_lohalloc_arena_recycle_stats();
+        eprintln!(
+            "native_workload: arena_recycles={recycles} arena_grows={grows} \
+             skip_pinned={skip_pinned} skip_unfreed={skip_unfreed} skip_uncarved={skip_uncarved}"
+        );
+        for (i, (used, carved, freed, spans)) in
+            ga::global_lohalloc_arena_chunk_debug().iter().enumerate()
+        {
+            eprintln!(
+                "native_workload: arena_chunk[{i}] used={used} carved={carved} \
+                 freed={freed} spans={spans}"
+            );
+        }
         let (refills, steps, hits) = ga::global_lohalloc_slab_refill_counts();
         eprintln!(
             "native_workload: stripes={} demote_fraction={} slab_central_refills={refills} \

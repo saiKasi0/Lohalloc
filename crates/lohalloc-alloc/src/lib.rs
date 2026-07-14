@@ -55,7 +55,9 @@ pub mod tune;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::Cell;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use crossbeam_utils::CachePadded;
 use lohalloc_core::{align_up, BUDDY_MAX, MIN_ALIGN, SLAB_MAX};
 use std::sync::Mutex;
@@ -453,6 +455,25 @@ pub struct Lohalloc {
     /// `arena_alloc_fast`'s lock-free path — null until the arena is first
     /// initialized. See `ArenaChunkDescriptor`'s doc.
     arena_chunk: CachePadded<AtomicPtr<ArenaChunkDescriptor>>,
+    /// J8-B: per-class central recycled-gain epoch — bumped (Relaxed) after
+    /// any push into a central slab free tier (magazine overflow flushes,
+    /// direct central deallocs). `slab_batch_recycled_first` records the
+    /// epoch of a refill whose full recycled scan (own stripe + siblings)
+    /// found nothing, in TLS; while the epoch is unchanged the scan is
+    /// provably still empty (tiers only gain via pushes, and every push
+    /// bumps this) and is skipped — the fix for the futile-scan tax on
+    /// carve-bound workloads (measured: json-tree burned 115k sibling
+    /// try_lock steps with 0 hits; kv-store 22k/0). A push that races a
+    /// scan can at worst make the scanner miss a just-arrived block — a
+    /// missed *steal*, which was always best-effort (`try_lock`, skipping
+    /// contended stripes). Starts at 1 so a fresh thread's zeroed TLS slot
+    /// never spuriously matches. Bumps are rare (per magazine *flush*, not
+    /// per free). **Each class is padded onto its own line** so a
+    /// multi-class MT workload (mt-mixed, adv-mixed) never false-shares one
+    /// class's flush RMW against another's — the J4-D shared-line rule.
+    /// (Same-class true sharing on one hot class is inherent to any
+    /// cross-stripe re-arm signal; that is the mt-xfree cert watch-cost.)
+    slab_gain_epoch: [CachePadded<AtomicU32>; lohalloc_core::SLAB_SIZE_CLASSES.len()],
 }
 
 /// Published snapshot of the arena chunk currently being bumped — see
@@ -1152,6 +1173,47 @@ fn arena_reclaim_enabled() -> bool {
     !off
 }
 
+/// Latched `LOHALLOC_ARENA_SELF_FLUSH` state (0 = unread, 1 = on, 2 = off).
+static ARENA_SELF_FLUSH_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// J8-A: whether an arena slow-path visit first clears the visiting
+/// thread's own quiescence blockers (pending free batch + stale open span)
+/// so the recycle scan sees honest counters (default **on**;
+/// `LOHALLOC_ARENA_SELF_FLUSH=0` disables — the A/B/revert knob). Read on
+/// the (cold) arena slow path only, never per-op.
+#[inline]
+fn arena_self_flush_enabled() -> bool {
+    let s = ARENA_SELF_FLUSH_STATE.load(Ordering::Relaxed);
+    if s != 0 {
+        return s == 1;
+    }
+    // SAFETY: same argument as `arena_reclaim_enabled` above.
+    let p = unsafe { libc::getenv(b"LOHALLOC_ARENA_SELF_FLUSH\0".as_ptr().cast()) };
+    let off = !p.is_null() && unsafe { *p == b'0' as libc::c_char && *p.offset(1) == 0 };
+    ARENA_SELF_FLUSH_STATE.store(if off { 2 } else { 1 }, Ordering::Relaxed);
+    !off
+}
+
+/// Latched `LOHALLOC_SLAB_SCAN_GATE` state (0 = unread, 1 = on, 2 = off).
+static SLAB_SCAN_GATE_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// J8-B: whether the central recycled-scan gate is armed (default **on**;
+/// `LOHALLOC_SLAB_SCAN_GATE=0` reverts to always scanning — the pre-J8-B
+/// behavior, the A/B revert knob). One relaxed load per central refill
+/// (already a cold, Mutex-bound path), never per allocation.
+#[inline]
+fn slab_scan_gate_enabled() -> bool {
+    let s = SLAB_SCAN_GATE_STATE.load(Ordering::Relaxed);
+    if s != 0 {
+        return s == 1;
+    }
+    // SAFETY: same argument as `arena_reclaim_enabled` above.
+    let p = unsafe { libc::getenv(b"LOHALLOC_SLAB_SCAN_GATE\0".as_ptr().cast()) };
+    let off = !p.is_null() && unsafe { *p == b'0' as libc::c_char && *p.offset(1) == 0 };
+    SLAB_SCAN_GATE_STATE.store(if off { 2 } else { 1 }, Ordering::Relaxed);
+    !off
+}
+
 impl Default for Lohalloc {
     fn default() -> Self {
         Self::new()
@@ -1316,6 +1378,21 @@ impl Lohalloc {
             arena_chunks: registry::ArenaChunkRegistry::new(),
             arena_epoch: CachePadded::new(AtomicU64::new(0)),
             arena_chunk: CachePadded::new(AtomicPtr::new(core::ptr::null_mut())),
+            slab_gain_epoch: [const { CachePadded::new(AtomicU32::new(1)) };
+                lohalloc_core::SLAB_SIZE_CLASSES.len()],
+        }
+    }
+
+    /// J8-B: record that `class`'s central recycled tiers just gained
+    /// blocks — re-arms any thread whose refill scan latched "empty" for
+    /// this class. Call *after* the push is visible (outside the stripe
+    /// lock is fine; see `slab_gain_epoch`'s doc for the race budget).
+    /// No-op when the gate is disabled, so `LOHALLOC_SLAB_SCAN_GATE=0` is a
+    /// true pre-J8-B baseline (zero added atomics on the free path).
+    #[inline]
+    fn note_slab_central_gain(&self, class: usize) {
+        if slab_scan_gate_enabled() {
+            self.slab_gain_epoch[class].fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1899,6 +1976,9 @@ impl Lohalloc {
                     if let Ok(mut slab) = self.slab[thread_stripe()].lock() {
                         unsafe { slab.dealloc_class(block, class) };
                     }
+                    // J8-B: re-arm the central-scan gate — this block is now
+                    // in a recycled tier a refill scan can serve.
+                    self.note_slab_central_gain(class);
                 } else {
                     let owner = self.magazine_owner();
                     if !magazine::push(owner, class, block) {
@@ -1913,6 +1993,9 @@ impl Lohalloc {
                                 slab.dealloc_class(block, class);
                             }
                         }
+                        // J8-B: the flushed batch just refilled the central
+                        // recycled tiers — re-arm any thread's scan gate.
+                        self.note_slab_central_gain(class);
                     }
                 }
             }
@@ -2606,30 +2689,48 @@ impl Lohalloc {
         headerless: bool,
     ) -> usize {
         let stripe = thread_stripe();
-        {
-            let Ok(mut slab) = self.slab[stripe].lock() else {
-                return 0;
-            };
-            let n = slab.alloc_batch_recycled(class, buf, headerless);
-            if n > 0 {
-                record_slab_central_refill(0, false);
-                return n;
-            }
-        }
-        let mask = stripe_mask();
-        let mut steps: u64 = 0;
-        for k in 1..=mask {
-            steps += 1;
-            let s = (stripe + k) & mask;
-            if let Ok(mut slab) = self.slab[s].try_lock() {
+        // J8-B: skip the whole central recycled scan (own stripe + siblings)
+        // while no push has landed in any central recycled tier for `class`
+        // since this thread last scanned it empty — the shared per-class
+        // gain epoch is unchanged. Reading it *before* the scan closes the
+        // race: any concurrent push bumps the epoch past what we latch, so
+        // the next call re-scans. `0` in the TLS slot never matches (the
+        // epoch starts at 1), so a thread always scans at least once.
+        let gain_epoch = self.slab_gain_epoch[class].load(Ordering::Relaxed);
+        let scan_gated = slab_scan_gate_enabled()
+            && hot::with(|h| h.slab_scan_miss_epoch[class].get()) == gain_epoch;
+        if !scan_gated {
+            {
+                let Ok(mut slab) = self.slab[stripe].lock() else {
+                    return 0;
+                };
                 let n = slab.alloc_batch_recycled(class, buf, headerless);
                 if n > 0 {
-                    record_slab_central_refill(steps, true);
+                    record_slab_central_refill(0, false);
                     return n;
                 }
             }
+            let mask = stripe_mask();
+            let mut steps: u64 = 0;
+            for k in 1..=mask {
+                steps += 1;
+                let s = (stripe + k) & mask;
+                if let Ok(mut slab) = self.slab[s].try_lock() {
+                    let n = slab.alloc_batch_recycled(class, buf, headerless);
+                    if n > 0 {
+                        record_slab_central_refill(steps, true);
+                        return n;
+                    }
+                }
+            }
+            record_slab_central_refill(steps, false);
+            // Latch: every central recycled tier was empty at `gain_epoch`.
+            // Future refills for this class skip the scan until a push bumps
+            // the epoch (see `note_slab_central_gain`).
+            hot::with(|h| h.slab_scan_miss_epoch[class].set(gain_epoch));
+        } else {
+            record_slab_central_refill(0, false);
         }
-        record_slab_central_refill(steps, false);
         let Ok(mut slab) = self.slab[stripe].lock() else {
             return 0;
         };
@@ -2717,6 +2818,9 @@ impl Lohalloc {
             if let Ok(mut slab) = self.slab[thread_stripe()].lock() {
                 unsafe { slab.dealloc_batch_headerless(class, &buf[..total]) };
             }
+            // J8-B: re-arm the central-scan gate AFTER the push is visible
+            // (monotone epoch bump; see `slab_gain_epoch`'s race argument).
+            self.note_slab_central_gain(class);
             return;
         }
         let fallback = thread_stripe();
@@ -2740,6 +2844,8 @@ impl Lohalloc {
             if let Ok(mut slab) = self.slab[first].lock() {
                 unsafe { slab.dealloc_batch_headerless(class, &buf[..total]) };
             }
+            // J8-B: re-arm the central-scan gate (see above).
+            self.note_slab_central_gain(class);
             return;
         }
         let mut grouped = [core::ptr::null_mut::<u8>(); 17];
@@ -2758,6 +2864,9 @@ impl Lohalloc {
                 unsafe { slab.dealloc_batch_headerless(class, &grouped[..g]) };
             }
         }
+        // J8-B: re-arm the central-scan gate after the cross-stripe flush —
+        // this is exactly the mt-xfree path a producer thread must re-scan.
+        self.note_slab_central_gain(class);
     }
 
     /// The stripe that carved `ptr`'s segment (recorded in
@@ -3020,6 +3129,53 @@ impl Lohalloc {
         {
             self.arena_exhausted.store(false, Ordering::Relaxed);
         }
+    }
+
+    /// J8-A: clear this thread's own quiescence blockers before an arena
+    /// slow-path visit — flush the pending free batch and retire the open
+    /// TLS span (flush its block count, release its pin, and invalidate it
+    /// so the next fast-path alloc re-carves).
+    ///
+    /// Why: the J8-A rotation probe showed the arena growing (mapping fresh
+    /// chunks) precisely when every recycle candidate was blocked by
+    /// `freed != carved` (this thread's unflushed free batch) or
+    /// `spans != 0` (this thread's own stale open span pinning an earlier
+    /// chunk) — the allocating thread was blocking its own recycling. Both
+    /// are same-thread TLS operations, cost a few relaxed atomics, and run
+    /// only on slow-path visits (chunk advances), never per allocation.
+    /// Other threads' pins/batches remain (their next slow-path visit
+    /// clears them); the scan stays conservatively correct either way.
+    fn arena_clear_own_blockers(&self) {
+        if !self.arena_reclaim_active() || !arena_self_flush_enabled() {
+            return;
+        }
+        let owner = self.magazine_owner();
+        hot::with(|h| {
+            self.arena_flush_free_batch(h);
+            let span = &h.span;
+            let meta = span.meta.get();
+            if meta != 0 && span.owner.get() == owner {
+                // SAFETY: owner match ⇒ this instance carved the span, so
+                // its ChunkMeta is alive and address-stable (same argument
+                // as the retire in `arena_alloc_fast`).
+                let m = unsafe { &*(meta as *const arena::ChunkMeta) };
+                m.alloc_side
+                    .carved
+                    .fetch_add(span.blocks.get(), Ordering::Relaxed);
+                m.alloc_side.spans.fetch_sub(1, Ordering::Release);
+            }
+            // Invalidate unconditionally (a foreign span is dead weight for
+            // this instance anyway): zero meta/blocks so the next carve's
+            // retire can't double-flush, and collapse the window so the
+            // next fast-path alloc misses and re-carves. Abandons at most
+            // `ARENA_SPAN_BYTES` of remnant — the chunk it lived in is
+            // typically the full one that sent us to the slow path.
+            span.meta.set(0);
+            span.blocks.set(0);
+            span.end.set(0);
+            span.cursor.set(1); // cursor > end == 0 ⇒ every window check misses
+                                // (not usize::MAX: `align_up` would overflow)
+        });
     }
 
     /// (Re)publish `arena`'s current chunk as the fast path's descriptor.
@@ -3395,6 +3551,12 @@ impl Lohalloc {
                 // lock, then (re)publish whichever chunk is now current —
                 // covers first-time init and every chunk advance, which is
                 // the only way `arena_chunk` can go stale.
+                //
+                // J8-A: first clear this thread's own quiescence blockers
+                // (pending free batch + stale open span) so the recycle
+                // scan below sees honest counters — done before taking the
+                // Mutex to keep hold time minimal.
+                self.arena_clear_own_blockers();
                 let Ok(mut arena_guard) = self.arena.lock() else {
                     return None;
                 };
@@ -4420,6 +4582,29 @@ impl Lohalloc {
         let ptr = self.route_alloc_with_hash(size, align, pad, total, hash);
         hot::in_alloc_set(depth);
         ptr
+    }
+
+    /// J8-A diagnostics: per-chunk `(used_bytes, carved, freed, spans)`
+    /// snapshot — identifies chunks whose quiescence is permanently blocked
+    /// (e.g. one long-lived block keeping `freed < carved` forever). Not on
+    /// any hot path; allocates a Vec (callers are debug/exit reporting).
+    pub fn arena_chunk_debug(&self) -> Vec<(usize, usize, usize, usize)> {
+        self.arena
+            .lock()
+            .ok()
+            .and_then(|a| a.as_ref().map(|arena| arena.chunk_debug().collect()))
+            .unwrap_or_default()
+    }
+
+    /// J8-A diagnostics: the arena's recycle-scan outcome counters
+    /// (recycles, grows, per-reason candidate skips). Zeros before the
+    /// arena exists or if its Mutex is poisoned.
+    pub fn arena_recycle_stats(&self) -> arena::RecycleStats {
+        self.arena
+            .lock()
+            .ok()
+            .and_then(|a| a.as_ref().map(|arena| arena.recycle_stats()))
+            .unwrap_or_default()
     }
 
     /// Snapshot of per-backend live-region/usage counters, for benchmarks
@@ -5996,6 +6181,63 @@ mod integration_tests {
     }
 
     #[test]
+    fn slab_scan_gate_rearms_so_freed_blocks_are_recycled() {
+        // J8-B correctness: the futile-scan gate must never make the central
+        // recycled tier invisible. The failure mode it guards against is a
+        // thread latching "empty" (scan found nothing → gate armed) and then
+        // skipping the scan forever even after blocks are freed back — which
+        // would carve fresh memory instead of reusing, defeating the
+        // mt-xfree recycled-first fix. Single-threaded proxy: run a wave big
+        // enough to overflow the magazine and force central carve + central
+        // frees (arming the gate on the miss, then re-arming on the frees),
+        // free it all, then run a second identical wave. If the gate
+        // re-arms, the second wave reuses the freed blocks and maps no new
+        // regions; if it stayed stuck, region_count would climb.
+        let hash = 0x38B0_0001u64;
+        let size = 128usize;
+        let alloc = Lohalloc::new();
+        assert!(alloc.load(&slab_only_model(hash, size)));
+        let layout = Layout::from_size_align(size, 16).unwrap();
+
+        // Wave 1: 512 live blocks of one class — well past the magazine cap,
+        // so many land in (and free back to) the central recycled tiers,
+        // exercising both the empty-scan arm and the free-side re-arm.
+        let mut wave = Vec::with_capacity(512);
+        for _ in 0..512 {
+            let p = unsafe { alloc.alloc_with_hash(layout, hash) };
+            assert!(!p.is_null());
+            wave.push(p);
+        }
+        for p in wave.drain(..) {
+            unsafe { alloc.dealloc_with_hash(p, layout) };
+        }
+        let regions_after_wave1 = alloc.backend_counters().slab_region_count;
+        assert!(
+            regions_after_wave1 > 0,
+            "test precondition: wave 1 must have carved central regions \
+             (otherwise the gate was never exercised)"
+        );
+
+        // Wave 2: identical. Every block should come from the recycled tier
+        // the frees just refilled — the gate must have re-armed, so no new
+        // region is mapped.
+        for _ in 0..512 {
+            let p = unsafe { alloc.alloc_with_hash(layout, hash) };
+            assert!(!p.is_null());
+            wave.push(p);
+        }
+        let regions_after_wave2 = alloc.backend_counters().slab_region_count;
+        for p in wave.drain(..) {
+            unsafe { alloc.dealloc_with_hash(p, layout) };
+        }
+        assert_eq!(
+            regions_after_wave2, regions_after_wave1,
+            "gate failed to re-arm: wave 2 carved fresh regions ({regions_after_wave1} \
+             -> {regions_after_wave2}) instead of reusing the freed blocks"
+        );
+    }
+
+    #[test]
     fn headerless_registry_saturation_falls_back_safely() {
         // Regression test: force enough *concurrently live* blocks of the
         // largest Slab class (16384B => SEGMENT_SIZE/stride = 4 blocks per
@@ -6445,6 +6687,51 @@ mod integration_tests {
         assert!(
             counters.arena_capacity <= 8 << 20,
             "mapped chunks must stay at the live high-water, got {} bytes",
+            counters.arena_capacity
+        );
+    }
+
+    #[test]
+    fn arena_self_flush_keeps_rotation_tight() {
+        // J8-A: the same burst churn as `arena_recycles_after_burst_free_
+        // without_reset`, but asserting the *rotation breadth*: with the
+        // slow path clearing the visiting thread's own quiescence blockers
+        // (pending free batch + stale open span), the recycle scan must
+        // find a quiescent chunk at almost every advance — the arena
+        // ping-pongs over a small warm set instead of growing. The J8-A
+        // probe measured the pre-fix behavior at 5 mapped chunks on
+        // request-loop (skip_pinned/skip_unfreed blocking every candidate
+        // at grow time); post-fix it holds at <= 4.
+        let (alloc, layout) = forced_arena_instance(0xA8F1_0001, 4096, true);
+        for burst in 0..600 {
+            let mut ptrs = Vec::with_capacity(64);
+            for i in 0..64 {
+                let p = unsafe { alloc.alloc_with_hash(layout, 0xA8F1_0001) };
+                assert!(!p.is_null(), "burst {burst} alloc {i} failed");
+                ptrs.push(p);
+            }
+            for p in ptrs {
+                unsafe { alloc.dealloc_with_hash(p, layout) };
+            }
+        }
+        let stats = alloc.arena_recycle_stats();
+        assert!(
+            stats.recycles > 50,
+            "burst churn must be served by recycling (got {} recycles)",
+            stats.recycles
+        );
+        assert!(
+            stats.grows <= 3,
+            "self-flush must keep growth to the warm-set floor, got {} grows \
+             ({} pinned / {} unfreed skips)",
+            stats.grows,
+            stats.skip_pinned,
+            stats.skip_unfreed
+        );
+        let counters = alloc.backend_counters();
+        assert!(
+            counters.arena_capacity <= 4 << 20,
+            "rotation must stay within a 4-chunk warm set, got {} bytes",
             counters.arena_capacity
         );
     }
