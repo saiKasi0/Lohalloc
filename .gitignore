@@ -1,26 +1,43 @@
+# Documentation and IDE
 COPILOT.md
 CLAUDE.md
 .vscode
 .claude
+.github/copilot-instructions.md
+
+# Build and output
 target/
 target-ie/
-.github/copilot-instructions.md
 dist/
-node_modules
-*.png
+
+# Dependencies
+node_modules/
+
+# Test and benchmark results
 test-results
 bench/native/build/
 bench/graphs/.venv/
 __pycache__/
 results/
-.terraform
+crash.log
+
+# Graphics
+*.png
+
+# Terraform and cloud infrastructure
+.terraform/
 *.tfstate
 *.tfstate.*
 *.tfvars
-crash.log
-# Local AWS creds for infra/cloud_bench.sh — never commit. .env.example is the
-# tracked template (negated so it stays in the repo).
+
+# Environment and credentials
+# Local AWS creds for infra/cloud_bench.sh — never commit.
+# .env.example is the tracked template (negated so it stays in the repo).
 .env
 !.env.example
-# Transient state for the decoupled cloud_provision/cloud_collect flow
+
+# Transient cloud provisioning state
 .cloud_run.env
+
+# OS-specific files
+.DS_Store
