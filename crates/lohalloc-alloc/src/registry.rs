@@ -306,28 +306,35 @@ impl RegionRegistry {
     }
 }
 
-/// Fixed slot count for the **arena chunk** set: an arena maps at most
-/// `arena::MAX_CHUNKS` (32) chunks per instance, so 256 slots keep the
-/// load factor at 12.5% — a `PROBE_MAX`-length cluster is statistically
-/// impossible, i.e. `insert` cannot fail in practice (the `bool` return
-/// exists for the same defensive fallthrough discipline as the other
-/// tables). 2 KiB embedded.
-const ARENA_CHUNK_CAPACITY: usize = 256;
+/// Fixed slot count for the **arena chunk** table: a production arena maps
+/// up to `arena::MAX_CHUNKS_CAP` (128, CPU-scaled) chunks per instance, so
+/// 512 slots keep the load factor ≤25% — a `PROBE_MAX`-length cluster is
+/// statistically impossible, i.e. `insert` cannot fail in practice (the
+/// `bool` return exists for the same defensive fallthrough discipline as
+/// the other tables). 8 KiB embedded (keys + vals).
+const ARENA_CHUNK_CAPACITY: usize = 512;
 
-/// Insert-only, lock-free **arena chunk** membership set (Ladder 5
-/// headerless Arena).
+/// Insert-only, lock-free **arena chunk** table (Ladder 5 headerless Arena;
+/// J7 gave it a payload).
 ///
-/// Key-only — a hit answers the single question the dealloc side asks:
-/// "is this pointer inside a bump-arena chunk?" (in which case `free` is a
-/// no-op and no header may be read: headerless arena blocks have none, and
-/// `ptr - HEADER_SIZE` may be a neighboring live block's tail). Chunks are
+/// Key = chunk base; payload = the address of the chunk's [`ChunkMeta`]
+/// (`crate::arena::ChunkMeta`), stored as a `usize`. A hit answers the two
+/// questions the dealloc side asks: "is this pointer inside a bump-arena
+/// chunk?" (free is a no-op and no header may be read: headerless arena
+/// blocks have none, and `ptr - HEADER_SIZE` may be a neighboring live
+/// block's tail) and — J7 — "where is that chunk's quiescence accounting?"
+/// (so `arena_note_free` can flush its freed-block batch). Chunks are
 /// `arena::CHUNK_BYTES`-aligned and -sized, so `ptr & !(CHUNK_BYTES - 1)`
 /// recovers the chunk base — the same mask-probe design as the other two
-/// tables, same publish discipline (key CAS is the only word; there is no
-/// payload to order against), same single-writer context (inserted under
-/// `Lohalloc`'s `arena` Mutex on the chunk-creating slow path, before the
-/// chunk is published to the lock-free fast path or any block from it is
-/// returned).
+/// tables, the same payload-before-publish discipline as `SegmentRegistry`
+/// (val stored Release-before-key-CAS so a key hit always reads a valid
+/// payload), same single-writer context (inserted under `Lohalloc`'s
+/// `arena` Mutex on the chunk-creating slow path, before the chunk is
+/// published to the lock-free fast path or any block from it is returned).
+/// Meta addresses are stable for the instance's lifetime (the arena's
+/// chunk Vec never reallocates) and chunks are never unmapped short of
+/// instance drop, so entries never dangle in the single-instance
+/// production deployment.
 ///
 /// No false positives across backends: mappings are disjoint, so a
 /// slab/buddy/System pointer masked to `CHUNK_BYTES` can only equal a
@@ -335,6 +342,9 @@ const ARENA_CHUNK_CAPACITY: usize = 256;
 pub struct ArenaChunkRegistry {
     /// `0` = empty; chunk bases are nonzero and `CHUNK_BYTES`-aligned.
     keys: [AtomicUsize; ARENA_CHUNK_CAPACITY],
+    /// The chunk's `ChunkMeta` address (valid whenever the key is set —
+    /// payload-before-publish).
+    vals: [AtomicUsize; ARENA_CHUNK_CAPACITY],
 }
 
 impl Default for ArenaChunkRegistry {
@@ -347,15 +357,16 @@ impl ArenaChunkRegistry {
     pub const fn new() -> Self {
         Self {
             keys: [EMPTY_KEY; ARENA_CHUNK_CAPACITY],
+            vals: [EMPTY_KEY; ARENA_CHUNK_CAPACITY],
         }
     }
 
-    /// Register `base` (a fresh chunk's `CHUNK_BYTES`-aligned start).
-    /// Returns `false` only on a probe-bound hit (see
-    /// [`ARENA_CHUNK_CAPACITY`] — unreachable in practice); the caller
+    /// Register `base` (a fresh chunk's `CHUNK_BYTES`-aligned start) with
+    /// its `ChunkMeta` address. Returns `false` only on a probe-bound hit
+    /// (see [`ARENA_CHUNK_CAPACITY`] — unreachable in practice); the caller
     /// must then not serve headerless blocks from the chunk.
     #[must_use]
-    pub fn insert(&self, base: usize) -> bool {
+    pub fn insert(&self, base: usize, meta: usize) -> bool {
         debug_assert!(base != 0, "chunk base must be nonzero");
         let mut idx = SegmentRegistry::slot_for(base, ARENA_CHUNK_CAPACITY);
         for _ in 0..PROBE_MAX {
@@ -364,6 +375,10 @@ impl ArenaChunkRegistry {
                 return true;
             }
             if existing == 0 {
+                // Payload before publish: the val must be visible to any
+                // reader that wins the key load (same discipline as
+                // `SegmentRegistry::insert`).
+                self.vals[idx].store(meta, Ordering::Release);
                 match self.keys[idx].compare_exchange(0, base, Ordering::Release, Ordering::Relaxed)
                 {
                     Ok(_) => return true,
@@ -379,18 +394,25 @@ impl ArenaChunkRegistry {
     /// Is `base` (pre-masked by the caller) a registered arena chunk?
     #[inline]
     pub fn contains(&self, base: usize) -> bool {
+        self.lookup(base).is_some()
+    }
+
+    /// The `ChunkMeta` address registered for `base` (pre-masked), or
+    /// `None` for a pointer in no registered chunk.
+    #[inline]
+    pub fn lookup(&self, base: usize) -> Option<usize> {
         let mut idx = SegmentRegistry::slot_for(base, ARENA_CHUNK_CAPACITY);
         for _ in 0..PROBE_MAX {
             let k = self.keys[idx].load(Ordering::Acquire);
             if k == 0 {
-                return false;
+                return None;
             }
             if k == base {
-                return true;
+                return Some(self.vals[idx].load(Ordering::Acquire));
             }
             idx = (idx + 1) & (ARENA_CHUNK_CAPACITY - 1);
         }
-        false
+        None
     }
 }
 

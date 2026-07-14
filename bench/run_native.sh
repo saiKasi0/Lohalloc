@@ -558,6 +558,11 @@ run_lohalloc_triple() {
     # so it must reach the train+export leg (it does — tune_env reaches all
     # three legs of the triple).
     [ -n "${LOHALLOC_PIN_EXCLUDE_LEGACY:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_PIN_EXCLUDE_LEGACY=$LOHALLOC_PIN_EXCLUDE_LEGACY"
+    # J7 arena-reclaim off-switch (LOHALLOC_ARENA_RECLAIM=0): chunk
+    # recycling + the freeze-demotion lift (default on). Runtime behavior on
+    # every leg (training accounting, freeze predicate, inference recycle),
+    # so forward it to the whole triple.
+    [ -n "${LOHALLOC_ARENA_RECLAIM:-}" ] && tune_env="$tune_env${tune_env:+ }LOHALLOC_ARENA_RECLAIM=$LOHALLOC_ARENA_RECLAIM"
     run_one "$lang" "$binary" "$workload" "lohalloc" "$preload" "training" "$tune_env"
     local model="$MODEL_DIR/model-${lang}-${workload}.lohalloc"
     echo "==> [train+export] $lang/$workload -> $model (train ops=$TRAIN_OPS)"

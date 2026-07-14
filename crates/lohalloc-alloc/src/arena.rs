@@ -38,10 +38,29 @@
 //! topological clusters identified by the stack hash tend to have bursty,
 //! correlated lifetimes (e.g. all allocations within a single request
 //! handler). Dealloc for Arena-tagged blocks stays a no-op in `lib.rs`.
+//!
+//! # J7: per-chunk quiescence recycling (reset-free reclaim)
+//!
+//! Under LD_PRELOAD nothing ever calls `reset`, which made the arena a
+//! one-shot budget: the certified request-loop failure (4.3–5.5× slower +
+//! 7.6× RSS) was this arena filling, latching exhausted, and falling
+//! through per-op forever. J7 gives each chunk cumulative accounting
+//! ([`ChunkMeta`]) so a chunk whose every carved block has been freed can be
+//! **rewound and reused** without a reset — the arena becomes renewable and
+//! mapped chunks cap at the live high-water instead of the byte cap.
+//!
+//! The accounting protocol lives across this file and `lib.rs` (span carve /
+//! retire / `arena_note_free`); the J4-D lesson it is built around: **no
+//! per-allocation atomic RMW** (per-op accounting is a TLS `Cell` bump,
+//! flushed per span), no shared global counter line (everything is
+//! per-chunk, cache-padded), and the recycle scan runs only under the arena
+//! Mutex on the chunk-advance slow path. See `ChunkMeta`'s doc for the
+//! rewind-safety (Dekker) argument.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::system;
+use crossbeam_utils::CachePadded;
 use lohalloc_core::{align_up, round_up_pow2, MIN_ALIGN};
 
 /// Default per-chunk size: 1 MiB. Large enough for most clusters, small
@@ -84,6 +103,67 @@ fn scaled_max_chunks() -> usize {
     (BASE_MAX_CHUNKS + PER_CPU_CHUNKS * ncpus).clamp(BASE_MAX_CHUNKS, MAX_CHUNKS_CAP)
 }
 
+/// J7 alloc-side accounting for one chunk: the recycle-intent flag, the
+/// open-span pin count, and the cumulative carved-block count. Grouped on
+/// one padded line — all three are touched together by the (already
+/// amortized) span carve/retire and the Mutex-held recycle scan, and none
+/// is touched on the per-allocation fast path.
+pub(crate) struct ChunkAllocMeta {
+    /// Recycle intent (0 = none). Set (SeqCst) by the Mutex-held recycle
+    /// scan before it examines `spans`; a span carve that observes it backs
+    /// off to the Mutex slow path. One half of the Dekker pair below.
+    pub(crate) intent: AtomicUsize,
+    /// Open-span pin count: +1 (SeqCst) when a TLS span is carved from this
+    /// chunk, −1 (Release) when that span retires (after flushing its block
+    /// count into `carved`). The other half of the Dekker pair.
+    pub(crate) spans: AtomicUsize,
+    /// Cumulative blocks ever carved from this chunk — flushed per span at
+    /// retire, or +1 directly for Mutex slow-path blocks. **Never zeroed**
+    /// (zeroing has an unfixable stale-flush TOCTOU); quiescence is the
+    /// cumulative predicate `freed == carved`.
+    pub(crate) carved: AtomicUsize,
+}
+
+/// J7 per-chunk accounting. `alloc_side` and `freed` live on separate
+/// padded lines: `freed` is RMW'd by (batched) frees on whatever thread
+/// frees, `alloc_side` by carves/retires — sharing a line would couple the
+/// alloc and free hot paths through coherence traffic (the J4-D lesson).
+///
+/// # Rewind safety (Dekker)
+///
+/// The only way recycling could hand memory out twice is a span carve
+/// racing the cursor rewind. Guard: the carver does `spans.fetch_add
+/// (SeqCst)` **then** `intent.load(SeqCst)`; the recycler does
+/// `intent.store(1, SeqCst)` **then** `spans.load(SeqCst)`. Under the
+/// SeqCst total order one side always observes the other: either the
+/// recycler sees the pin and aborts, or the carver sees the intent and
+/// backs off to the Mutex (serializing behind the rewind). With `spans ==
+/// 0` observed under intent, no carve can succeed and no retire is
+/// outstanding, so `carved` is exact (each retire's `carved` add is
+/// sequenced before its `spans` Release decrement, which the recycler's
+/// SeqCst≥Acquire load synchronizes with) and `freed == carved` proves no
+/// live block remains. `freed` itself needs only Relaxed monotonicity —
+/// reading it low merely delays recycling.
+pub(crate) struct ChunkMeta {
+    pub(crate) alloc_side: CachePadded<ChunkAllocMeta>,
+    /// Cumulative blocks ever freed back to this chunk (batched TLS flushes
+    /// from `lib.rs::arena_note_free`). Never zeroed.
+    pub(crate) freed: CachePadded<AtomicUsize>,
+}
+
+impl ChunkMeta {
+    const fn new() -> Self {
+        Self {
+            alloc_side: CachePadded::new(ChunkAllocMeta {
+                intent: AtomicUsize::new(0),
+                spans: AtomicUsize::new(0),
+                carved: AtomicUsize::new(0),
+            }),
+            freed: CachePadded::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
 /// One mmap-backed bump chunk.
 ///
 /// `cursor` is an `AtomicUsize` (not a plain `usize`) so `lib.rs`'s
@@ -93,6 +173,12 @@ fn scaled_max_chunks() -> usize {
 /// still uses the same atomic via a plain load/store, which is just as
 /// cheap as a bare field access and keeps exactly one source of truth for
 /// "how full is this chunk" between the two paths.
+///
+/// `meta` and `cursor` addresses are handed out raw (to the published
+/// `ArenaChunkDescriptor` and the chunk registry) — sound because the
+/// owning `Vec<Chunk>` is pre-reserved to `max_chunks` and never
+/// reallocates, so `Chunk`s never move (the same argument the descriptor
+/// has always relied on).
 pub(crate) struct Chunk {
     /// The backing mapping. Kept alive so the memory stays mapped; its
     /// `Drop` releases the mapping when the arena is dropped.
@@ -104,6 +190,15 @@ pub(crate) struct Chunk {
     pub(crate) capacity: usize,
     /// Next free byte. `base <= cursor <= base + capacity`.
     pub(crate) cursor: AtomicUsize,
+    /// J7 recycling accounting (see [`ChunkMeta`]).
+    pub(crate) meta: ChunkMeta,
+    /// Cached leaked `ArenaChunkDescriptor` pointer for this chunk
+    /// (`0` = not yet published). The descriptor's content (base, capacity,
+    /// cursor/meta pointers) is immutable per chunk, so `lib.rs`'s
+    /// `publish_arena_chunk` reuses it instead of leaking a fresh one per
+    /// republish — with recycling, publishes happen once per chunk *cycle*
+    /// (unbounded over a server's lifetime), not once per chunk.
+    pub(crate) desc: AtomicUsize,
 }
 
 unsafe impl Send for Chunk {}
@@ -126,6 +221,8 @@ impl Chunk {
             base,
             capacity,
             cursor: AtomicUsize::new(base as usize),
+            meta: ChunkMeta::new(),
+            desc: AtomicUsize::new(0),
         })
     }
 
@@ -189,6 +286,14 @@ pub struct BumpArena {
     /// arenas pin it to [`BASE_MAX_CHUNKS`] so cap-exhaustion tests stay
     /// deterministic regardless of the machine they run on.
     max_chunks: usize,
+    /// J7: whether the recycle scan may run. Set by `lib.rs` at arena
+    /// creation from the `LOHALLOC_ARENA_RECLAIM` latch; cleared forever by
+    /// [`reset`](Self::reset) — after a forced reset, a straggler free of a
+    /// pre-reset pointer is indistinguishable from a post-reset one, so the
+    /// cumulative quiescence predicate is no longer trustworthy (LD_PRELOAD
+    /// deployments never reset; GUI/replay instances that do already have
+    /// reset as their reclaim mechanism).
+    reclaim_enabled: bool,
 }
 
 unsafe impl Send for BumpArena {}
@@ -218,7 +323,14 @@ impl BumpArena {
             current: 0,
             chunk_size,
             max_chunks,
+            reclaim_enabled: false,
         })
+    }
+
+    /// J7: enable/disable the recycle scan (see the field doc). `lib.rs`
+    /// calls this right after construction, under the arena Mutex.
+    pub(crate) fn set_reclaim(&mut self, on: bool) {
+        self.reclaim_enabled = on;
     }
 
     /// Allocate `size` bytes aligned to at least `max(align, MIN_ALIGN)`.
@@ -235,8 +347,12 @@ impl BumpArena {
         }
         let align = align.max(MIN_ALIGN);
 
-        // Fast path: bump the current chunk.
+        // Fast path: bump the current chunk. Every block served through
+        // this Mutex-held path is a direct (non-span) block, so it is
+        // accounted into `carved` here; span-carved blocks are accounted by
+        // the span retire flush in `lib.rs` instead.
         if let Some(p) = self.chunks[self.current].alloc(size, align) {
+            self.note_direct_carve(self.current);
             return Some(p);
         }
 
@@ -246,22 +362,88 @@ impl BumpArena {
             return None;
         }
 
-        // Advance: reuse the next already-mapped chunk (rewound by `reset`)
-        // or map a new one below the cap.
+        // Advance: reuse the next already-mapped chunk (rewound by `reset`),
+        // recycle a quiescent one (J7), or map a new one below the cap.
         loop {
             if self.current + 1 < self.chunks.len() {
                 self.current += 1;
+            } else if let Some(i) = self.try_recycle() {
+                // Prefer rewinding a fully-freed chunk over mapping a fresh
+                // one: this is what caps mapped chunks at the live
+                // high-water instead of the byte cap (the request-loop RSS
+                // fix), and what keeps the arena serving past the cap (the
+                // fallthrough-storm fix).
+                self.current = i;
             } else if self.chunks.len() < self.max_chunks {
                 let chunk = Chunk::new(self.chunk_size)?;
                 self.chunks.push(chunk);
                 self.current += 1;
             } else {
-                return None; // cap reached — caller falls through
+                return None; // cap reached, nothing recyclable — falls through
             }
             if let Some(p) = self.chunks[self.current].alloc(size, align) {
+                self.note_direct_carve(self.current);
                 return Some(p);
             }
         }
+    }
+
+    /// Account one Mutex-held direct block into its chunk's `carved`.
+    /// Skipped while reclaim is disabled so the kill switch keeps the
+    /// legacy path byte-identical in behavior (the counters would be inert
+    /// anyway, but zero writes is easier to reason about in an A/B).
+    #[inline]
+    fn note_direct_carve(&self, idx: usize) {
+        if self.reclaim_enabled {
+            self.chunks[idx]
+                .meta
+                .alloc_side
+                .carved
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// J7 recycle scan (arena Mutex held): find a non-current chunk whose
+    /// every carved block has been freed and no TLS span is open into it,
+    /// rewind its cursor, and return its index. The intent/spans Dekker
+    /// pair (see [`ChunkMeta`]) is what makes the rewind safe against a
+    /// concurrent lock-free span carve targeting a stale descriptor.
+    fn try_recycle(&mut self) -> Option<usize> {
+        if !self.reclaim_enabled {
+            return None;
+        }
+        for i in 0..self.chunks.len() {
+            if i == self.current {
+                continue; // the published chunk is never recycled
+            }
+            let c = &self.chunks[i];
+            if c.used() == 0 {
+                continue; // already rewound/untouched — the advance path reuses it
+            }
+            let m = &c.meta;
+            m.alloc_side.intent.store(1, Ordering::SeqCst);
+            let pinned = m.alloc_side.spans.load(Ordering::SeqCst) != 0;
+            let carved = m.alloc_side.carved.load(Ordering::Relaxed);
+            let freed = m.freed.load(Ordering::Relaxed);
+            if pinned || carved == 0 || freed != carved {
+                m.alloc_side.intent.store(0, Ordering::Release);
+                continue;
+            }
+            // Quiescent: `spans == 0` under intent means `carved` is exact
+            // and no carve can slip in; `freed == carved` means every block
+            // ever handed out of this chunk has been freed. `freed >
+            // carved` is impossible absent the documented UB channels
+            // (double-free / post-reset free — the latter disables reclaim
+            // entirely).
+            debug_assert!(
+                freed <= carved,
+                "arena chunk freed count exceeds carved (double-free?)"
+            );
+            c.cursor.store(c.base as usize, Ordering::Release);
+            m.alloc_side.intent.store(0, Ordering::Release);
+            return Some(i);
+        }
+        None
     }
 
     /// Reset the arena: rewind every chunk's cursor and start bumping from
@@ -282,6 +464,12 @@ impl BumpArena {
             chunk.cursor.store(base, Ordering::Relaxed);
         }
         self.current = 0;
+        // J7: a forced reset invalidates every outstanding pointer, so
+        // straggler frees of pre-reset pointers would corrupt the cumulative
+        // quiescence predicate — recycling is one-shot-disabled here (the
+        // counters are never zeroed, so late flushes are inert). See the
+        // field doc.
+        self.reclaim_enabled = false;
     }
 
     /// The chunk currently being bumped — `lib.rs` reads this to (re)publish
@@ -292,15 +480,18 @@ impl BumpArena {
     }
 
     /// After a failed [`alloc`](Self::alloc): `true` when the failure means
-    /// the arena is *permanently* out of memory for chunk-fitting requests
-    /// (the `max_chunks` cap is reached and this request would have fit an
-    /// empty chunk), as opposed to a one-off oversized request that could
-    /// never fit any chunk. `lib.rs` uses this to set its `arena_exhausted`
-    /// fast-fail flag — a bump arena never recovers from cap exhaustion
-    /// except via [`reset`](Self::reset). Deliberately conservative about
-    /// tail space: a smaller later request might still squeeze into the last
-    /// chunk's remaining bytes, but that transient (< one chunk) is not
-    /// worth re-attempting the Mutex slow path on every allocation forever.
+    /// the arena is out of memory for chunk-fitting requests (the
+    /// `max_chunks` cap is reached, nothing was recyclable *right now*, and
+    /// this request would have fit an empty chunk), as opposed to a one-off
+    /// oversized request that could never fit any chunk. `lib.rs` uses this
+    /// to set its `arena_exhausted` fast-fail flag. Pre-J7 this was
+    /// permanent short of a [`reset`](Self::reset); with recycling the
+    /// latch is clearable — a free that completes a chunk's quiescence
+    /// clears it (`lib.rs::arena_note_free`), and the next slow-path visit
+    /// recycles. Deliberately conservative about tail space: a smaller
+    /// later request might still squeeze into the last chunk's remaining
+    /// bytes, but that transient (< one chunk) is not worth re-attempting
+    /// the Mutex slow path on every allocation forever.
     pub(crate) fn exhausted_after_failed(&self, size: usize, align: usize) -> bool {
         self.chunks.len() == self.max_chunks
             && size.saturating_add(align.max(MIN_ALIGN)) <= self.chunk_size
@@ -313,12 +504,17 @@ impl BumpArena {
         self.max_chunks
     }
 
-    /// Base address of every currently mapped chunk, for the headerless
-    /// chunk registry (`lib.rs` registers them — idempotently, ≤
-    /// `max_chunks` entries — on the chunk-creating slow path, before
-    /// the current chunk is (re)published to the lock-free fast path).
-    pub(crate) fn chunk_bases(&self) -> impl Iterator<Item = usize> + '_ {
-        self.chunks.iter().map(|c| c.base as usize)
+    /// `(base, meta)` for every currently mapped chunk, for the chunk
+    /// registry (`lib.rs` registers them — idempotently, ≤ `max_chunks`
+    /// entries — on the chunk-creating slow path, before the current chunk
+    /// is (re)published to the lock-free fast path). The `ChunkMeta`
+    /// addresses are stable (see `Chunk`'s doc: the Vec never reallocates)
+    /// and live as long as the arena — they are the J7 free path's route
+    /// from a masked pointer to the chunk's quiescence accounting.
+    pub(crate) fn chunk_entries(&self) -> impl Iterator<Item = (usize, *const ChunkMeta)> + '_ {
+        self.chunks
+            .iter()
+            .map(|c| (c.base as usize, &c.meta as *const ChunkMeta))
     }
 
     /// Whether every chunk is exactly [`CHUNK_BYTES`] (default-sized) —
@@ -502,6 +698,130 @@ mod tests {
             MAX_CHUNKS_CAP,
             "huge core count clamps to ceiling"
         );
+    }
+
+    #[test]
+    fn recycle_reuses_quiescent_chunk_instead_of_mapping() {
+        // J7: fill chunk 0 with direct blocks, "free" them all (the free
+        // side is lib.rs's arena_note_free; at this layer that's a freed
+        // fetch_add), then keep allocating — the advance must RECYCLE chunk
+        // 0 once the current chunk fills, rather than mapping chunk 3.
+        let mut arena = BumpArena::with_capacity(4096).expect("arena");
+        arena.set_reclaim(true);
+        let chunk_cap = arena.chunks[0].capacity;
+        let per_chunk = chunk_cap / 256; // 256-byte blocks, MIN_ALIGN'd
+        let mut first_chunk_blocks = 0;
+        // Fill chunk 0 (and let the advance map chunk 1).
+        while arena.current == 0 {
+            assert!(arena.alloc(256, 16).is_some());
+            if arena.current == 0 {
+                first_chunk_blocks += 1;
+            }
+        }
+        assert_eq!(arena.chunks.len(), 2, "advance mapped exactly one chunk");
+        // Every block in chunk 0 is freed → quiescent.
+        arena.chunks[0]
+            .meta
+            .freed
+            .fetch_add(first_chunk_blocks, Ordering::Relaxed);
+        // Fill chunk 1; the next advance must recycle chunk 0, not map.
+        let mapped_before = arena.chunks.len();
+        for _ in 0..(per_chunk + 4) {
+            assert!(arena.alloc(256, 16).is_some());
+        }
+        assert_eq!(
+            arena.chunks.len(),
+            mapped_before,
+            "quiescent chunk 0 must be recycled instead of mapping a new chunk"
+        );
+        assert_eq!(arena.current, 0, "bumping the rewound chunk 0 again");
+        // Cumulative counters: carved grew past the first generation.
+        assert!(
+            arena.chunks[0]
+                .meta
+                .alloc_side
+                .carved
+                .load(Ordering::Relaxed)
+                > first_chunk_blocks,
+            "second-generation carves must accumulate (counters never zeroed)"
+        );
+    }
+
+    #[test]
+    fn recycle_skips_pinned_and_non_quiescent_chunks() {
+        let mut arena = BumpArena::with_capacity(4096).expect("arena");
+        arena.set_reclaim(true);
+        // Fill chunk 0, advance to chunk 1.
+        let mut blocks0 = 0;
+        while arena.current == 0 {
+            assert!(arena.alloc(256, 16).is_some());
+            if arena.current == 0 {
+                blocks0 += 1;
+            }
+        }
+        // Not quiescent (one block still live): no recycle.
+        arena.chunks[0]
+            .meta
+            .freed
+            .fetch_add(blocks0 - 1, Ordering::Relaxed);
+        assert!(
+            arena.try_recycle().is_none(),
+            "live block must block recycle"
+        );
+        // Quiescent but pinned by an open span: no recycle.
+        arena.chunks[0].meta.freed.fetch_add(1, Ordering::Relaxed);
+        arena.chunks[0]
+            .meta
+            .alloc_side
+            .spans
+            .fetch_add(1, Ordering::SeqCst);
+        assert!(
+            arena.try_recycle().is_none(),
+            "open span must block recycle"
+        );
+        assert_eq!(
+            arena.chunks[0]
+                .meta
+                .alloc_side
+                .intent
+                .load(Ordering::Relaxed),
+            0,
+            "aborted scan must clear intent"
+        );
+        // Unpin: recycles.
+        arena.chunks[0]
+            .meta
+            .alloc_side
+            .spans
+            .fetch_sub(1, Ordering::Release);
+        assert_eq!(arena.try_recycle(), Some(0));
+        assert_eq!(arena.chunks[0].used(), 0, "recycle rewinds the cursor");
+    }
+
+    #[test]
+    fn reset_disables_recycling_permanently() {
+        let mut arena = BumpArena::with_capacity(4096).expect("arena");
+        arena.set_reclaim(true);
+        let mut blocks0 = 0;
+        while arena.current == 0 {
+            assert!(arena.alloc(256, 16).is_some());
+            if arena.current == 0 {
+                blocks0 += 1;
+            }
+        }
+        arena.reset();
+        // Even a fully-quiescent chunk must not recycle after a reset.
+        arena.chunks[0]
+            .meta
+            .freed
+            .fetch_add(blocks0, Ordering::Relaxed);
+        // (Post-reset chunk 0 is current anyway; check chunk 1 semantics by
+        // asserting the master switch.)
+        assert!(
+            !arena.reclaim_enabled,
+            "reset must one-shot-disable reclaim"
+        );
+        assert!(arena.try_recycle().is_none());
     }
 
     #[test]

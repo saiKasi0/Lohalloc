@@ -90,11 +90,23 @@ pub(crate) struct PinEntry {
 /// `Lohalloc::arena_alloc_fast`). Validity is (owner, epoch)-checked on
 /// every use, so instance mixing and `reset_arena()` both simply discard
 /// the span.
+///
+/// J7 fields: `meta` is the carved-from chunk's `ChunkMeta` address (0 =
+/// none/reclaim off — the span holds a +1 pin on that chunk's `spans`
+/// counter while installed), and `blocks` counts allocations served from
+/// this span — a pure `Cell` increment per alloc, flushed into the chunk's
+/// cumulative `carved` when the span retires. This span-granular flush is
+/// what keeps the J7 accounting off the per-allocation hot path (the J4-D
+/// lesson). `meta` is only dereferenced at retire when `owner` still
+/// matches the live instance (owner match ⇒ instance alive ⇒ chunk meta
+/// valid).
 pub(crate) struct ArenaSpan {
     pub(crate) owner: Cell<u64>,
     pub(crate) epoch: Cell<u64>,
     pub(crate) cursor: Cell<usize>,
     pub(crate) end: Cell<usize>,
+    pub(crate) meta: Cell<usize>,
+    pub(crate) blocks: Cell<usize>,
 }
 
 /// The merged per-thread hot block. Field order is layout (`repr(C)`):
@@ -138,6 +150,20 @@ pub(crate) struct HotTls {
     pub(crate) seg_class: Cell<u8>,
     /// Instance tag for `seg_base` (0 = empty; magazine ids are never 0).
     pub(crate) seg_owner: Cell<u64>,
+    /// J7 arena free batch: chunk base of the pending batch (0 = empty).
+    /// Same-chunk arena frees are pure `Cell` increments; the batch flushes
+    /// one `fetch_add` into the chunk's `freed` on a chunk-boundary
+    /// crossing (or immediately while `arena_exhausted` is latched). See
+    /// `Lohalloc::arena_note_free`.
+    pub(crate) arena_free_base: Cell<usize>,
+    /// The batch chunk's `ChunkMeta` address (cached from the registry
+    /// lookup that opened the batch; only dereferenced under an owner
+    /// match).
+    pub(crate) arena_free_meta: Cell<usize>,
+    /// Instance tag for the batch (0 = empty).
+    pub(crate) arena_free_owner: Cell<u64>,
+    /// Pending free count for `arena_free_base`.
+    pub(crate) arena_free_pending: Cell<usize>,
     /// Per-class magazine fill counts (12 bytes — completes the first
     /// cache line together with the scalars above).
     pub(crate) mag_counts: [Cell<u8>; MAG_CLASSES],
@@ -168,7 +194,13 @@ thread_local! {
                 epoch: Cell::new(0),
                 cursor: Cell::new(0),
                 end: Cell::new(0),
+                meta: Cell::new(0),
+                blocks: Cell::new(0),
             },
+            arena_free_base: Cell::new(0),
+            arena_free_meta: Cell::new(0),
+            arena_free_owner: Cell::new(0),
+            arena_free_pending: Cell::new(0),
             mag_slots: [const { [const { Cell::new(core::ptr::null_mut()) }; MAG_MAX_CAP] };
                 MAG_CLASSES],
             pin: [const {

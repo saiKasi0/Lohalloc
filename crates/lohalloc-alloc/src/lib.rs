@@ -293,6 +293,13 @@ pub struct Lohalloc {
     /// stay in Shared state across cores regardless of what any RMW field
     /// does. Cost: ~128 B per field on a single static — irrelevant.
     arena_exhausted: CachePadded<AtomicBool>,
+    /// J7 per-instance arena-reclaim latch: `0` = uninit (read the
+    /// `LOHALLOC_ARENA_RECLAIM` env latch on first use), `1` = on, `2` =
+    /// off. Cleared to `2` forever by `reset_arena()` (post-reset straggler
+    /// frees make the cumulative quiescence predicate untrustworthy — see
+    /// `BumpArena::reset`). Padded: read on the (cold) arena slow path and
+    /// at freeze, written once.
+    arena_reclaim_on: CachePadded<AtomicU8>,
     /// The Decision Engine (Phase 3). Routes allocations via MAB in Training
     /// mode and via a frozen `PerfectHashTable` in Inference mode.
     state: Mutex<state::AllocatorState>,
@@ -462,6 +469,12 @@ struct ArenaChunkDescriptor {
     base: usize,
     capacity: usize,
     cursor: *const AtomicUsize,
+    /// J7: the chunk's quiescence accounting (`arena::ChunkMeta`), same
+    /// stability argument as `cursor` (the chunk Vec never reallocates).
+    /// The carve path pins `meta.alloc_side.spans` before reserving — the
+    /// Dekker pair that makes chunk recycling safe against a carve through
+    /// a stale descriptor.
+    meta: *const arena::ChunkMeta,
 }
 
 unsafe impl Send for ArenaChunkDescriptor {}
@@ -1114,6 +1127,31 @@ pub(crate) fn pin_exclude_legacy() -> bool {
     legacy
 }
 
+/// J7 arena-reclaim enable latch: `0` = uninit, `1` = on, `2` = off.
+/// **Default ON.** Gates the whole chunk-recycling protocol (accounting,
+/// recycle scan, latch clearing, freeze-demotion lift) —
+/// `LOHALLOC_ARENA_RECLAIM=0` reverts to the pre-J7 one-shot-budget arena
+/// byte-exactly, the A/B kill switch for certification.
+static ARENA_RECLAIM_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// Whether arena chunk recycling may arm (default **on**;
+/// `LOHALLOC_ARENA_RECLAIM=0` disables). One relaxed load after the first
+/// call — read on the (cold) arena slow path and at freeze, never per-op.
+#[inline]
+fn arena_reclaim_enabled() -> bool {
+    let s = ARENA_RECLAIM_STATE.load(Ordering::Relaxed);
+    if s != 0 {
+        return s == 1;
+    }
+    // SAFETY: NUL-terminated literal; getenv returns NULL or a pointer into
+    // the C environment (no setenv on the allocator hot path). Only an exact
+    // "0" disables; every other value (unset included) keeps the default on.
+    let p = unsafe { libc::getenv(b"LOHALLOC_ARENA_RECLAIM\0".as_ptr().cast()) };
+    let off = !p.is_null() && unsafe { *p == b'0' as libc::c_char && *p.offset(1) == 0 };
+    ARENA_RECLAIM_STATE.store(if off { 2 } else { 1 }, Ordering::Relaxed);
+    !off
+}
+
 impl Default for Lohalloc {
     fn default() -> Self {
         Self::new()
@@ -1256,6 +1294,7 @@ impl Lohalloc {
             // is not const-evaluable).
             arena: Mutex::new(None),
             arena_exhausted: CachePadded::new(AtomicBool::new(false)),
+            arena_reclaim_on: CachePadded::new(AtomicU8::new(0)),
             // Decision Engine starts in Training mode.
             state: Mutex::new(state::AllocatorState::new_training_const()),
             frozen: CachePadded::new(AtomicBool::new(false)),
@@ -1305,6 +1344,22 @@ impl Lohalloc {
         let result = f(unsafe { &mut *self.system_cache.get() });
         self.system_cache_lock.store(false, Ordering::Release);
         Some(result)
+    }
+
+    /// J7: whether arena chunk recycling is active on this instance —
+    /// lazily latched from the `LOHALLOC_ARENA_RECLAIM` env (default on),
+    /// cleared forever by [`reset_arena`](Self::reset_arena). Cold paths
+    /// only (arena slow path, freeze, free-side batch flushes).
+    #[inline]
+    fn arena_reclaim_active(&self) -> bool {
+        let s = self.arena_reclaim_on.load(Ordering::Relaxed);
+        if s != 0 {
+            return s == 1;
+        }
+        let on = arena_reclaim_enabled();
+        self.arena_reclaim_on
+            .store(if on { 1 } else { 2 }, Ordering::Relaxed);
+        on
     }
 
     /// This instance's magazine owner id, claimed lazily (never 0, never
@@ -1742,6 +1797,7 @@ unsafe impl GlobalAlloc for Lohalloc {
         // exactly the signal to recover.
         if self.arena_headerless_hit(ptr) {
             self.headerless_free_attributed(ptr, Backend::Arena, || {});
+            self.arena_note_free(ptr);
             return;
         }
         // Read the header (unaligned) sitting immediately before the user ptr.
@@ -1878,9 +1934,14 @@ impl Lohalloc {
                 }
             }
             Some(Backend::Arena) => {
-                // Arena allocations are reclaimed via `reset()`, not
-                // per-allocation free. Dealloc is a no-op — the memory stays
-                // mapped until the arena is reset or dropped.
+                // Arena allocations are reclaimed via chunk recycling (J7)
+                // or `reset()`, never a per-allocation free — routing-wise
+                // this is a no-op and the memory stays mapped. J7 notes the
+                // free for the chunk's quiescence accounting (the header
+                // block's chunk was registered by the slow path; a miss —
+                // e.g. a non-default-sized test arena — just skips
+                // accounting).
+                self.arena_note_free(ptr);
             }
             None => {
                 debug_assert!(false, "dealloc: unknown backend tag");
@@ -2772,6 +2833,14 @@ impl Lohalloc {
                 if let Some(new_cur) = aligned.checked_add(size) {
                     if new_cur <= span.end.get() {
                         span.cursor.set(new_cur);
+                        // J7 per-op accounting: a pure Cell increment,
+                        // flushed into the chunk's cumulative `carved` at
+                        // span retire. `meta != 0` ⇔ the span was carved
+                        // with reclaim active, so the kill-switch path pays
+                        // nothing here (not even a shared load).
+                        if span.meta.get() != 0 {
+                            span.blocks.set(span.blocks.get() + 1);
+                        }
                         return Some(aligned as *mut u8);
                     }
                 }
@@ -2786,35 +2855,87 @@ impl Lohalloc {
             } else {
                 want
             };
-            let base = self.arena_carve_shared(reserve)?;
+            let (base, meta) = self.arena_carve_shared(reserve)?;
+            // J7 span retire: flush the outgoing span's block count into its
+            // chunk's cumulative `carved`, then release its pin. Only when
+            // the span belongs to THIS instance (owner match ⇒ instance
+            // alive ⇒ its chunk meta pointer is valid) — a foreign span is
+            // discarded, leaking its pin on a dead instance's chunk
+            // (bounded to multi-instance tests; never worse than "chunk not
+            // recycled").
+            let old_meta = span.meta.get();
+            if old_meta != 0 && span.owner.get() == owner {
+                // SAFETY: owner match — see above; ChunkMeta is alive and
+                // address-stable for the instance lifetime.
+                let m = unsafe { &*(old_meta as *const arena::ChunkMeta) };
+                m.alloc_side
+                    .carved
+                    .fetch_add(span.blocks.get(), Ordering::Relaxed);
+                m.alloc_side.spans.fetch_sub(1, Ordering::Release);
+            }
             let aligned = align_up(base, align);
             debug_assert!(aligned + size <= base + reserve);
             span.owner.set(owner);
             span.epoch.set(epoch);
             span.cursor.set(aligned + size);
             span.end.set(base + reserve);
+            // The new span inherits the pin `arena_carve_shared` took (meta
+            // is 0 when reclaim is off — no pin was taken).
+            span.meta.set(meta);
+            span.blocks.set(if meta != 0 { 1 } else { 0 });
             Some(aligned as *mut u8)
         })
     }
 
     /// CAS-reserve `reserve` bytes from the published shared chunk
     /// (MIN_ALIGN-aligned). The pre-span fast path's body, now the span
-    /// refill.
-    fn arena_carve_shared(&self, reserve: usize) -> Option<usize> {
+    /// refill. Returns the carve base plus the chunk's `ChunkMeta` address
+    /// (`0` when reclaim is inactive — no accounting, no pin, byte-exact
+    /// pre-J7 behavior).
+    ///
+    /// J7 pin protocol (the carve half of the Dekker pair — see
+    /// `arena::ChunkMeta`): pin `spans` (SeqCst), then check `intent`
+    /// (SeqCst); a nonzero intent means the Mutex-held recycle scan may be
+    /// rewinding this chunk right now — unpin and back off to the Mutex
+    /// slow path, which serializes behind the rewind. On a full-chunk carve
+    /// failure the pin is released before returning. A successful carve's
+    /// pin transfers to the installed TLS span and is released at span
+    /// retire.
+    fn arena_carve_shared(&self, reserve: usize) -> Option<(usize, usize)> {
         let desc_ptr = self.arena_chunk.load(Ordering::Acquire);
         if desc_ptr.is_null() {
             return None;
         }
         // SAFETY: see `ArenaChunkDescriptor`'s doc — the pointed-to chunk
-        // and its cursor never move or get freed while this `Lohalloc`
+        // and its cursor/meta never move or get freed while this `Lohalloc`
         // instance is alive.
         let desc = unsafe { &*desc_ptr };
         let cursor = unsafe { &*desc.cursor };
+        let reclaim = self.arena_reclaim_active();
+        if reclaim {
+            // SAFETY: same lifetime argument as `cursor`.
+            let m = unsafe { &*desc.meta };
+            m.alloc_side.spans.fetch_add(1, Ordering::SeqCst);
+            if m.alloc_side.intent.load(Ordering::SeqCst) != 0 {
+                m.alloc_side.spans.fetch_sub(1, Ordering::Release);
+                return None; // recycle in progress — Mutex path decides
+            }
+        }
         loop {
             let cur = cursor.load(Ordering::Relaxed);
             let aligned = align_up(cur, MIN_ALIGN);
-            let new_cur = aligned.checked_add(reserve)?;
+            let Some(new_cur) = aligned.checked_add(reserve) else {
+                if reclaim {
+                    let m = unsafe { &*desc.meta };
+                    m.alloc_side.spans.fetch_sub(1, Ordering::Release);
+                }
+                return None;
+            };
             if new_cur > desc.base + desc.capacity {
+                if reclaim {
+                    let m = unsafe { &*desc.meta };
+                    m.alloc_side.spans.fetch_sub(1, Ordering::Release);
+                }
                 return None; // chunk full or doesn't fit — slow path decides
             }
             // A racing thread may have already advanced `cur` since our
@@ -2824,25 +2945,110 @@ impl Lohalloc {
                 .compare_exchange_weak(cur, new_cur, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
-                return Some(aligned);
+                return Some((aligned, if reclaim { desc.meta as usize } else { 0 }));
             }
+        }
+    }
+
+    /// J7 free-side accounting: note one freed arena block (any flavor —
+    /// headerless or header-carrying; the caller has already identified the
+    /// pointer as an arena block). TLS-batched so the common same-chunk
+    /// free stream costs pure `Cell` ops: the batch flushes one
+    /// `fetch_add` into the chunk's cumulative `freed` when the stream
+    /// crosses a chunk boundary — or immediately while `arena_exhausted`
+    /// is latched, because a flush is what can clear the latch and end the
+    /// fallthrough storm. A batch never blocks recycling incorrectly:
+    /// unflushed frees only make `freed` read LOW (chunk looks non-quiescent
+    /// — the safe direction).
+    #[inline]
+    fn arena_note_free(&self, ptr: *mut u8) {
+        if !self.arena_reclaim_active() {
+            return;
+        }
+        let base = (ptr as usize) & !(arena::CHUNK_BYTES - 1);
+        let owner = self.magazine_owner();
+        hot::with(|h| {
+            if h.arena_free_base.get() == base && h.arena_free_owner.get() == owner {
+                h.arena_free_pending.set(h.arena_free_pending.get() + 1);
+            } else {
+                self.arena_flush_free_batch(h);
+                // Open a batch for the new chunk. A miss (foreign pointer /
+                // unregistered chunk) simply skips accounting — the chunk
+                // is never recycled, which is the safe direction.
+                let Some(meta) = self.arena_chunks.lookup(base) else {
+                    return;
+                };
+                h.arena_free_base.set(base);
+                h.arena_free_meta.set(meta);
+                h.arena_free_owner.set(owner);
+                h.arena_free_pending.set(1);
+            }
+            if self.arena_exhausted.load(Ordering::Relaxed) {
+                self.arena_flush_free_batch(h);
+            }
+        });
+    }
+
+    /// Flush this thread's pending arena free batch into its chunk's
+    /// `freed` counter, and — while `arena_exhausted` is latched — clear
+    /// the latch if the chunk just reached quiescence (the next Mutex
+    /// slow-path visit then recycles it). The quiescence read here is
+    /// deliberately approximate (relaxed loads, no Dekker): a spurious
+    /// unlatch costs one Mutex round-trip that re-latches via
+    /// `exhausted_after_failed`; a missed one is retried by the next flush.
+    fn arena_flush_free_batch(&self, h: &hot::HotTls) {
+        let n = h.arena_free_pending.get();
+        if n == 0 {
+            return;
+        }
+        h.arena_free_pending.set(0);
+        if h.arena_free_owner.get() != self.magazine_owner() {
+            // Foreign (dead or different) instance's batch: discard —
+            // dereferencing its meta would be a use-after-drop. Undercount
+            // = that chunk is never recycled = safe.
+            h.arena_free_base.set(0);
+            return;
+        }
+        // SAFETY: owner match ⇒ this instance registered the meta and is
+        // alive; `ChunkMeta` addresses are stable (the chunk Vec never
+        // reallocates) and chunks are never unmapped before instance drop.
+        let m = unsafe { &*(h.arena_free_meta.get() as *const arena::ChunkMeta) };
+        let freed = m.freed.fetch_add(n, Ordering::Relaxed) + n;
+        if self.arena_exhausted.load(Ordering::Relaxed)
+            && m.alloc_side.spans.load(Ordering::Relaxed) == 0
+            && freed == m.alloc_side.carved.load(Ordering::Relaxed)
+        {
+            self.arena_exhausted.store(false, Ordering::Relaxed);
         }
     }
 
     /// (Re)publish `arena`'s current chunk as the fast path's descriptor.
     /// Must be called (under `self.arena`'s lock) after anything that can
     /// change which chunk is "current": the arena's initial creation, a
-    /// chunk advance inside `BumpArena::alloc`, or `reset()`. Redundant
-    /// calls (current chunk unchanged) are harmless — just a small extra
-    /// leak (bounded by `MAX_CHUNKS` per arena lifetime, see
-    /// `ArenaChunkDescriptor`'s doc).
+    /// chunk advance inside `BumpArena::alloc`, or `reset()`. J7: the
+    /// leaked descriptor is cached per chunk (`Chunk::desc`) and reused —
+    /// its content is immutable per chunk, and with recycling a chunk is
+    /// republished once per *cycle* (unbounded over a server lifetime), so
+    /// the pre-J7 leak-per-publish would have grown without bound. Leak is
+    /// now ≤ one descriptor per mapped chunk per arena lifetime.
     fn publish_arena_chunk(&self, arena: &arena::BumpArena) {
         let chunk = arena.current_chunk();
-        let desc = Box::leak(Box::new(ArenaChunkDescriptor {
-            base: chunk.base as usize,
-            capacity: chunk.capacity,
-            cursor: &chunk.cursor as *const AtomicUsize,
-        }));
+        let cached = chunk.desc.load(Ordering::Relaxed);
+        let desc: *mut ArenaChunkDescriptor = if cached != 0 {
+            cached as *mut ArenaChunkDescriptor
+        } else {
+            let fresh = Box::leak(Box::new(ArenaChunkDescriptor {
+                base: chunk.base as usize,
+                capacity: chunk.capacity,
+                cursor: &chunk.cursor as *const AtomicUsize,
+                meta: &chunk.meta as *const arena::ChunkMeta,
+            }));
+            // Single writer (arena Mutex held) — a plain store suffices.
+            chunk
+                .desc
+                .store(fresh as *mut _ as usize, Ordering::Relaxed);
+            fresh
+        };
         self.arena_chunk.store(desc, Ordering::Release);
     }
 
@@ -3194,38 +3400,47 @@ impl Lohalloc {
                 };
                 if arena_guard.is_none() {
                     *arena_guard = arena::BumpArena::new();
+                    // J7: arm chunk recycling on this fresh arena from the
+                    // instance flag (env-latched at construction, cleared
+                    // by `reset_arena`). Under the Mutex, before any block
+                    // escapes.
+                    if let Some(a) = arena_guard.as_mut() {
+                        a.set_reclaim(self.arena_reclaim_active());
+                    }
                 }
-                let gate_on = self.arena_headerless.load(Ordering::Relaxed);
                 let mut registered_ok = true;
                 let result = arena_guard.as_mut().and_then(|arena| {
                     let block = arena.alloc(request, align)?;
-                    // When the headerless gate is on, register every chunk
-                    // base on EVERY slow-path visit — not just headerless
-                    // calls (idempotent, <= MAX_CHUNKS entries, fixed
-                    // atomics: safe under this Mutex per the reentrancy
-                    // rule). This must happen BEFORE the block escapes or
-                    // the chunk is (re)published: the lock-free fast path
-                    // serves headerless blocks from whatever chunk is
-                    // published, and a headerless block whose chunk isn't
-                    // in the membership set reaches `free` with no header
-                    // to fall back on (the probe misses, `ptr - 48` is
-                    // read as a garbage header, and cabi delegates the
-                    // pointer to libc). A rare header-carrying block
-                    // (align > MIN_ALIGN) inside a registered chunk is the
-                    // safe direction: arena frees are no-ops either way.
-                    // Registration cannot fail in practice (256-slot set
-                    // vs. 32 chunks); if it ever does, fail the arm and
-                    // suppress the publish below. The default-size check
-                    // is defense-in-depth for the free side's
-                    // `ptr & !(CHUNK_BYTES - 1)` mask (always true for
-                    // `BumpArena::new()`, which is the only constructor
-                    // `lib.rs` uses).
-                    if gate_on {
-                        registered_ok = arena.chunks_are_default_sized()
-                            && arena.chunk_bases().all(|b| self.arena_chunks.insert(b));
-                        if !registered_ok {
-                            return None;
-                        }
+                    // Register every chunk (base → ChunkMeta addr) on EVERY
+                    // slow-path visit (idempotent, <= MAX_CHUNKS entries,
+                    // fixed atomics: safe under this Mutex per the
+                    // reentrancy rule). This must happen BEFORE the block
+                    // escapes or the chunk is (re)published: the lock-free
+                    // fast path serves headerless blocks from whatever
+                    // chunk is published, and a headerless block whose
+                    // chunk isn't in the table reaches `free` with no
+                    // header to fall back on (the probe misses, `ptr - 48`
+                    // is read as a garbage header, and cabi delegates the
+                    // pointer to libc). J7 dropped the old
+                    // headerless-gate-only condition: the free side now
+                    // also needs the meta payload for HEADER-carrying arena
+                    // frees (training instances, align > MIN_ALIGN), whose
+                    // quiescence accounting flows through the same table.
+                    // A rare header-carrying block inside a registered
+                    // chunk was always the safe direction: arena frees are
+                    // routing no-ops either way. Registration cannot fail
+                    // in practice (512-slot table vs. <=128 chunks); if it
+                    // ever does, fail the arm and suppress the publish
+                    // below. The default-size check is defense-in-depth for
+                    // the free side's `ptr & !(CHUNK_BYTES - 1)` mask
+                    // (always true for `BumpArena::new()`, the only
+                    // constructor `lib.rs` uses).
+                    registered_ok = arena.chunks_are_default_sized()
+                        && arena
+                            .chunk_entries()
+                            .all(|(b, m)| self.arena_chunks.insert(b, m as usize));
+                    if !registered_ok {
+                        return None;
                     }
                     if headerless {
                         Some(block)
@@ -3468,6 +3683,12 @@ impl Lohalloc {
     /// controls call this when a topological cluster's lifetime ends.
     pub fn reset_arena(&self) {
         if let Ok(mut arena_guard) = self.arena.lock() {
+            // J7: a forced reset makes the cumulative quiescence counters
+            // untrustworthy (straggler frees of invalidated pointers), so
+            // chunk recycling is one-shot-disabled on this instance —
+            // `arena.reset()` clears the BumpArena-level flag too. Ordered
+            // under the Mutex against the recycle scan.
+            self.arena_reclaim_on.store(2, Ordering::Relaxed);
             if let Some(ref mut arena) = *arena_guard {
                 arena.reset();
             }
@@ -3555,7 +3776,15 @@ impl Lohalloc {
         // kept — J4-C demoted all and flattened the light-arena rows; J4-D
         // kept all and the storm cost 3.98×; the volume split is the good
         // half of both). See its doc.
+        // J7: with chunk recycling active the arena is a RENEWABLE resource
+        // for buddy-range sizes, so heavy Arena verdicts at sc >= 12 are
+        // KEPT (`reclaim_lifts_large` — the request-loop fix); slab-range
+        // verdicts still demote (the v1 blanket lift re-opened the
+        // arena/slab routing lottery on tiny-churn rows: mt-slab +16%,
+        // c/slab +32%, certified 20260714T013202). See
+        // `AllocatorState::freeze`'s demote_for.
         let demote_arena = self.arena_epoch.load(Ordering::Relaxed) == 0;
+        let reclaim_lifts_large = self.arena_reclaim_active();
         // The heavy/light threshold comes from the `demote_fraction` tune
         // key (default = the certified 0.10 const; bisect knob:
         // LOHALLOC_DEMOTE_FRACTION). `tune::config()` is one atomic load,
@@ -3565,7 +3794,12 @@ impl Lohalloc {
         let escalate_variance = crate::tune::config().escalate_variance;
         Self::with_realloc_guard(|| {
             if let Ok(mut state) = self.state.lock() {
-                state.freeze(demote_arena, demote_fraction, escalate_variance);
+                state.freeze(
+                    demote_arena,
+                    reclaim_lifts_large,
+                    demote_fraction,
+                    escalate_variance,
+                );
                 self.publish_frozen_table(&state);
             }
         });
@@ -3644,6 +3878,16 @@ impl Lohalloc {
     #[cfg(test)]
     fn set_sc_shortcut(&self, on: bool) {
         self.sc_shortcut_on.store(on, Ordering::Relaxed);
+    }
+
+    /// Test-only: pin THIS instance's J7 arena-reclaim latch (on = `1`,
+    /// off = `2`) so tests never race the process-global env latch. Must be
+    /// called before the arena's first allocation (the BumpArena-level flag
+    /// copies it at lazy creation).
+    #[cfg(test)]
+    fn set_arena_reclaim(&self, on: bool) {
+        self.arena_reclaim_on
+            .store(if on { 1 } else { 2 }, Ordering::Relaxed);
     }
 
     /// Diagnostic snapshot of the Phase-1 shadow fine map (see
@@ -4356,6 +4600,7 @@ impl Lohalloc {
         }
         if self.arena_headerless_hit(ptr) {
             self.headerless_free_attributed(ptr, Backend::Arena, || {});
+            self.arena_note_free(ptr);
             return true; // ours; free is a no-op (bump arena)
         }
         let header = unsafe { ptr.cast::<Header>().offset(-1).read_unaligned() };
@@ -4463,8 +4708,9 @@ impl Lohalloc {
                 })
             }
             ReallocTokenInner::ArenaHeaderless => {
-                self.headerless_free_attributed(ptr, Backend::Arena, || {})
-            } // bump arena: free is a no-op
+                self.headerless_free_attributed(ptr, Backend::Arena, || {});
+                self.arena_note_free(ptr);
+            } // bump arena: free is a routing no-op (J7 notes it for reclaim)
         }
     }
 }
@@ -6145,6 +6391,204 @@ mod integration_tests {
         unsafe { alloc.dealloc_with_hash(p, layout) };
     }
 
+    /// Forced-Arena single-site model at `size`, on a fresh instance with
+    /// the J7 reclaim latch pinned per-instance (no process-env race).
+    /// Boxed: a `Lohalloc` is a giant stack object (embedded registries),
+    /// and returning one by value doubles the frame in debug builds — the
+    /// J5 bench-compile stack-overflow lesson.
+    fn forced_arena_instance(hash: u64, size: usize, reclaim: bool) -> (Box<Lohalloc>, Layout) {
+        let sc = state::size_class_for(size);
+        let key = state::combine_hash_size_class(hash, sc);
+        let table = perfect_hash::PerfectHashTable::from_entries(vec![(
+            key,
+            sc,
+            lohalloc_core::Backend::Arena,
+        )]);
+        let alloc = Box::new(Lohalloc::new());
+        alloc.set_arena_reclaim(reclaim);
+        assert!(alloc.load(&table.serialize()));
+        (alloc, Layout::from_size_align(size, 16).unwrap())
+    }
+
+    #[test]
+    fn arena_recycles_after_burst_free_without_reset() {
+        // J7 end-to-end: burst-alloc/free-all churn totaling far more than
+        // the chunk cap (the request-loop shape) must stay Arena-served
+        // forever — chunk recycling replaces the old fill→latch→fallthrough
+        // death spiral — and the arena's mapped footprint must stay at the
+        // live high-water (a few chunks), not the byte cap.
+        let (alloc, layout) = forced_arena_instance(0xA4E7_0001, 4096, true);
+        // 600 bursts × 64 blocks × 4 KiB = 150 MiB of traffic — above the
+        // 128 MiB cap ceiling, so a non-recycling arena would exhaust on
+        // any host.
+        for burst in 0..600 {
+            let mut ptrs = Vec::with_capacity(64);
+            for i in 0..64 {
+                let p = unsafe { alloc.alloc_with_hash(layout, 0xA4E7_0001) };
+                assert!(!p.is_null(), "burst {burst} alloc {i} failed");
+                assert_eq!(
+                    unsafe { alloc.backend_for_ptr(p) },
+                    Some(lohalloc_core::Backend::Arena),
+                    "burst {burst} alloc {i}: recycling must keep the arena serving"
+                );
+                ptrs.push(p);
+            }
+            for p in ptrs {
+                unsafe { alloc.dealloc_with_hash(p, layout) };
+            }
+        }
+        assert!(
+            !alloc.arena_exhausted.load(Ordering::Relaxed),
+            "recycling churn must never latch exhaustion"
+        );
+        let counters = alloc.backend_counters();
+        assert!(
+            counters.arena_capacity <= 8 << 20,
+            "mapped chunks must stay at the live high-water, got {} bytes",
+            counters.arena_capacity
+        );
+    }
+
+    #[test]
+    fn arena_exhaustion_latch_clears_on_quiescence_without_reset() {
+        // Hold every block until the cap latches (recycling can't help
+        // while everything is live), then free everything — the frees
+        // themselves must clear the latch, and the next arena-routed alloc
+        // must be Arena-served again with NO reset_arena().
+        let (alloc, layout) = forced_arena_instance(0xA4E7_0002, 64 * 1024, true);
+        let mut ptrs = Vec::new();
+        let mut i = 0;
+        while !alloc.arena_exhausted.load(Ordering::Relaxed) && i < 5000 {
+            let p = unsafe { alloc.alloc_with_hash(layout, 0xA4E7_0002) };
+            assert!(!p.is_null());
+            ptrs.push(p);
+            i += 1;
+        }
+        assert!(
+            alloc.arena_exhausted.load(Ordering::Relaxed),
+            "all-live churn must still latch"
+        );
+        for p in ptrs {
+            unsafe { alloc.dealloc_with_hash(p, layout) };
+        }
+        assert!(
+            !alloc.arena_exhausted.load(Ordering::Relaxed),
+            "freeing everything must clear the latch (quiescent chunks)"
+        );
+        let p = unsafe { alloc.alloc_with_hash(layout, 0xA4E7_0002) };
+        assert_eq!(
+            unsafe { alloc.backend_for_ptr(p) },
+            Some(lohalloc_core::Backend::Arena),
+            "post-quiescence allocs must be arena-served again (recycled chunk)"
+        );
+        unsafe { alloc.dealloc_with_hash(p, layout) };
+    }
+
+    #[test]
+    fn arena_reclaim_kill_switch_reproduces_legacy_latch() {
+        // LOHALLOC_ARENA_RECLAIM=0 semantics (pinned per-instance): the
+        // same burst/free churn that recycling absorbs must exhaust and
+        // fall through — the pre-J7 behavior, byte-exact.
+        let (alloc, layout) = forced_arena_instance(0xA4E7_0003, 64 * 1024, false);
+        let mut fell_through = false;
+        for _ in 0..400 {
+            let mut ptrs = Vec::with_capacity(8);
+            for _ in 0..8 {
+                let p = unsafe { alloc.alloc_with_hash(layout, 0xA4E7_0003) };
+                assert!(!p.is_null(), "fallthrough chain must still serve");
+                if unsafe { alloc.backend_for_ptr(p) } != Some(lohalloc_core::Backend::Arena) {
+                    fell_through = true;
+                }
+                ptrs.push(p);
+            }
+            for p in ptrs {
+                unsafe { alloc.dealloc_with_hash(p, layout) };
+            }
+            if fell_through {
+                break;
+            }
+        }
+        assert!(
+            fell_through,
+            "with reclaim off, burst churn past the cap must fall through (legacy)"
+        );
+        assert!(
+            alloc.arena_exhausted.load(Ordering::Relaxed),
+            "legacy latch must be set and stay set"
+        );
+    }
+
+    #[test]
+    fn reset_arena_one_shot_disables_recycling() {
+        let (alloc, layout) = forced_arena_instance(0xA4E7_0004, 4096, true);
+        let p = unsafe { alloc.alloc_with_hash(layout, 0xA4E7_0004) };
+        unsafe { alloc.dealloc_with_hash(p, layout) };
+        assert!(alloc.arena_reclaim_active(), "reclaim on before reset");
+        alloc.reset_arena();
+        assert!(
+            !alloc.arena_reclaim_active(),
+            "reset_arena must one-shot-disable recycling (straggler frees of \
+             invalidated pointers would corrupt the quiescence predicate)"
+        );
+    }
+
+    #[test]
+    fn freeze_demotion_lift_is_size_aware() {
+        // J7 v2 (size-aware lift, certified after the v1 blanket lift
+        // regressed the tiny-churn families): with reclaim on, a heavy
+        // Arena verdict is KEPT at buddy-range classes (sc >= 12 — the
+        // request-loop medium buffers) and still DEMOTED at slab-range
+        // classes (sc <= 11 — the certified-fast Slab territory). With
+        // reclaim off, everything demotes (legacy J5-A). Bandit state is
+        // injected directly (real-latency training is not deterministic
+        // about the winner — forced-outcome per the repo's testing rule).
+        let drive = |reclaim: bool, sc: u8| -> lohalloc_core::Backend {
+            let alloc = Box::new(Lohalloc::new());
+            alloc.set_arena_reclaim(reclaim);
+            let sig = lohalloc_core::Signature::new(0xA4E7_0005, sc);
+            {
+                let mut st = alloc.state.lock().unwrap();
+                match &mut *st {
+                    state::AllocatorState::Training { bandit, .. } => {
+                        let cfg = crate::tune::TrainingConfig::default();
+                        let _ = bandit.select_with_frame(sig, 0xF00D, &cfg, 0);
+                        bandit.update_weighted(sig, lohalloc_core::Backend::Arena, 0.9, 100);
+                        bandit.update_weighted(sig, lohalloc_core::Backend::Slab, 0.1, 10);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            alloc.freeze();
+            let st = alloc.state.lock().unwrap();
+            let key = state::combine_hash_size_class(0xA4E7_0005, sc);
+            st.routing()
+                .expect("frozen")
+                .main
+                .lookup(key)
+                .expect("trained key present")
+        };
+        assert_eq!(
+            drive(true, 12),
+            lohalloc_core::Backend::Arena,
+            "reclaim on ⇒ heavy buddy-range Arena verdict kept (request-loop fix)"
+        );
+        assert_eq!(
+            drive(true, 5),
+            lohalloc_core::Backend::Slab,
+            "reclaim on ⇒ slab-range verdicts still demote (tiny-churn protection)"
+        );
+        assert_eq!(
+            drive(false, 12),
+            lohalloc_core::Backend::Buddy,
+            "reclaim off ⇒ legacy demotion to the size default everywhere"
+        );
+        assert_eq!(
+            drive(false, 5),
+            lohalloc_core::Backend::Slab,
+            "reclaim off ⇒ legacy demotion at small classes too"
+        );
+    }
+
     #[test]
     fn arena_reset_republishes_fast_path_after_chunk_advance() {
         // Advance the arena past its first 1 MiB chunk (forcing the slow
@@ -6331,6 +6775,67 @@ mod integration_tests {
                 start_a + len_a
             );
         }
+    }
+
+    #[test]
+    fn arena_recycling_races_mt_churn_without_corruption() {
+        // J7 MT race target (run this shape under TSAN for the definitive
+        // check — same recipe as the chunk-advance test above): 8 threads
+        // burst-alloc canary-stamped arena blocks, verify every byte, then
+        // free — with enough total traffic that the Mutex-held recycle scan
+        // constantly rewinds quiescent chunks CONCURRENTLY with other
+        // threads' lock-free span carves through possibly-stale
+        // descriptors. A broken intent/spans Dekker pair hands the same
+        // memory to two threads, which shows up here as a stomped canary.
+        use std::sync::Arc;
+
+        let hash = 0xA4E7_0006u64;
+        let size = 256usize;
+        let sc = state::size_class_for(size);
+        let key = state::combine_hash_size_class(hash, sc);
+        let table = perfect_hash::PerfectHashTable::from_entries(vec![(
+            key,
+            sc,
+            lohalloc_core::Backend::Arena,
+        )]);
+        let alloc = Arc::new(Lohalloc::new());
+        alloc.set_arena_reclaim(true);
+        assert!(alloc.load(&table.serialize()));
+        let layout = Layout::from_size_align(size, 16).unwrap();
+
+        let mut handles = Vec::new();
+        for t in 0..8u8 {
+            let a = Arc::clone(&alloc);
+            handles.push(std::thread::spawn(move || {
+                for round in 0..120u32 {
+                    let stamp = t ^ (round as u8) ^ 0x5A;
+                    let mut ptrs = Vec::with_capacity(128);
+                    for _ in 0..128 {
+                        let p = unsafe { a.alloc_with_hash(layout, hash) };
+                        assert!(!p.is_null());
+                        unsafe { core::ptr::write_bytes(p, stamp, size) };
+                        ptrs.push(p);
+                    }
+                    for p in &ptrs {
+                        let s = unsafe { core::slice::from_raw_parts(*p, size) };
+                        assert!(
+                            s.iter().all(|&b| b == stamp),
+                            "canary stomped: block handed out twice (recycle race)"
+                        );
+                    }
+                    for p in ptrs {
+                        unsafe { a.dealloc_with_hash(p, layout) };
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+        assert!(
+            !alloc.arena_exhausted.load(Ordering::Relaxed),
+            "recycling must keep MT churn from latching exhaustion"
+        );
     }
 
     #[test]

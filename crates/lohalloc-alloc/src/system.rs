@@ -80,22 +80,24 @@ impl Drop for Mapping {
 /// Runtime page size of the host. Queried once via `sysconf(_SC_PAGESIZE)` and
 /// cached. Always a power of two.
 pub fn page_size() -> usize {
-    static mut PAGE_SIZE: usize = 0;
-    // SAFETY: a race here is benign — `sysconf` is pure and idempotent, and any
-    // thread computes the same value. We use the relaxed read/write model.
-    unsafe {
-        let ps = PAGE_SIZE;
-        if ps != 0 {
-            return ps;
-        }
-        // `sysconf(_SC_PAGESIZE)` is available on both Linux and macOS.
-        let v = libc::sysconf(libc::_SC_PAGESIZE);
-        // sysconf returns -1 on error; fall back to 4096 (x86/typical Linux).
-        let v = if v <= 0 { 4096 } else { v as usize };
-        debug_assert!(v.is_power_of_two());
-        PAGE_SIZE = v;
-        v
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    // Racy init is benign — `sysconf` is pure and idempotent, and every
+    // thread computes the same value — but it must be expressed through an
+    // atomic: the old `static mut` version was a formal data race (UB) that
+    // ThreadSanitizer flagged on the first cross-thread first-touch,
+    // aborting every TSAN run before the code under test even ran.
+    static PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
+    let ps = PAGE_SIZE.load(Ordering::Relaxed);
+    if ps != 0 {
+        return ps;
     }
+    // `sysconf(_SC_PAGESIZE)` is available on both Linux and macOS.
+    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    // sysconf returns -1 on error; fall back to 4096 (x86/typical Linux).
+    let v = if v <= 0 { 4096 } else { v as usize };
+    debug_assert!(v.is_power_of_two());
+    PAGE_SIZE.store(v, Ordering::Relaxed);
+    v
 }
 
 /// Round `n` up to a whole number of pages.
